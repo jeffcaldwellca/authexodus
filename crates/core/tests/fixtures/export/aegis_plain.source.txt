@@ -1,0 +1,6 @@
+Aegis plain-text vault, entry fields and envelope.
+Docs: https://github.com/beemdevelopment/Aegis/blob/master/docs/vault.md
+  (envelope version 1; header slots/params null = not encrypted; db version 3; entry fields)
+Official plain sample: https://github.com/beemdevelopment/Aegis/blob/master/app/src/test/resources/com/beemdevelopment/aegis/importers/aegis_plain.json
+Retrieved 2026-10-02. Secrets here are made up. "UUID" stands for a random per-entry uuid (the test normalises it).
+Status: verified against the documentation.

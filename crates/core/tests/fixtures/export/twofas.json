@@ -1,0 +1,40 @@
+{
+  "services": [
+    {
+      "name": "Mason",
+      "secret": "JBSWY3DPEHPK3PXP",
+      "updatedAt": 0,
+      "otp": {
+        "label": "Mason",
+        "account": "Mason",
+        "issuer": "Deno",
+        "digits": 6,
+        "period": 30,
+        "algorithm": "SHA1",
+        "tokenType": "TOTP",
+        "source": "Manual"
+      },
+      "order": { "position": 0 }
+    },
+    {
+      "name": "Vercel: jeff@example.com",
+      "secret": "GEZDGNBVGY3TQOJQ",
+      "updatedAt": 0,
+      "otp": {
+        "label": "jeff@example.com",
+        "account": "jeff@example.com",
+        "issuer": "Vercel",
+        "digits": 8,
+        "period": 30,
+        "algorithm": "SHA1",
+        "tokenType": "TOTP",
+        "source": "Manual"
+      },
+      "order": { "position": 1 }
+    }
+  ],
+  "groups": [],
+  "updatedAt": 0,
+  "schemaVersion": 4,
+  "appVersionName": "authexodus"
+}

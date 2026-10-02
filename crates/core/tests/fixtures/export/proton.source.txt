@@ -1,0 +1,7 @@
+Proton Authenticator import. The Proton file is the Aegis plain vault JSON (see aegis_plain.json).
+Docs: https://proton.me/support/import-2fa-codes  (lists 2FAS, Aegis Authenticator, Bitwarden Authenticator,
+  Entre Auth, Google Authenticator, LastPass Authenticator, Proton Authenticator, Proton Pass as import sources)
+Retrieved 2026-10-02. The page does not describe file schemas; that Aegis JSON is read as a file import comes
+from the support page's source list plus a secondary technical write-up (deepwiki.com/protonpass/android-authenticator),
+which could not be re-fetched (HTTP 429).
+Status: PARTLY verified (Aegis is a documented source; exact file acceptance not confirmed against the app).

@@ -1,0 +1,36 @@
+{
+  "version": 1,
+  "header": { "slots": null, "params": null },
+  "db": {
+    "version": 3,
+    "entries": [
+      {
+        "type": "totp",
+        "uuid": "UUID",
+        "name": "Mason",
+        "issuer": "Deno",
+        "note": "",
+        "favorite": false,
+        "icon": null,
+        "icon_mime": null,
+        "icon_hash": null,
+        "info": { "secret": "JBSWY3DPEHPK3PXP", "algo": "SHA1", "digits": 6, "period": 30 },
+        "groups": []
+      },
+      {
+        "type": "totp",
+        "uuid": "UUID",
+        "name": "jeff@example.com",
+        "issuer": "Vercel",
+        "note": "",
+        "favorite": false,
+        "icon": null,
+        "icon_mime": null,
+        "icon_hash": null,
+        "info": { "secret": "GEZDGNBVGY3TQOJQ", "algo": "SHA1", "digits": 8, "period": 30 },
+        "groups": []
+      }
+    ],
+    "groups": []
+  }
+}
