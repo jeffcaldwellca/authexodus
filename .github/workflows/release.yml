@@ -1,0 +1,11 @@
+# Placeholder. Batch 3 builds, signs and notarizes the macOS app here.
+name: release
+
+on:
+  workflow_dispatch:
+
+jobs:
+  placeholder:
+    runs-on: macos-latest
+    steps:
+      - run: echo "release pipeline is added in Batch 3"

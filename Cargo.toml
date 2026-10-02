@@ -1,0 +1,17 @@
+[workspace]
+resolver = "2"
+members = ["crates/core", "src-tauri"]
+# spikes/ are throwaway experiments with their own lockfiles; never part of the build.
+exclude = ["spikes/proxy"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+authors = ["Jeff Caldwell"]
+rust-version = "1.93"
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
+strip = true

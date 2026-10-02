@@ -1,0 +1,13 @@
+{
+  "name": "authexodus-workspace",
+  "private": true,
+  "version": "0.1.0",
+  "license": "MIT",
+  "scripts": {
+    "tauri": "tauri",
+    "ui": "pnpm -C ui"
+  },
+  "devDependencies": {
+    "@tauri-apps/cli": "^2"
+  }
+}

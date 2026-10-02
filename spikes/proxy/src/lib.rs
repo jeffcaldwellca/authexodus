@@ -10,6 +10,7 @@ use std::net::SocketAddr;
 use std::sync::{Arc, Mutex};
 
 use anyhow::{anyhow, Context, Result};
+use http_body_util::{BodyExt, Full};
 use hudsucker::{
     certificate_authority::RcgenAuthority,
     hyper::{self, body::Incoming, service::service_fn, Request, Response},
@@ -26,7 +27,6 @@ use hudsucker::{
     },
     Body, HttpContext, HttpHandler, Proxy, RequestOrResponse,
 };
-use http_body_util::{BodyExt, Full};
 use tokio::net::{TcpListener, TcpStream};
 use tokio_rustls::TlsAcceptor;
 
@@ -55,19 +55,25 @@ fn make_ca(cn: &str, constrain_to: Option<&str>) -> Result<TestCa> {
     }
     let key = KeyPair::generate()?;
     let cert = p.self_signed(&key)?;
-    Ok(TestCa { cert_pem: cert.pem(), cert_der: cert.der().to_vec(), key })
+    Ok(TestCa {
+        cert_pem: cert.pem(),
+        cert_der: cert.der().to_vec(),
+        key,
+    })
 }
 
 /// Leaf for `names`, signed by `ca`, as a rustls server config.
 fn leaf_server_config(ca: &TestCa, names: &[&str]) -> Result<(Arc<ServerConfig>, Vec<u8>)> {
-    let issuer = Issuer::from_ca_cert_pem(&ca.cert_pem, KeyPair::from_pem(&ca.key.serialize_pem())?)?;
+    let issuer =
+        Issuer::from_ca_cert_pem(&ca.cert_pem, KeyPair::from_pem(&ca.key.serialize_pem())?)?;
     let mut p = CertificateParams::new(Vec::<String>::new())?;
     p.distinguished_name.push(DnType::CommonName, names[0]);
     for n in names {
-        p.subject_alt_names.push(match n.parse::<std::net::IpAddr>() {
-            Ok(ip) => SanType::IpAddress(ip),
-            Err(_) => SanType::DnsName((*n).try_into()?),
-        });
+        p.subject_alt_names
+            .push(match n.parse::<std::net::IpAddr>() {
+                Ok(ip) => SanType::IpAddress(ip),
+                Err(_) => SanType::DnsName((*n).try_into()?),
+            });
     }
     let key = KeyPair::generate()?;
     let leaf = p.signed_by(&key, &issuer)?;
@@ -89,10 +95,14 @@ async fn https_server(cfg: Arc<ServerConfig>, body: &'static str) -> Result<Sock
     let acceptor = TlsAcceptor::from(cfg);
     tokio::spawn(async move {
         loop {
-            let Ok((tcp, _)) = l.accept().await else { return };
+            let Ok((tcp, _)) = l.accept().await else {
+                return;
+            };
             let acceptor = acceptor.clone();
             tokio::spawn(async move {
-                let Ok(tls) = acceptor.accept(tcp).await else { return };
+                let Ok(tls) = acceptor.accept(tcp).await else {
+                    return;
+                };
                 let svc = service_fn(move |_r: Request<Incoming>| async move {
                     Ok::<_, std::convert::Infallible>(Response::new(Full::new(Bytes::from(body))))
                 });
@@ -110,7 +120,9 @@ async fn http_server(body: &'static str) -> Result<SocketAddr> {
     let addr = l.local_addr()?;
     tokio::spawn(async move {
         loop {
-            let Ok((tcp, _)) = l.accept().await else { return };
+            let Ok((tcp, _)) = l.accept().await else {
+                return;
+            };
             tokio::spawn(async move {
                 let svc = service_fn(move |_r: Request<Incoming>| async move {
                     Ok::<_, std::convert::Infallible>(Response::new(Full::new(Bytes::from(body))))
@@ -134,8 +146,13 @@ struct Dial {
 impl tower_service::Service<hyper::Uri> for Dial {
     type Response = TokioIo<TcpStream>;
     type Error = std::io::Error;
-    type Future = std::pin::Pin<Box<dyn std::future::Future<Output = Result<Self::Response, Self::Error>> + Send>>;
-    fn poll_ready(&mut self, _: &mut std::task::Context<'_>) -> std::task::Poll<Result<(), Self::Error>> {
+    type Future = std::pin::Pin<
+        Box<dyn std::future::Future<Output = Result<Self::Response, Self::Error>> + Send>,
+    >;
+    fn poll_ready(
+        &mut self,
+        _: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Result<(), Self::Error>> {
         std::task::Poll::Ready(Ok(()))
     }
     fn call(&mut self, uri: hyper::Uri) -> Self::Future {
@@ -167,19 +184,37 @@ impl HttpHandler for Handler {
         let host = req.uri().host().unwrap_or_default();
         let yes = host == AUTHY_HOST || host == CHECK_HOST;
         if yes {
-            self.intercepted_hosts.lock().unwrap().push(host.to_string());
+            self.intercepted_hosts
+                .lock()
+                .unwrap()
+                .push(host.to_string());
         }
         yes
     }
 
-    async fn handle_request(&mut self, _ctx: &HttpContext, req: Request<Body>) -> RequestOrResponse {
+    async fn handle_request(
+        &mut self,
+        _ctx: &HttpContext,
+        req: Request<Body>,
+    ) -> RequestOrResponse {
         req.into()
     }
 
-    async fn handle_response(&mut self, _ctx: &HttpContext, res: Response<Body>) -> Response<hudsucker::Body> {
+    async fn handle_response(
+        &mut self,
+        _ctx: &HttpContext,
+        res: Response<Body>,
+    ) -> Response<hudsucker::Body> {
         let (parts, body) = res.into_parts();
-        let bytes = body.collect().await.map(|c| c.to_bytes()).unwrap_or_default();
-        self.captured.lock().unwrap().push(("response".into(), bytes.to_vec()));
+        let bytes = body
+            .collect()
+            .await
+            .map(|c| c.to_bytes())
+            .unwrap_or_default();
+        self.captured
+            .lock()
+            .unwrap()
+            .push(("response".into(), bytes.to_vec()));
         Response::from_parts(parts, Body::from(Full::new(bytes)))
     }
 }
@@ -219,11 +254,17 @@ pub async fn run() -> Result<Report> {
     let connector = hyper_rustls_connector(up_cfg, Dial { authy_at: a });
 
     let proxy_ca = RcgenAuthority::new(
-        Issuer::from_ca_cert_pem(&spike_ca.cert_pem, KeyPair::from_pem(&spike_ca.key.serialize_pem())?)?,
+        Issuer::from_ca_cert_pem(
+            &spike_ca.cert_pem,
+            KeyPair::from_pem(&spike_ca.key.serialize_pem())?,
+        )?,
         100,
         aws_lc_rs::default_provider(),
     );
-    let handler = Handler { captured: Default::default(), intercepted_hosts: Default::default() };
+    let handler = Handler {
+        captured: Default::default(),
+        intercepted_hosts: Default::default(),
+    };
     let listener = TcpListener::bind("127.0.0.1:0").await?;
     let proxy_addr = listener.local_addr()?;
     let proxy = Proxy::builder()
@@ -247,19 +288,39 @@ pub async fn run() -> Result<Report> {
         .build()?;
 
     // (a) intercepted: reqwest gets the body; a raw CONNECT+TLS probe shows who signed the cert.
-    let r = client.get(format!("https://{AUTHY_HOST}/json/ios/authenticator_tokens")).send().await.context("a")?;
+    let r = client
+        .get(format!(
+            "https://{AUTHY_HOST}/json/ios/authenticator_tokens"
+        ))
+        .send()
+        .await
+        .context("a")?;
     let a_body = r.text().await?;
     let roots = [spike_ca.cert_der.clone(), b_ca.cert_der.clone()];
-    let a_peer = peer_cert_via_proxy(proxy_addr, AUTHY_HOST, AUTHY_HOST, 443, &roots).await.context("a probe")?;
+    let a_peer = peer_cert_via_proxy(proxy_addr, AUTHY_HOST, AUTHY_HOST, 443, &roots)
+        .await
+        .context("a probe")?;
     let a_issued_by_spike = contains(&a_peer, b"spike CA");
 
     // (b) tunnelled: the cert the client sees is B's own leaf, byte for byte.
-    let r = client.get(format!("https://localhost:{}/x", b.port())).send().await.context("b")?;
+    let r = client
+        .get(format!("https://localhost:{}/x", b.port()))
+        .send()
+        .await
+        .context("b")?;
     let b_body = r.text().await?;
-    let b_peer = peer_cert_via_proxy(proxy_addr, "localhost", "localhost", b.port(), &roots).await.context("b probe")?;
+    let b_peer = peer_cert_via_proxy(proxy_addr, "localhost", "localhost", b.port(), &roots)
+        .await
+        .context("b probe")?;
 
     // (c) plain http
-    let c_body = client.get(format!("http://127.0.0.1:{}/plain", c.port())).send().await.context("c")?.text().await?;
+    let c_body = client
+        .get(format!("http://127.0.0.1:{}/plain", c.port()))
+        .send()
+        .await
+        .context("c")?
+        .text()
+        .await?;
 
     let captured = handler.captured.lock().unwrap().clone();
     let hosts = handler.intercepted_hosts.lock().unwrap().clone();
@@ -267,7 +328,9 @@ pub async fn run() -> Result<Report> {
         hudsucker: "0.25.0",
         a_body,
         a_peer_cert_issued_by_spike_ca: a_issued_by_spike,
-        a_captured_by_proxy: captured.iter().any(|(_, b)| b.starts_with(b"{\"authenticator_tokens\"")),
+        a_captured_by_proxy: captured
+            .iter()
+            .any(|(_, b)| b.starts_with(b"{\"authenticator_tokens\"")),
         b_body,
         b_peer_cert_is_servers_own: b_peer == b_leaf_der,
         b_was_not_intercepted: !hosts.iter().any(|h| h == "localhost"),
@@ -293,9 +356,16 @@ fn contains(hay: &[u8], needle: &[u8]) -> bool {
     hay.windows(needle.len()).any(|w| w == needle)
 }
 
-fn hyper_rustls_connector<C>(cfg: ClientConfig, inner: C) -> impl hudsucker::hyper_util::client::legacy::connect::Connect + Clone
+fn hyper_rustls_connector<C>(
+    cfg: ClientConfig,
+    inner: C,
+) -> impl hudsucker::hyper_util::client::legacy::connect::Connect + Clone
 where
-    C: tower_service::Service<hyper::Uri, Response = TokioIo<TcpStream>, Error = std::io::Error> + Clone + Send + Sync + 'static,
+    C: tower_service::Service<hyper::Uri, Response = TokioIo<TcpStream>, Error = std::io::Error>
+        + Clone
+        + Send
+        + Sync
+        + 'static,
     C::Future: Send + 'static,
 {
     hyper_rustls::HttpsConnectorBuilder::new()
@@ -346,6 +416,11 @@ async fn peer_cert_via_proxy(
         .connect(sni.to_string().try_into()?, tcp)
         .await
         .context("tls handshake")?;
-    let peer = tls.get_ref().1.peer_certificates().ok_or_else(|| anyhow!("no peer certs"))?[0].to_vec();
+    let peer = tls
+        .get_ref()
+        .1
+        .peer_certificates()
+        .ok_or_else(|| anyhow!("no peer certs"))?[0]
+        .to_vec();
     Ok(peer)
 }
