@@ -34,6 +34,37 @@ fn plain_message(e: &BwError) -> String {
     }
 }
 
+/// The title each decision would be created under, by position in `decisions`. Tokens that share
+/// a title get " (2)", " (3)" ... in the order the decisions list them, so two tokens never
+/// collapse into one login and a re-run maps every token to the same title as before.
+fn unique_titles(tokens: &[Token], decisions: &[(String, Decision)]) -> Vec<String> {
+    let base: Vec<Option<&str>> = decisions
+        .iter()
+        .map(|(id, d)| match d {
+            Decision::CreateNew => tokens
+                .iter()
+                .find(|t| &t.id == id)
+                .map(|t| t.title.as_str()),
+            _ => None,
+        })
+        .collect();
+    let all: HashSet<&str> = base.iter().flatten().copied().collect();
+    let mut used: HashSet<String> = HashSet::new();
+    base.iter()
+        .map(|b| {
+            let Some(b) = b else { return String::new() };
+            let mut title = (*b).to_string();
+            let mut n = 1;
+            while used.contains(&title) || (n > 1 && all.contains(title.as_str())) {
+                n += 1;
+                title = format!("{b} ({n})");
+            }
+            used.insert(title.clone());
+            title
+        })
+        .collect()
+}
+
 /// Apply the user's decisions. Syncs first, so anything a failed earlier run did create is seen.
 /// Stops at the first Bitwarden error; `progress` gets one plain line per step.
 pub async fn apply(
@@ -69,7 +100,9 @@ async fn run(
         HashSet::new()
     };
 
-    for (token_id, decision) in decisions {
+    let titles = unique_titles(tokens, decisions);
+
+    for (n, (token_id, decision)) in decisions.iter().enumerate() {
         let Some(token) = tokens.iter().find(|t| &t.id == token_id) else {
             report.skipped += 1;
             continue;
@@ -89,21 +122,18 @@ async fn run(
                 }
             }
             Decision::CreateNew => {
-                if existing.contains(&token.title) {
+                let title = &titles[n];
+                if existing.contains(title) {
                     report.skipped += 1;
-                    progress(format!("{} is already in the import folder", token.title));
+                    progress(format!("{title} is already in the import folder"));
                     continue;
                 }
                 client
-                    .create_in_import_folder(
-                        &token.title,
-                        token.username.as_deref(),
-                        &otpauth_uri(token),
-                    )
+                    .create_in_import_folder(title, token.username.as_deref(), &otpauth_uri(token))
                     .await?;
-                existing.insert(token.title.clone());
+                existing.insert(title.clone());
                 report.created += 1;
-                progress(format!("Created {}", token.title));
+                progress(format!("Created {title}"));
             }
         }
     }

@@ -37,12 +37,26 @@ pub struct Proposal {
 const SERVICE_POINTS: u32 = 3;
 const USERNAME_POINTS: u32 = 2;
 
-/// (key as it appears in a token, extra keys to search for as well).
+/// (key as it appears in a token, extra patterns to search for as well). A pattern containing a
+/// dot is a host suffix (`live.com` matches `login.live.com`, never `livenation.com`); one
+/// without is a whole word of the login name or a whole label of a host. A match that rests only
+/// on one of these is never better than `Low` confidence: the user confirms it.
 const ALIASES: &[(&str, &[&str])] = &[
-    ("amazon web services", &["aws", "amazon"]),
-    ("microsoft", &["microsoft", "live", "office"]),
-    ("google", &["google", "gmail"]),
-    ("gmail", &["google", "gmail"]),
+    (
+        "amazon web services",
+        &["aws", "amazonaws.com", "aws.amazon.com"],
+    ),
+    (
+        "microsoft",
+        &[
+            "microsoft.com",
+            "live.com",
+            "office.com",
+            "microsoftonline.com",
+        ],
+    ),
+    ("google", &["google.com", "gmail.com"]),
+    ("gmail", &["google.com", "gmail.com"]),
 ];
 
 /// Lowercase, every run of non-alphanumerics becomes one space.
@@ -65,7 +79,12 @@ fn has_word_run(haystack: &str, needle: &str) -> bool {
     format!(" {haystack} ").contains(&format!(" {needle} "))
 }
 
-fn search_keys(token: &Token) -> Vec<String> {
+struct Keys {
+    own: Vec<String>,
+    alias: Vec<String>,
+}
+
+fn search_keys(token: &Token) -> Keys {
     let mut raw: Vec<&str> = Vec::new();
     if let Some(issuer) = token.issuer.as_deref() {
         raw.push(issuer);
@@ -76,7 +95,8 @@ fn search_keys(token: &Token) -> Vec<String> {
     if !name.contains('@') {
         raw.push(name);
     }
-    let mut keys: Vec<String> = Vec::new();
+    let mut own: Vec<String> = Vec::new();
+    let mut alias: Vec<String> = Vec::new();
     for r in raw {
         let k = norm(r);
         if k.chars().count() < 3 {
@@ -84,34 +104,55 @@ fn search_keys(token: &Token) -> Vec<String> {
         }
         for (from, to) in ALIASES {
             if has_word_run(&k, from) {
-                keys.extend(to.iter().map(|s| s.to_string()));
+                alias.extend(to.iter().map(|s| s.to_string()));
             }
         }
-        keys.push(k);
+        own.push(k);
     }
-    keys.sort();
-    keys.dedup();
-    keys
+    own.sort();
+    own.dedup();
+    alias.sort();
+    alias.dedup();
+    alias.retain(|a| !own.contains(a));
+    Keys { own, alias }
 }
 
-fn key_hits(key: &str, text_norm: &str) -> bool {
-    if has_word_run(text_norm, key) {
+fn host_has_suffix(host: &str, suffix: &str) -> bool {
+    let host = host.to_lowercase();
+    host == suffix || host.ends_with(&format!(".{suffix}"))
+}
+
+/// Whole words of the login name, or whole labels of a host; never part of a word.
+fn key_hits(key: &str, name_norm: &str, hosts: &[String]) -> bool {
+    if key.contains('.') {
+        return hosts.iter().any(|h| host_has_suffix(h, key));
+    }
+    let host_norms = hosts.iter().map(|h| norm(h));
+    if has_word_run(name_norm, key) || host_norms.clone().any(|h| has_word_run(&h, key)) {
         return true;
     }
-    // "Stack Overflow" vs stackoverflow.com; only for keys long enough not to hit by accident.
-    let compact_key: String = key.split(' ').collect();
-    compact_key.chars().count() >= 5
-        && text_norm
-            .split(' ')
-            .collect::<String>()
-            .contains(&compact_key)
+    // "Stack Overflow" vs stackoverflow.com: a multi-word key, squashed, must be a whole word
+    // or label by itself.
+    if key.contains(' ') {
+        let compact: String = key.split(' ').collect();
+        return name_norm.split(' ').any(|w| w == compact)
+            || host_norms
+                .into_iter()
+                .any(|h| h.split(' ').any(|w| w == compact));
+    }
+    false
 }
 
-fn service_match(keys: &[String], login: &VaultLogin) -> bool {
+/// `Some(alias_only)` when the login matches the token's service.
+fn service_match(keys: &Keys, login: &VaultLogin) -> Option<bool> {
     let name = norm(&login.name);
-    let hosts: Vec<String> = login.hosts.iter().map(|h| norm(h)).collect();
-    keys.iter()
-        .any(|k| key_hits(k, &name) || hosts.iter().any(|h| key_hits(k, h)))
+    if keys.own.iter().any(|k| key_hits(k, &name, &login.hosts)) {
+        Some(false)
+    } else if keys.alias.iter().any(|k| key_hits(k, &name, &login.hosts)) {
+        Some(true)
+    } else {
+        None
+    }
 }
 
 fn same_username(token: &Token, login: &VaultLogin) -> bool {
@@ -124,21 +165,25 @@ fn same_username(token: &Token, login: &VaultLogin) -> bool {
     }
 }
 
-/// Service-matching logins for one token: (index in `vault`, score), best first, vault order on ties.
-fn scored(token: &Token, keys: &[String], vault: &[VaultLogin]) -> Vec<(usize, u32)> {
-    let mut v: Vec<(usize, u32)> = vault
+/// (index in `vault`, score, match rests only on an alias).
+type Scored = (usize, u32, bool);
+
+/// Service-matching logins for one token, best first (own-key matches before alias-only ones,
+/// vault order on ties).
+fn scored(token: &Token, keys: &Keys, vault: &[VaultLogin]) -> Vec<Scored> {
+    let mut v: Vec<Scored> = vault
         .iter()
         .enumerate()
-        .filter(|(_, l)| service_match(keys, l))
-        .map(|(i, l)| {
+        .filter_map(|(i, l)| {
+            let alias_only = service_match(keys, l)?;
             let mut score = SERVICE_POINTS;
             if same_username(token, l) {
                 score += USERNAME_POINTS;
             }
-            (i, score)
+            Some((i, score, alias_only))
         })
         .collect();
-    v.sort_by(|a, b| b.1.cmp(&a.1).then(a.0.cmp(&b.0)));
+    v.sort_by(|a, b| b.1.cmp(&a.1).then(a.2.cmp(&b.2)).then(a.0.cmp(&b.0)));
     v
 }
 
@@ -149,8 +194,8 @@ fn scored(token: &Token, keys: &[String], vault: &[VaultLogin]) -> Vec<(usize, u
 /// whose only candidates were taken becomes `CreateNew` with `Low` confidence and the taken
 /// logins listed, so the user is asked.
 pub fn propose(tokens: &[Token], vault: &[VaultLogin]) -> Vec<Proposal> {
-    let keys: Vec<Vec<String>> = tokens.iter().map(search_keys).collect();
-    let scores: Vec<Vec<(usize, u32)>> = tokens
+    let keys: Vec<Keys> = tokens.iter().map(search_keys).collect();
+    let scores: Vec<Vec<Scored>> = tokens
         .iter()
         .zip(&keys)
         .map(|(t, k)| scored(t, k, vault))
@@ -161,8 +206,8 @@ pub fn propose(tokens: &[Token], vault: &[VaultLogin]) -> Vec<Proposal> {
     order.sort_by_key(|&i| {
         let best = scores[i]
             .iter()
-            .filter(|(l, _)| !vault[*l].has_totp)
-            .map(|(_, s)| *s)
+            .filter(|(l, _, _)| !vault[*l].has_totp)
+            .map(|(_, s, _)| *s)
             .max()
             .unwrap_or(0);
         (std::cmp::Reverse(best), i)
@@ -174,22 +219,25 @@ pub fn propose(tokens: &[Token], vault: &[VaultLogin]) -> Vec<Proposal> {
     for i in order {
         let candidates: Vec<String> = scores[i]
             .iter()
-            .map(|(l, _)| vault[*l].id.clone())
+            .map(|(l, _, _)| vault[*l].id.clone())
             .collect();
-        let free: Vec<(usize, u32)> = scores[i]
+        let free: Vec<Scored> = scores[i]
             .iter()
             .copied()
-            .filter(|(l, _)| !vault[*l].has_totp && !claimed.contains(l))
+            .filter(|(l, _, _)| !vault[*l].has_totp && !claimed.contains(l))
             .collect();
         let taken_by_another = scores[i]
             .iter()
-            .any(|(l, _)| !vault[*l].has_totp && claimed.contains(l));
+            .any(|(l, _, _)| !vault[*l].has_totp && claimed.contains(l));
 
         let (decision, confidence) = match free.first() {
-            Some(&(best, top)) => {
+            Some(&(best, top, alias_only)) => {
                 claimed.insert(best);
-                let tied = free.iter().filter(|(_, s)| *s == top).count();
-                let confidence = if tied == 1 && !taken_by_another {
+                let tied = free
+                    .iter()
+                    .filter(|(_, s, a)| *s == top && *a == alias_only)
+                    .count();
+                let confidence = if tied == 1 && !taken_by_another && !alias_only {
                     Confidence::High
                 } else {
                     Confidence::Low
@@ -225,8 +273,10 @@ mod tests {
 
     #[test]
     fn short_or_address_names_make_no_keys() {
-        assert!(search_keys(&token("t", "jeff@example.com", None)).is_empty());
-        assert!(search_keys(&token("t", "ab", None)).is_empty());
+        assert!(search_keys(&token("t", "jeff@example.com", None))
+            .own
+            .is_empty());
+        assert!(search_keys(&token("t", "ab", None)).own.is_empty());
     }
 
     fn token(id: &str, name: &str, issuer: Option<&str>) -> Token {

@@ -927,3 +927,207 @@ async fn cli_client_creates_in_the_existing_import_folder() {
     assert!(!sb.log("args.log").contains("JBSWY3DPEHPK3PXP"));
     assert_eq!(sb.log("create.stdin").trim(), "ENCODEDJSON");
 }
+
+// ---------- fix round 1 ----------
+
+#[test]
+fn aws_token_does_not_attach_to_amazon_shopping() {
+    let vault = vec![login(
+        "shop",
+        "Amazon",
+        Some("sam@example.test"),
+        &["www.amazon.ca"],
+        false,
+    )];
+    let p = propose(
+        &[tok(
+            "t1",
+            "Amazon Web Services",
+            Some("Amazon Web Services"),
+            Some("sam@example.test"),
+        )],
+        &vault,
+    );
+    assert_eq!(p[0].decision, Decision::CreateNew);
+    assert!(p[0].candidates.is_empty());
+}
+
+#[test]
+fn microsoft_token_does_not_attach_to_live_nation_or_office_depot() {
+    let vault = vec![
+        login("ln", "Live Nation", None, &["livenation.com"], false),
+        login("od", "Office Depot", None, &["officedepot.com"], false),
+    ];
+    let p = propose(&[tok("t1", "Microsoft", Some("Microsoft"), None)], &vault);
+    assert_eq!(p[0].decision, Decision::CreateNew);
+    assert_eq!(p[0].confidence, Confidence::High);
+}
+
+#[test]
+fn a_match_resting_only_on_an_alias_is_low() {
+    let vault = vec![
+        login(
+            "aws",
+            "Cloud console",
+            None,
+            &["console.aws.amazon.com"],
+            false,
+        ),
+        login("ms", "Outlook", None, &["login.live.com"], false),
+    ];
+    let p = propose(
+        &[
+            tok(
+                "a",
+                "Amazon Web Services",
+                Some("Amazon Web Services"),
+                None,
+            ),
+            tok("m", "Microsoft", Some("Microsoft"), None),
+        ],
+        &vault,
+    );
+    assert_eq!(p[0].decision, attach("aws"));
+    assert_eq!(p[0].confidence, Confidence::Low);
+    assert_eq!(p[1].decision, attach("ms"));
+    assert_eq!(p[1].confidence, Confidence::Low);
+    // The token's own name is still High.
+    let own = propose(
+        &[tok("m", "Microsoft", Some("Microsoft"), None)],
+        &[login("ms", "Microsoft account", None, &[], false)],
+    );
+    assert_eq!(own[0].confidence, Confidence::High);
+}
+
+#[test]
+fn keys_match_whole_words_and_labels_never_substrings() {
+    let vault = vec![
+        login("a", "Orchard", None, &["pineapple.com"], false),
+        login("b", "Chat", None, &["blackslackline.com"], false),
+    ];
+    for name in ["Apple", "Slack"] {
+        let p = propose(&[tok("t", name, Some(name), None)], &vault);
+        assert_eq!(p[0].decision, Decision::CreateNew, "{name}");
+        assert!(p[0].candidates.is_empty(), "{name}");
+    }
+    // Real hits still work: a whole label, and a multi-word name squashed into one label.
+    let vault = vec![
+        login("so", "Q&A", None, &["stackoverflow.com"], false),
+        login("ap", "iCloud", None, &["appleid.apple.com"], false),
+    ];
+    let p = propose(
+        &[
+            tok("1", "Stack Overflow", Some("Stack Overflow"), None),
+            tok("2", "Apple", Some("Apple"), None),
+        ],
+        &vault,
+    );
+    assert_eq!(p[0].decision, attach("so"));
+    assert_eq!(p[1].decision, attach("ap"));
+}
+
+#[test]
+fn only_real_server_errors_are_server_errors() {
+    assert!(matches!(classify_failure("Error: 503"), BwError::Server(_)));
+    assert!(matches!(
+        classify_failure("Request failed with status code 502"),
+        BwError::Server(_)
+    ));
+    assert!(matches!(classify_failure("HTTP 500"), BwError::Server(_)));
+    assert!(matches!(
+        classify_failure("Item \"Network 500 backup\" not found."),
+        BwError::Cli(_)
+    ));
+    assert!(matches!(
+        classify_failure("Not found: id 15034"),
+        BwError::Cli(_)
+    ));
+    assert!(matches!(
+        classify_failure("Unknown network card"),
+        BwError::Cli(_)
+    ));
+}
+
+#[tokio::test]
+async fn parent_bitwarden_environment_does_not_reach_the_child() {
+    let _g = SCRIPT_LOCK.lock().await;
+    let sb = sandbox();
+    let vars = [
+        ("BW_SESSION", "parent-session"),
+        ("BW_PASSWORD", "parent-pw"),
+        ("BW_CLIENTID", "parent-id"),
+        ("BW_CLIENTSECRET", "parent-secret"),
+        ("BW_RESPONSE", "true"),
+        ("BITWARDENCLI_APPDATA_DIR", "/somewhere/else"),
+    ];
+    // SAFETY: every test that reads the environment runs a script under SCRIPT_LOCK, held here.
+    for (k, v) in vars {
+        unsafe { std::env::set_var(k, v) };
+    }
+    let mut c = sb.client();
+    let r = c
+        .login("sam@example.test", "correct horse", &Region::Us, None)
+        .await;
+    c.sync().await.unwrap();
+    for (k, _) in vars {
+        unsafe { std::env::remove_var(k) };
+    }
+    assert_eq!(r.unwrap(), LoginOutcome::Ok);
+    let env = sb.log("env.log");
+    assert!(!env.contains("parent-"), "{env}");
+    assert!(!env.contains("resp=true"), "{env}");
+    assert!(!env.contains("/somewhere/else"), "{env}");
+    assert!(env.contains(&format!("appdata={}", sb.data_dir.display())));
+}
+
+#[tokio::test]
+async fn two_tokens_with_one_title_make_two_logins_and_rerun_adds_nothing() {
+    let fake = FakeBw::new(vec![]);
+    let mut a = tok("a", "Admin", Some("Shop"), None);
+    let mut b = tok("b", "Admin", Some("Shop"), None);
+    a.title = "Shop (Admin)".into();
+    b.title = "Shop (Admin)".into();
+    let tokens = [a, b];
+    let decisions = vec![
+        ("a".to_string(), Decision::CreateNew),
+        ("b".to_string(), Decision::CreateNew),
+    ];
+    let r = apply(&fake, &tokens, &decisions, &no_progress()).await;
+    assert_eq!((r.created, r.skipped, r.failed.clone()), (2, 0, None));
+    assert_eq!(
+        fake.titles(),
+        vec!["Shop (Admin)".to_string(), "Shop (Admin) (2)".to_string()]
+    );
+    let again = apply(&fake, &tokens, &decisions, &no_progress()).await;
+    assert_eq!((again.created, again.skipped), (0, 2));
+    assert_eq!(fake.titles().len(), 2);
+}
+
+#[tokio::test]
+async fn truncated_download_leaves_no_part_file() {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+    tokio::spawn(async move {
+        let (mut sock, _) = listener.accept().await.unwrap();
+        let mut buf = [0u8; 2048];
+        let _ = sock.read(&mut buf).await;
+        let _ = sock
+            .write_all(
+                b"HTTP/1.1 200 OK\r\nContent-Length: 100000\r\nConnection: close\r\n\r\nshort",
+            )
+            .await;
+        let _ = sock.shutdown().await;
+    });
+    let dir = tempfile::tempdir().unwrap();
+    let err = ensure_cli_from(
+        dir.path(),
+        &format!("http://127.0.0.1:{port}"),
+        "bw-test.zip",
+        &sha256_hex(b"x"),
+    )
+    .await
+    .unwrap_err();
+    assert!(matches!(err, BwError::Download(_)), "{err:?}");
+    assert!(!dir.path().join("bw-test.zip.part").exists());
+}

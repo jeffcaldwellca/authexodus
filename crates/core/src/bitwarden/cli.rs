@@ -45,12 +45,10 @@ const WRONG_TWO_FACTOR_CODE: &[&str] = &[
     "invalid two-step",
 ];
 // ASSUMED (typical Node/HTTP failure wording; the CLI passes these through): the server or the
-// network to it failed. Worth running again.
+// network to it failed. Worth running again. Phrases only: a bare "500" or "network" can appear in
+// an unrelated message (an item named "Network 500"), so status codes are matched with their
+// context and everything else as a whole phrase.
 const SERVER_TROUBLE: &[&str] = &[
-    "503",
-    "502",
-    "504",
-    "500",
     "service unavailable",
     "bad gateway",
     "gateway timeout",
@@ -60,8 +58,37 @@ const SERVER_TROUBLE: &[&str] = &[
     "enotfound",
     "etimedout",
     "fetch failed",
-    "network",
+    "network error",
+    "network request failed",
+    "network is unreachable",
     "timed out",
+];
+/// "status code 503", "http 503", "http error 503", "error: 503"
+const STATUS_CONTEXTS: &[&str] = &[
+    "status code",
+    "status:",
+    "http",
+    "http error",
+    "error:",
+    "error code",
+];
+const SERVER_STATUS_CODES: &[&str] = &["500", "502", "503", "504"];
+
+/// Variables from the user's own shell that would steer or leak into the child (their session,
+/// API-key login, output-format switches). All removed before ours are set.
+const SCRUBBED_ENV: &[&str] = &[
+    "BW_SESSION",
+    "BW_PASSWORD",
+    "BW_CLIENTID",
+    "BW_CLIENTSECRET",
+    "BW_QUIET",
+    "BW_RESPONSE",
+    "BW_RAW",
+    "BW_PRETTY",
+    "BW_CLEANEXIT",
+    "BITWARDENCLI_DEBUG",
+    "BITWARDENCLI_APPDATA_DIR",
+    "NODE_OPTIONS",
 ];
 
 const PASSWORD_ENV: &str = "AUTHEXODUS_BW_PASSWORD";
@@ -95,7 +122,6 @@ impl CliClient {
         let mut cmd = Command::new(&self.binary);
         cmd.args(args)
             .arg("--nointeraction")
-            .env("BITWARDENCLI_APPDATA_DIR", &self.data_dir)
             .env("BW_NOINTERACTION", "true")
             .stdin(if stdin.is_some() {
                 Stdio::piped()
@@ -105,11 +131,14 @@ impl CliClient {
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             .kill_on_drop(true);
+        for var in SCRUBBED_ENV {
+            cmd.env_remove(var);
+        }
+        cmd.env("BITWARDENCLI_APPDATA_DIR", &self.data_dir);
         if let Some(s) = &self.session {
             cmd.env("BW_SESSION", s.as_str());
-        } else {
-            cmd.env_remove("BW_SESSION");
         }
+        cmd.env_remove(PASSWORD_ENV);
         if let Some(p) = password {
             cmd.env(PASSWORD_ENV, p);
         }
@@ -202,7 +231,7 @@ pub fn classify_failure(stderr: &str) -> BwError {
     let any = |needles: &[&str]| needles.iter().any(|n| lower.contains(n));
     if any(SESSION_GONE) {
         BwError::SessionExpired
-    } else if any(SERVER_TROUBLE) {
+    } else if any(SERVER_TROUBLE) || has_server_status(&lower) {
         BwError::Server(text.to_string())
     } else {
         BwError::Cli(if text.is_empty() {
@@ -211,6 +240,20 @@ pub fn classify_failure(stderr: &str) -> BwError {
             text.to_string()
         })
     }
+}
+
+/// A 5xx status code that is its own number and follows a status-ish word ("http 503").
+fn has_server_status(lower: &str) -> bool {
+    SERVER_STATUS_CODES.iter().any(|code| {
+        lower.match_indices(code).any(|(at, _)| {
+            let before = &lower[..at];
+            let after = &lower[at + code.len()..];
+            let standalone = !before.ends_with(|c: char| c.is_alphanumeric())
+                && !after.starts_with(|c: char| c.is_alphanumeric());
+            let lead = before.trim_end();
+            standalone && STATUS_CONTEXTS.iter().any(|w| lead.ends_with(w))
+        })
+    })
 }
 
 /// Classify the stderr of a failed `bw login`.
@@ -313,6 +356,9 @@ impl BwClient for CliClient {
 
         let passwordenv = format!("--passwordenv={PASSWORD_ENV}");
         let mut args = vec!["login", email, passwordenv.as_str(), "--raw"];
+        // The code has to go in argv: `bw login` (2026.9.1 `--help`) offers `--code` only, with no
+        // environment-variable or file form for it as it has for the password. It is a one-time,
+        // 30-second code, so the exposure in `ps` is accepted.
         // Method 0 is "authenticator app", the common case. The CLI needs --method with --code
         // because without it a non-interactive login cannot pick a provider.
         if let Some(code) = two_factor {

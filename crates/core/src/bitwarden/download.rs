@@ -9,6 +9,7 @@
 //! architecture in its name, `bw-macos-VERSION.zip`, is Intel (x64).
 
 use std::path::{Path, PathBuf};
+use std::time::Duration;
 
 use sha2::{Digest, Sha256};
 use tokio::io::AsyncWriteExt;
@@ -25,6 +26,10 @@ pub const MACOS_ARM64_SHA256: &str =
 pub const MACOS_X64_ASSET: &str = "bw-macos-2026.9.1.zip";
 pub const MACOS_X64_SHA256: &str =
     "7996558e562a7e5d1ef167f625e4dfde0230fe87246e01caf647aff5501ca658";
+
+/// Connecting must succeed quickly; the whole ~130 MB download gets ten minutes.
+const CONNECT_TIMEOUT: Duration = Duration::from_secs(30);
+const TOTAL_TIMEOUT: Duration = Duration::from_secs(600);
 
 /// File name of the extracted binary inside `dir`.
 const BINARY_NAME: &str = "bw";
@@ -73,11 +78,14 @@ pub async fn ensure_cli_from(
     };
     if !have_good_zip {
         let part = dir.join(format!("{asset}.part"));
-        let actual = fetch(
-            &format!("{}/{asset}", base_url.trim_end_matches('/')),
-            &part,
-        )
-        .await?;
+        let url = format!("{}/{asset}", base_url.trim_end_matches('/'));
+        let actual = match fetch(&url, &part).await {
+            Ok(h) => h,
+            Err(e) => {
+                let _ = tokio::fs::remove_file(&part).await;
+                return Err(e);
+            }
+        };
         if !actual.eq_ignore_ascii_case(expected_sha256) {
             let _ = tokio::fs::remove_file(&part).await;
             return Err(BwError::ChecksumMismatch);
@@ -98,7 +106,12 @@ pub async fn ensure_cli_from(
 /// Stream `url` into `path`, hashing as it goes. Returns the SHA-256 hex.
 async fn fetch(url: &str, path: &Path) -> Result<String, BwError> {
     let dl = |e: &dyn std::fmt::Display| BwError::Download(e.to_string());
-    let mut resp = reqwest::get(url).await.map_err(|e| dl(&e))?;
+    let client = reqwest::Client::builder()
+        .connect_timeout(CONNECT_TIMEOUT)
+        .timeout(TOTAL_TIMEOUT)
+        .build()
+        .map_err(|e| dl(&e))?;
+    let mut resp = client.get(url).send().await.map_err(|e| dl(&e))?;
     if !resp.status().is_success() {
         return Err(BwError::Download(format!(
             "server answered {}",

@@ -2,7 +2,7 @@
 # Stand-in for the `bw` binary in tests. Records its arguments, answers from fixtures.
 DIR="$(dirname "$0")"
 echo "$@" >> "$DIR/args.log"
-echo "appdata=$BITWARDENCLI_APPDATA_DIR session=${BW_SESSION:-none}" >> "$DIR/env.log"
+echo "appdata=$BITWARDENCLI_APPDATA_DIR session=${BW_SESSION:-none} pw=${BW_PASSWORD:-none} cid=${BW_CLIENTID:-none} sec=${BW_CLIENTSECRET:-none} resp=${BW_RESPONSE:-none}" >> "$DIR/env.log"
 case "$1" in
   logout) exit 0 ;;
   config) exit 0 ;;
