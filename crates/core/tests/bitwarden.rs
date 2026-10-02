@@ -1571,6 +1571,15 @@ async fn two_step_outcomes_follow_what_the_tool_says_and_whether_a_code_was_sent
         Ok(LoginOutcome::BadTwoFactorCode)
     );
 
+    // An account with no two-step login, on a device Bitwarden has not seen (this app's
+    // private data folder always is one), is asked for the code Bitwarden emails. Without a
+    // code sent, the tool's words are the same as for an authenticator-app account, so the
+    // first answer can only be "a code is needed"; the UI offers the API key beside the code
+    // field for exactly this case.
+    assert_eq!(
+        try_login("devicecheck", None).await,
+        Ok(LoginOutcome::NeedsTwoFactor)
+    );
     // What a password sign-in cannot get past is its own answer, so the person can be sent
     // to sign in with an API key: never a failure to connect, never "needs a code" again.
     assert_eq!(

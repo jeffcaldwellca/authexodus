@@ -57,6 +57,19 @@ const BAD_CREDENTIALS: &[&str] = &[
 /// code it emails to a new device (the `requiresDeviceVerification` branch; re-read in the
 /// 2026.9.1 release itself), and that is the only way to get it when `--code` WAS given (with
 /// a code, the two-step branch never asks for one).
+///
+/// The two cannot be told apart from what the tool prints when no code was sent. In
+/// `LoginCommand.run`, the two-step branch ends
+/// `if (twoFactorToken == null || twoFactorToken === "") { return response_Response.badRequest("Code is required."); }`
+/// and the new-device branch ends
+/// `if (newDeviceToken == null || newDeviceToken === "") { return response_Response.badRequest("Code is required."); }`:
+/// the same call with the same text, so the same stderr and the same exit status. Nothing
+/// else is printed on the way (the interactive prompts that would differ, "Two-step login
+/// code:" and "New device verification required. Enter OTP sent to login email:", are
+/// skipped under `--nointeraction`), and the provider list that would tell them apart is
+/// kept in memory only (`new StateDefinition("twoFactor", "memory")`), never in the data
+/// folder. The only probe that separates them is sending a made-up code, which Bitwarden
+/// would count as a failed two-step login on a real account; this app does not do that.
 const CODE_REQUIRED: &[&str] = &["code is required"];
 /// `error("Login failed. No provider selected.")`: the account has several two-step methods and
 /// none was chosen (no `--method`), or the one chosen with `--method 0` is not among them.
@@ -433,8 +446,9 @@ fn has_server_status(lower: &str) -> bool {
 /// device it has not seen, which this app's private data folder always is, or because email
 /// is the account's two-step method), or a method the tool cannot do (a security key, Duo).
 /// An account with no two-step login at all therefore goes: "Code is required." with no code
-/// sent (`NeedsTwoFactor`: the tool's wording does not say which code), and the same again
-/// once any code is tried (`NeedsApiKey`).
+/// sent (`NeedsTwoFactor`: the tool's wording does not say which code, see [`CODE_REQUIRED`]),
+/// and the same again once any code is tried (`NeedsApiKey`). The UI's code prompt says so and
+/// offers the API key beside it.
 fn classify_login_failure(stderr: &str, code_sent: bool) -> Result<LoginOutcome, BwError> {
     let lower = stderr.to_lowercase();
     let any = |needles: &[&str]| needles.iter().any(|n| lower.contains(n));
