@@ -105,12 +105,16 @@ the same token list.
 
 ### Authy-native tokens
 
-Tokens Authy issues itself (7 digits, 10 seconds) arrive in a separate `apps`
-response. Observed on 2026-10-02: each entry carries a `secret_seed` (32 hex
-characters, unencrypted) and `digits: 7`. The app migrates them to destinations
-that accept that format, and lists any it could not move with instructions to
-re-enrol by hand. That a code generated from this seed matches Authy's is still
-to be confirmed by the spike below.
+Tokens Authy issues itself (7 digits, e.g. Twitch) arrive in a separate `apps`
+response. They are not migrated in the first release. Tried on 2026-10-02: the
+response carries a `secret_seed` (32 hex characters) and `digits: 7`, but no
+code derived from it matched the code Authy displayed. The search covered the
+seed hex-decoded and as ASCII, HMAC-SHA1/256/512, periods of 10/20/30/60 s and
+six time steps either side. Either the seed in that response is not the one the
+device ends up using, or the derivation involves something else.
+
+The app lists these tokens by name and tells the user to re-enrol each one in
+the service's own security settings, choosing a standard authenticator app.
 
 ### Invalid tokens
 
@@ -167,10 +171,7 @@ Each has its own plain-language screen with what to try:
 1. **Name-constrained root on iOS:** does iOS accept and enforce a
    user-installed root limited to `authy.com`? If not, fall back to an
    unconstrained root and say so in the cleanup screen.
-2. **Authy-native seeds:** the `apps` response does contain a seed. Confirm
-   the derivation (seed encoding, 7 digits, 10 seconds) yields the same code
-   Authy shows.
-3. **Rust proxy crate:** confirm the chosen crate can intercept one host and
+2. **Rust proxy crate:** confirm the chosen crate can intercept one host and
    blind-tunnel the rest.
 
 ## Release
