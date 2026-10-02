@@ -204,21 +204,34 @@ fn still_ours(ip: Ipv4Addr, own: &[IpAddr]) -> bool {
     ip.is_unspecified() || own.contains(&IpAddr::V4(ip))
 }
 
+/// How many looks in a row must miss the proxy's address before the UI is told. One miss is
+/// often a Wi-Fi blip or a wake from sleep, after which the same address comes back.
+const ADDRESS_MISSES: u32 = 2;
+
 /// While the proxy runs on `ip`: read this computer's addresses every `every`, and tell the
-/// UI, once each time it happens, that `ip` is no longer among them. (A computer that moves
-/// to another Wi-Fi keeps its listener, bound to an address nothing can reach any more.)
+/// UI, once each time it happens, that `ip` is no longer among them: when it has been missing
+/// from [`ADDRESS_MISSES`] looks in a row (so about 10 s at the usual 5 s). (A computer that
+/// moves to another Wi-Fi keeps its listener, bound to an address nothing can reach any more.)
+///
+/// Nothing is sent when the address comes back. The UI finds out by asking for the proxy
+/// again (`start_proxy` with no address), which describes it as before once the address is
+/// this computer's again, and rejects with `address_changed` while it is not.
 async fn watch_address(ip: Ipv4Addr, every: Duration, addresses: AddressSource, emit: EmitProxy) {
-    let mut gone = false;
+    let mut misses = 0u32;
     loop {
         tokio::time::sleep(every).await;
-        let now_gone = !still_ours(ip, &addresses());
-        if now_gone && !gone {
+        if still_ours(ip, &addresses()) {
+            if misses >= ADDRESS_MISSES {
+                tracing::info!("this computer has the proxy's address again");
+            }
+            misses = 0;
+            continue;
+        }
+        misses = misses.saturating_add(1);
+        if misses == ADDRESS_MISSES {
             tracing::warn!("this computer no longer has the address the proxy is listening on");
             emit(ProxyEventDto::AddressChanged);
-        } else if gone && !now_gone {
-            tracing::info!("this computer has the proxy's address again");
         }
-        gone = now_gone;
     }
 }
 

@@ -2182,6 +2182,47 @@ async fn a_code_that_cannot_be_drawn_is_an_error_not_an_empty_picture() {
 }
 
 #[tokio::test]
+async fn an_address_missing_from_one_look_only_is_not_a_change() {
+    // What each look at this computer's addresses finds, in order; after the script, the
+    // address is there.
+    let script = [
+        true, false, true, true, // one look without it (a Wi-Fi blip): nothing said
+        false, false, false, true, // gone on two looks in a row: said once
+        false, true, // one look again: nothing
+        false, false, // two in a row again: said a second time
+    ];
+    let looks = Arc::new(AtomicUsize::new(0));
+    let counter = Arc::clone(&looks);
+    let addresses: AddressSource = Arc::new(move || {
+        let n = counter.fetch_add(1, Ordering::SeqCst);
+        if script.get(n).copied().unwrap_or(true) {
+            vec![IpAddr::V4(Ipv4Addr::LOCALHOST)]
+        } else {
+            vec![]
+        }
+    });
+    let (emit, mut heard) = events();
+    let watch = tokio::spawn(watch_address(
+        Ipv4Addr::LOCALHOST,
+        Duration::from_millis(2),
+        addresses,
+        emit,
+    ));
+    while looks.load(Ordering::SeqCst) < script.len() + 3 {
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+    watch.abort();
+    let mut said = Vec::new();
+    while let Ok(event) = heard.try_recv() {
+        said.push(event);
+    }
+    assert_eq!(
+        said,
+        [ProxyEventDto::AddressChanged, ProxyEventDto::AddressChanged]
+    );
+}
+
+#[tokio::test]
 async fn a_changed_address_is_noticed_once_and_the_stale_proxy_is_not_described_again() {
     let dir = tempfile::tempdir().unwrap();
     let s = session(dir.path(), Arc::new(MemoryKeyStore::new()));
