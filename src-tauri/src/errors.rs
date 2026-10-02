@@ -227,6 +227,7 @@ rejections! {
     CleanupMarkerNotRemoved => CleanupFailed,
         "The app could not clear its own note that a cleanup is due, so it will ask again next time it is opened. Try again.";
 
+    /// A command panicked (see `commands::settled`): it still answers, with this.
     Internal => Internal,
         "Something went wrong inside the app. Try again; if it keeps happening, quit the app and open it again.";
 }

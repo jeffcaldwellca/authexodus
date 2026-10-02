@@ -16,13 +16,19 @@
 //!   sentences are fixed text, so none can hold a password, a secret, a path or a name. No
 //!   command logs its arguments; `unlock` and `bwLogin` carry passwords, which are held in
 //!   `Zeroizing` so they are wiped from memory when the command is done.
+//! * Every command that can be refused runs its work through [`settled`] (or [`settled_now`]):
+//!   a panic inside it is answered as `internal`, so the UI's promise always settles.
 //!
 //! The command list is written once, in `commands!`, which also builds the Tauri handler, so
 //! `commands_match_api_contract` compares the real registered list against `api.ts`. It also
 //! reads this file and compares each command's argument names with the method's parameters.
 
+use std::future::Future;
+use std::panic::AssertUnwindSafe;
 use std::path::PathBuf;
+use std::pin::Pin;
 use std::sync::Arc;
+use std::task::{Context, Poll};
 
 use tauri::{AppHandle, Emitter, Manager, State, WebviewWindow};
 use tauri_plugin_dialog::DialogExt;
@@ -41,6 +47,43 @@ pub const EVENTS: &[(&str, &str)] = &[
 ];
 pub const EVENT_PROXY: &str = "proxy-event";
 pub const EVENT_BW_PROGRESS: &str = "bw-progress";
+
+/// A command's work, polled so that a panic inside it ends the poll instead of the task.
+struct CatchPanic<F>(Pin<Box<F>>);
+
+impl<F: Future> Future for CatchPanic<F> {
+    /// `None`: the work panicked.
+    type Output = Option<F::Output>;
+
+    fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+        let work = self.0.as_mut();
+        match std::panic::catch_unwind(AssertUnwindSafe(|| work.poll(cx))) {
+            Ok(Poll::Ready(answer)) => Poll::Ready(Some(answer)),
+            Ok(Poll::Pending) => Poll::Pending,
+            Err(_) => Poll::Ready(None),
+        }
+    }
+}
+
+fn panicked<T>() -> Result<T, CmdError> {
+    // The panic's own message went to the terminal through the panic hook; it is not repeated
+    // here and never reaches the screen.
+    tracing::error!("a command stopped unexpectedly");
+    Err(CmdError(Reject::Internal))
+}
+
+/// Run an `async` command's work so that it always answers. Tauri runs such a command on a
+/// task of its own; if the work panicked there, the task would end without answering and the
+/// UI's promise would never settle ("Signing in…" for ever). A panic is answered as
+/// `internal` instead, with the fixed sentence.
+pub async fn settled<T>(work: impl Future<Output = Result<T, CmdError>>) -> Result<T, CmdError> {
+    CatchPanic(Box::pin(work)).await.unwrap_or_else(panicked)
+}
+
+/// [`settled`] for the commands that do not wait on anything.
+pub fn settled_now<T>(work: impl FnOnce() -> Result<T, CmdError>) -> Result<T, CmdError> {
+    std::panic::catch_unwind(AssertUnwindSafe(work)).unwrap_or_else(|_| panicked())
+}
 
 #[tauri::command]
 pub fn get_state(session: State<'_, Session>) -> AppState {
@@ -65,9 +108,12 @@ pub async fn start_proxy(
     session: State<'_, Session>,
     ip: Option<String>,
 ) -> Result<ProxyInfo, CmdError> {
-    session
-        .start_proxy(ip.as_deref(), &network::system(), proxy_emitter(app))
-        .await
+    settled(async move {
+        session
+            .start_proxy(ip.as_deref(), &network::system(), proxy_emitter(app))
+            .await
+    })
+    .await
 }
 
 /// The explicit start-over: see [`Session::restart_proxy`].
@@ -77,9 +123,12 @@ pub async fn restart_proxy(
     session: State<'_, Session>,
     ip: Option<String>,
 ) -> Result<ProxyInfo, CmdError> {
-    session
-        .restart_proxy(ip.as_deref(), &network::system(), proxy_emitter(app))
-        .await
+    settled(async move {
+        session
+            .restart_proxy(ip.as_deref(), &network::system(), proxy_emitter(app))
+            .await
+    })
+    .await
 }
 
 #[tauri::command]
@@ -87,22 +136,22 @@ pub async fn unlock(
     session: State<'_, Session>,
     password: Zeroizing<String>,
 ) -> Result<UnlockResult, CmdError> {
-    session.unlock(password).await
+    settled(async move { session.unlock(password).await }).await
 }
 
 #[tauri::command]
 pub fn token_qr(session: State<'_, Session>, id: String) -> Result<String, CmdError> {
-    session.token_qr(&id)
+    settled_now(|| session.token_qr(&id))
 }
 
 #[tauri::command]
 pub fn google_migration_qrs(session: State<'_, Session>) -> Result<Vec<String>, CmdError> {
-    session.google_migration_qrs()
+    settled_now(|| session.google_migration_qrs())
 }
 
 #[tauri::command]
 pub fn google_unsupported(session: State<'_, Session>) -> Result<Vec<String>, CmdError> {
-    session.google_unsupported()
+    settled_now(|| session.google_unsupported())
 }
 
 /// Write the `file` made for `dest` to `chosen` (owner-only), or report that the person
@@ -136,33 +185,36 @@ pub async fn export_file(
     session: State<'_, Session>,
     dest: DestinationDto,
 ) -> Result<ExportOutcome, CmdError> {
-    let file = session.prepare_export(dest)?;
-    let (tx, rx) = tokio::sync::oneshot::channel();
-    let mut dialog = app
-        .dialog()
-        .file()
-        .set_parent(&window)
-        .set_file_name(&file.suggested_name);
-    if let Ok(downloads) = app.path().download_dir() {
-        dialog = dialog.set_directory(downloads);
-    }
-    dialog.save_file(move |picked| {
-        let _ = tx.send(picked);
-    });
-    let picked = rx.await.map_err(|_| CmdError(Reject::SaveDialogClosed))?;
-    let chosen = match picked {
-        None => None,
-        Some(p) => Some(
-            p.into_path()
-                .map_err(|_| CmdError(Reject::UnsavableLocation))?,
-        ),
-    };
-    finish_export(dest, &file, chosen)
+    settled(async move {
+        let file = session.prepare_export(dest)?;
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        let mut dialog = app
+            .dialog()
+            .file()
+            .set_parent(&window)
+            .set_file_name(&file.suggested_name);
+        if let Ok(downloads) = app.path().download_dir() {
+            dialog = dialog.set_directory(downloads);
+        }
+        dialog.save_file(move |picked| {
+            let _ = tx.send(picked);
+        });
+        let picked = rx.await.map_err(|_| CmdError(Reject::SaveDialogClosed))?;
+        let chosen = match picked {
+            None => None,
+            Some(p) => Some(
+                p.into_path()
+                    .map_err(|_| CmdError(Reject::UnsavableLocation))?,
+            ),
+        };
+        finish_export(dest, &file, chosen)
+    })
+    .await
 }
 
 #[tauri::command]
 pub fn live_codes(session: State<'_, Session>) -> Result<Vec<LiveCode>, CmdError> {
-    session.live_codes()
+    settled_now(|| session.live_codes())
 }
 
 fn progress_emitter(app: AppHandle) -> EmitProgress {
@@ -174,14 +226,17 @@ fn progress_emitter(app: AppHandle) -> EmitProgress {
 /// Progress lines arrive on `bw-progress` while this runs (see `progress.rs`).
 #[tauri::command]
 pub async fn bw_prepare(app: AppHandle, session: State<'_, Session>) -> Result<(), CmdError> {
-    session.bw_prepare(progress_emitter(app)).await
+    settled(async move { session.bw_prepare(progress_emitter(app)).await }).await
 }
 
 /// Stop a download or a sign-in that is under way. Never fails: see [`Session::bw_cancel`].
 #[tauri::command]
 pub async fn bw_cancel(session: State<'_, Session>) -> Result<(), CmdError> {
-    session.bw_cancel().await;
-    Ok(())
+    settled(async move {
+        session.bw_cancel().await;
+        Ok(())
+    })
+    .await
 }
 
 #[tauri::command]
@@ -189,18 +244,21 @@ pub async fn bw_login(
     session: State<'_, Session>,
     login: BwLoginInput,
 ) -> Result<BwLoginResult, CmdError> {
-    let client = session.new_cli_client()?;
-    session.bw_login(Box::new(client), login).await
+    settled(async move {
+        let client = session.new_cli_client()?;
+        session.bw_login(Box::new(client), login).await
+    })
+    .await
 }
 
 #[tauri::command]
 pub async fn bw_propose(session: State<'_, Session>) -> Result<Vec<ProposalDto>, CmdError> {
-    session.bw_propose().await
+    settled(async move { session.bw_propose().await }).await
 }
 
 #[tauri::command]
 pub async fn bw_logins(session: State<'_, Session>) -> Result<Vec<VaultLoginView>, CmdError> {
-    session.bw_logins().await
+    settled(async move { session.bw_logins().await }).await
 }
 
 #[tauri::command]
@@ -209,17 +267,17 @@ pub async fn bw_apply(
     session: State<'_, Session>,
     decisions: Vec<DecisionEntry>,
 ) -> Result<ApplyReportDto, CmdError> {
-    session.bw_apply(decisions, progress_emitter(app)).await
+    settled(async move { session.bw_apply(decisions, progress_emitter(app)).await }).await
 }
 
 #[tauri::command]
 pub async fn cleanup(session: State<'_, Session>) -> Result<(), CmdError> {
-    session.cleanup().await
+    settled(async move { session.cleanup().await }).await
 }
 
 #[tauri::command]
 pub async fn finish(session: State<'_, Session>) -> Result<(), CmdError> {
-    session.finish().await
+    settled(async move { session.finish().await }).await
 }
 
 /// The single list of commands: it builds both the handler Tauri registers and
@@ -637,6 +695,34 @@ mod tests {
             serde_json::to_string(&ProxyEventDto::AddressChanged).unwrap(),
             r#"{"kind":"addressChanged"}"#
         );
+    }
+
+    /// A panic inside a command must still settle the UI's promise, as `internal`, or the
+    /// screen would wait on "Signing in…" for ever.
+    #[tokio::test]
+    async fn a_command_that_panics_still_answers_as_internal() {
+        let straight: Result<u8, CmdError> = settled(async { panic!("inside the command") }).await;
+        assert_eq!(straight, Err(CmdError(Reject::Internal)));
+        let later: Result<u8, CmdError> = settled(async {
+            tokio::task::yield_now().await;
+            panic!("after waiting once")
+        })
+        .await;
+        let error = later.unwrap_err();
+        assert_eq!(error, CmdError(Reject::Internal));
+        assert!(error
+            .to_string()
+            .starts_with("internal: Something went wrong inside the app."));
+        // The same for the commands that do not wait on anything.
+        let sync: Result<u8, CmdError> = settled_now(|| panic!("in a plain command"));
+        assert_eq!(sync, Err(CmdError(Reject::Internal)));
+        // Work that does not panic is untouched, answer or refusal.
+        assert_eq!(settled(async { Ok::<_, CmdError>(7) }).await, Ok(7));
+        assert_eq!(
+            settled(async { Err::<u8, _>(CmdError(Reject::NotUnlocked)) }).await,
+            Err(CmdError(Reject::NotUnlocked))
+        );
+        assert_eq!(settled_now(|| Ok::<_, CmdError>(8)), Ok(8));
     }
 
     #[test]
