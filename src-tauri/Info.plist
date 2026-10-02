@@ -1,0 +1,16 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  Additions to the app's Info.plist. Tauri merges a file of this name that sits beside
+  tauri.conf.json into the Info.plist it generates, so tauri.conf.json does not name it.
+
+  NSLocalNetworkUsageDescription: what macOS shows the person if it asks whether this app may
+  talk to devices on the local network. The app listens on this computer's Wi-Fi address for
+  the iPhone or iPad; without this text the prompt, if it appears, would give no reason.
+-->
+<plist version="1.0">
+<dict>
+	<key>NSLocalNetworkUsageDescription</key>
+	<string>authexodus lets your iPhone or iPad connect to this Mac over your Wi-Fi so it can read the backup Authy sends.</string>
+</dict>
+</plist>

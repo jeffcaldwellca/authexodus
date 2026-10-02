@@ -151,6 +151,49 @@ mod tests {
         }
     }
 
+    /// The value of `key` in the Info.plist additions, if it is there as a string.
+    fn plist_string<'a>(plist: &'a str, key: &str) -> Option<&'a str> {
+        let after = plist.split_once(&format!("<key>{key}</key>"))?.1;
+        let value = after.trim_start().strip_prefix("<string>")?;
+        Some(value.split_once("</string>")?.0)
+    }
+
+    #[test]
+    fn the_local_network_prompt_says_why_in_plain_words() {
+        let plist = include_str!("../Info.plist");
+        let said = plist_string(plist, "NSLocalNetworkUsageDescription")
+            .expect("the local-network usage description is set");
+        assert_eq!(
+            said,
+            "authexodus lets your iPhone or iPad connect to this Mac over your Wi-Fi so it can read the backup Authy sends."
+        );
+        // Tauri finds the file by its name and place: beside tauri.conf.json. The
+        // configuration must not point somewhere else.
+        let config: serde_json::Value =
+            serde_json::from_str(include_str!("../tauri.conf.json")).unwrap();
+        assert!(config["bundle"]["macOS"].get("infoPlist").is_none());
+        assert!(
+            std::path::Path::new(concat!(env!("CARGO_MANIFEST_DIR"), "/Info.plist")).exists()
+                && std::path::Path::new(concat!(env!("CARGO_MANIFEST_DIR"), "/tauri.conf.json"))
+                    .exists()
+        );
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn the_info_plist_additions_are_a_well_formed_property_list() {
+        let checked = std::process::Command::new("/usr/bin/plutil")
+            .arg("-lint")
+            .arg(concat!(env!("CARGO_MANIFEST_DIR"), "/Info.plist"))
+            .output()
+            .expect("plutil is part of macOS");
+        assert!(
+            checked.status.success(),
+            "{}",
+            String::from_utf8_lossy(&checked.stdout)
+        );
+    }
+
     #[test]
     fn the_app_has_one_window_and_it_is_the_one_a_second_launch_brings_forward() {
         let config: serde_json::Value =
