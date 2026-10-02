@@ -1,0 +1,19 @@
+# THROWAWAY spike (Batch 0). Not part of the workspace. Do not build on this code;
+# its only product is the verdict recorded at the top of crates/core/src/proxy.rs.
+[package]
+name = "proxy-spike"
+version = "0.0.0"
+edition = "2021"
+publish = false
+
+[workspace]
+
+[dependencies]
+hudsucker = { version = "0.25", features = ["rcgen-ca", "rustls-client", "decoder"] }
+tokio = { version = "1", features = ["full"] }
+tokio-rustls = "0.26"
+http-body-util = "0.1"
+tower-service = "0.3"
+hyper-rustls = { version = "0.27", default-features = false, features = ["http1", "aws-lc-rs"] }
+anyhow = "1"
+reqwest = { version = "0.13", default-features = false, features = ["rustls"] }
