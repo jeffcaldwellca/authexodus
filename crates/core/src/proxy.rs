@@ -95,10 +95,16 @@ const TUNNEL_IDLE: Duration = Duration::from_secs(10 * 60);
 /// Connections served at once from every peer together, tunnels included. Further ones wait
 /// in the listen queue.
 const MAX_CONNECTIONS: usize = 512;
-/// Connections served at once from one peer address. A peer at its limit has further
-/// connections closed straight away, so no single peer can use up [`MAX_CONNECTIONS`] and
-/// keep the iPhone or iPad out.
+/// Connections served at once from one peer address, so that no single peer can use up
+/// [`MAX_CONNECTIONS`] and keep the iPhone or iPad out. A peer at its limit that opens another
+/// connection gets it at the cost of its own longest-idle tunnel (see [`EVICT_AFTER`]); if it
+/// has no tunnel to give up, the new connection is closed straight away.
 const MAX_CONNECTIONS_PER_PEER: usize = 128;
+/// A tunnel that has carried nothing for this long may be closed to make room for a new
+/// connection from the same peer. A busy device holds many tunnels its apps are done with;
+/// closing one of those is harmless, and it keeps the device's new connections (Authy's among
+/// them) from being turned away.
+const EVICT_AFTER: Duration = Duration::from_secs(10);
 /// When several addresses are tried for one name, the next attempt starts this long after the
 /// previous one if that has not answered yet; the first to connect wins.
 const CONNECT_STAGGER: Duration = Duration::from_millis(250);
@@ -191,6 +197,7 @@ pub struct TestUpstream {
     default_peer: Option<IpAddr>,
     max_connections: usize,
     max_per_peer: usize,
+    evict_after: Duration,
     tunnel_idle: Duration,
 }
 
@@ -206,6 +213,7 @@ impl TestUpstream {
             default_peer: None,
             max_connections: MAX_CONNECTIONS,
             max_per_peer: MAX_CONNECTIONS_PER_PEER,
+            evict_after: EVICT_AFTER,
             tunnel_idle: TUNNEL_IDLE,
         }
     }
@@ -248,6 +256,13 @@ impl TestUpstream {
     /// production limit).
     pub fn with_max_per_peer(mut self, max: usize) -> TestUpstream {
         self.max_per_peer = max;
+        self
+    }
+
+    /// A peer at its limit may have a tunnel closed once it has been idle this long (the
+    /// default is the production value).
+    pub fn with_evict_after(mut self, idle: Duration) -> TestUpstream {
+        self.evict_after = idle;
         self
     }
 
@@ -338,6 +353,7 @@ pub async fn start(
         .upstream
         .as_ref()
         .map_or(MAX_CONNECTIONS_PER_PEER, |u| u.max_per_peer);
+    let evict_after = cfg.upstream.as_ref().map_or(EVICT_AFTER, |u| u.evict_after);
     let tunnel_idle = cfg.upstream.as_ref().map_or(TUNNEL_IDLE, |u| u.tunnel_idle);
     let pretend_peers = cfg.upstream.as_ref().map(|u| Arc::clone(&u.peers));
     let default_peer = cfg.upstream.as_ref().and_then(|u| u.default_peer);
@@ -365,6 +381,8 @@ pub async fn start(
         refused: Throttle::new(REFUSED_EVERY),
         per_peer: Mutex::new(HashMap::new()),
         max_per_peer,
+        tunnels: Mutex::new(Vec::new()),
+        evict_after,
         at_limit: Throttle::new(LIMIT_LOG_EVERY),
         pretend_peers,
         default_peer,
@@ -423,6 +441,9 @@ struct Shared {
     /// Open connections for each peer address.
     per_peer: Mutex<HashMap<IpAddr, usize>>,
     max_per_peer: usize,
+    /// Every open blind tunnel, with the peer it belongs to.
+    tunnels: Mutex<Vec<(IpAddr, Arc<Tunnel>)>>,
+    evict_after: Duration,
     at_limit: Throttle,
     /// Tests only: source port -> pretended peer address.
     pretend_peers: Option<Arc<Mutex<HashMap<u16, IpAddr>>>>,
@@ -465,11 +486,16 @@ impl Shared {
         *self.lock_device() == Some(peer.to_canonical())
     }
 
-    /// Count one more connection for `peer`, unless it is at its limit already.
+    /// Count one more connection for `peer`. At its limit, the peer's longest-idle tunnel is
+    /// told to close and the new connection takes its place (so the count is over the limit
+    /// only until that tunnel has gone); with no tunnel idle long enough, `None`.
     fn peer_slot(self: &Arc<Self>, peer: IpAddr) -> Option<PeerSlot> {
         let mut open = self.per_peer.lock().unwrap_or_else(PoisonError::into_inner);
         let count = open.entry(peer).or_insert(0);
-        if *count >= self.max_per_peer {
+        if *count >= self.max_per_peer && !self.evict_idle_tunnel(peer) {
+            if *count == 0 {
+                open.remove(&peer);
+            }
             return None;
         }
         *count += 1;
@@ -477,6 +503,31 @@ impl Shared {
             shared: Arc::clone(self),
             peer,
         })
+    }
+
+    /// Tell the tunnel of `peer` that has been idle longest (and at least
+    /// [`Shared::evict_after`]) to close. False when it has no such tunnel.
+    fn evict_idle_tunnel(&self, peer: IpAddr) -> bool {
+        let now = Instant::now();
+        let tunnels = self.tunnels.lock().unwrap_or_else(PoisonError::into_inner);
+        let oldest = tunnels
+            .iter()
+            .filter(|(owner, tunnel)| *owner == peer && !tunnel.evicted.load(Ordering::SeqCst))
+            .map(|(_, tunnel)| (tunnel.last_activity(), tunnel))
+            .filter(|(last, _)| now.saturating_duration_since(*last) >= self.evict_after)
+            .min_by_key(|(last, _)| *last);
+        match oldest {
+            Some((_, tunnel)) => {
+                tunnel.evicted.store(true, Ordering::SeqCst);
+                tunnel.evict.notify_one();
+                tracing::debug!(
+                    accepted_device = self.is_the_device(peer),
+                    "a peer at its connection limit had its longest-idle tunnel closed"
+                );
+                true
+            }
+            None => false,
+        }
     }
 
     /// A peer was turned away from an intercepted host because another peer is the device.
@@ -520,6 +571,21 @@ impl Shared {
             value = fut => Some(value),
             _ = self.stopped() => None,
         }
+    }
+}
+
+/// One open blind tunnel, as the rest of the proxy sees it.
+struct Tunnel {
+    /// When bytes last moved through it, in either direction.
+    activity: Mutex<Instant>,
+    /// Told to close to make room for a newer connection from the same peer.
+    evict: tokio::sync::Notify,
+    evicted: AtomicBool,
+}
+
+impl Tunnel {
+    fn last_activity(&self) -> Instant {
+        *self.activity.lock().unwrap_or_else(PoisonError::into_inner)
     }
 }
 
@@ -676,8 +742,9 @@ async fn accept_loop(
 
         let from = shared.peer_of(peer);
         let Some(peer_slot) = shared.peer_slot(from) else {
-            // This peer holds its share already. Closing at once keeps the rest free for
-            // everyone else. The line says only whether it was the accepted device.
+            // This peer holds its share already and has no idle tunnel to give up. Closing at
+            // once keeps the rest free for everyone else. The line says only whether it was
+            // the accepted device.
             if shared.at_limit.ready() {
                 tracing::warn!(
                     limit = shared.max_per_peer,
@@ -915,35 +982,55 @@ async fn connect(conn: Conn, req: Request<Incoming>) -> Response<ProxyBody> {
         Some(Err(_)) | None => return plain(StatusCode::BAD_GATEWAY),
     };
     tokio::spawn(async move {
+        let peer = conn.peer();
         let _conn = conn; // holds the connection's slot until the tunnel closes
         let Ok(upgraded) = hyper::upgrade::on(req).await else {
             return;
         };
         let mut device = TokioIo::new(upgraded);
         // Every byte of the tunnel, in either direction, is a read or a write on `server`.
-        let activity = Arc::new(Mutex::new(Instant::now()));
+        let tunnel = Arc::new(Tunnel {
+            activity: Mutex::new(Instant::now()),
+            evict: tokio::sync::Notify::new(),
+            evicted: AtomicBool::new(false),
+        });
+        shared
+            .tunnels
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .push((peer, Arc::clone(&tunnel)));
         let mut server = Watched {
             inner: server,
-            activity: Arc::clone(&activity),
+            tunnel: Arc::clone(&tunnel),
         };
         let copying = tokio::io::copy_bidirectional(&mut device, &mut server);
         tokio::select! {
             _ = shared.unless_stopped(copying) => {}
-            _ = idle_for(&activity, shared.tunnel_idle) => {}
+            _ = idle_for(&tunnel.activity, shared.tunnel_idle) => {}
+            _ = tunnel.evict.notified() => {}
         }
+        shared
+            .tunnels
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .retain(|(_, open)| !Arc::ptr_eq(open, &tunnel));
     });
     plain(StatusCode::OK)
 }
 
-/// A stream that notes when bytes last moved through it.
+/// A stream that notes on its tunnel when bytes last moved through it.
 struct Watched<T> {
     inner: T,
-    activity: Arc<Mutex<Instant>>,
+    tunnel: Arc<Tunnel>,
 }
 
 impl<T> Watched<T> {
     fn touch(&self) {
-        *self.activity.lock().unwrap_or_else(PoisonError::into_inner) = Instant::now();
+        *self
+            .tunnel
+            .activity
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner) = Instant::now();
     }
 }
 

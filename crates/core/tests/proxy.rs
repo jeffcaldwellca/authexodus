@@ -2038,3 +2038,71 @@ async fn a_refused_certificate_is_logged_with_the_alert_the_device_sent() {
         "{logs}"
     );
 }
+
+#[tokio::test]
+async fn a_device_at_its_limit_gives_up_its_longest_idle_tunnel_for_a_new_connection() {
+    let rig = rig_tuned(|upstream| {
+        upstream
+            .with_max_per_peer(2)
+            .with_evict_after(Duration::from_millis(100))
+    })
+    .await;
+    // A server that echoes whatever it is sent and never hangs up.
+    let listener = TcpListener::bind((LOCALHOST, 0)).await.unwrap();
+    let echo = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        while let Ok((mut tcp, _)) = listener.accept().await {
+            tokio::spawn(async move {
+                let (mut reader, mut writer) = tcp.split();
+                let _ = tokio::io::copy(&mut reader, &mut writer).await;
+            });
+        }
+    });
+    let get = b"GET / HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n";
+
+    // The phone has two tunnels open, which is its limit here.
+    let (status, mut old) = connect_on(rig.connect_as(PHONE).await, "127.0.0.1", echo.port()).await;
+    assert_eq!(status, "HTTP/1.1 200 OK");
+    let (status, mut busy) =
+        connect_on(rig.connect_as(PHONE).await, "127.0.0.1", echo.port()).await;
+    assert_eq!(status, "HTTP/1.1 200 OK");
+
+    // Straight away neither has been idle long enough to give up: a third is turned away.
+    let mut third = rig.connect_as(PHONE).await;
+    let _ = third.write_all(get).await;
+    let mut answer = Vec::new();
+    let _ = tokio::time::timeout(WAIT, third.read_to_end(&mut answer)).await;
+    assert!(answer.is_empty(), "nothing to give up yet");
+
+    // A little later one tunnel is still in use and the other has gone quiet.
+    tokio::time::sleep(Duration::from_millis(250)).await;
+    busy.write_all(b"x").await.unwrap();
+    assert_eq!(busy.read_u8().await.unwrap(), b'x');
+
+    // The phone's next connection is served...
+    let mut next = rig.connect_as(PHONE).await;
+    next.write_all(get).await.unwrap();
+    let mut answer = Vec::new();
+    tokio::time::timeout(WAIT, next.read_to_end(&mut answer))
+        .await
+        .expect("served")
+        .unwrap();
+    assert!(
+        answer.starts_with(b"HTTP/1.1 200"),
+        "the new connection is served"
+    );
+
+    // ...at the cost of the quiet tunnel, not the busy one.
+    let mut buf = [0u8; 1];
+    let read = tokio::time::timeout(WAIT, old.read(&mut buf))
+        .await
+        .expect("the idle tunnel was closed");
+    assert!(matches!(read, Ok(0) | Err(_)), "{read:?}");
+    busy.write_all(b"y").await.unwrap();
+    assert_eq!(
+        busy.read_u8().await.unwrap(),
+        b'y',
+        "the busy tunnel is untouched"
+    );
+    rig.handle.shutdown().await;
+}
