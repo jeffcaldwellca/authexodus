@@ -5,6 +5,11 @@
 //! 2026-10-02 and match the `digest` GitHub publishes for each release asset. A zip whose hash
 //! differs is deleted and refused; nothing unverified is ever extracted or run.
 //!
+//! The folder is made readable by its owner only. Every call extracts `bw` afresh from the
+//! verified zip, replacing whatever was there, and returns the SHA-256 of what it wrote, so
+//! the caller can check the file again before using it (see `CliClient::expecting_sha256`).
+//! A download larger than [`MAX_DOWNLOAD_BYTES`] is abandoned.
+//!
 //! Asset naming for this release: `bw-macos-arm64-VERSION.zip` is Apple silicon; the build with no
 //! architecture in its name, `bw-macos-VERSION.zip`, is Intel (x64).
 
@@ -33,6 +38,15 @@ const TOTAL_TIMEOUT: Duration = Duration::from_secs(600);
 
 /// File name of the extracted binary inside `dir`.
 const BINARY_NAME: &str = "bw";
+/// The release zip is about 130 MB. Anything past this is not it, and is not written to disk.
+pub const MAX_DOWNLOAD_BYTES: u64 = 400 * 1024 * 1024;
+
+/// The extracted `bw` program and the SHA-256 (hex) of the file as it was written.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CliBinary {
+    pub path: PathBuf,
+    pub sha256: String,
+}
 
 /// The pinned asset for this machine: (file name, expected SHA-256 hex).
 pub fn pinned_asset() -> Result<(&'static str, &'static str), BwError> {
@@ -50,8 +64,8 @@ pub fn pinned_asset() -> Result<(&'static str, &'static str), BwError> {
     }
 }
 
-/// Download (or reuse) the pinned, verified CLI and return the path to `bw`.
-pub async fn ensure_cli(dir: &Path) -> Result<PathBuf, BwError> {
+/// Download (or reuse) the pinned, verified CLI and return the extracted `bw`.
+pub async fn ensure_cli(dir: &Path) -> Result<CliBinary, BwError> {
     let (asset, sha256) = pinned_asset()?;
     let base = format!("{RELEASE_BASE_URL}/{RELEASE_TAG}");
     ensure_cli_from(dir, &base, asset, sha256).await
@@ -64,11 +78,30 @@ pub async fn ensure_cli_from(
     base_url: &str,
     asset: &str,
     expected_sha256: &str,
-) -> Result<PathBuf, BwError> {
+) -> Result<CliBinary, BwError> {
+    ensure_cli_within(dir, base_url, asset, expected_sha256, MAX_DOWNLOAD_BYTES).await
+}
+
+/// [`ensure_cli_from`] with the size limit injected, so a test need not serve 400 MB.
+#[doc(hidden)]
+pub async fn ensure_cli_within(
+    dir: &Path,
+    base_url: &str,
+    asset: &str,
+    expected_sha256: &str,
+    max_bytes: u64,
+) -> Result<CliBinary, BwError> {
     let io = |what: &str, e: std::io::Error| BwError::Download(format!("{what}: {e}"));
     tokio::fs::create_dir_all(dir)
         .await
         .map_err(|e| io("creating the download folder", e))?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        tokio::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700))
+            .await
+            .map_err(|e| io("making the download folder private", e))?;
+    }
     let zip_path = dir.join(asset);
 
     // A zip kept from an earlier run is trusted only if it still hashes correctly.
@@ -79,7 +112,7 @@ pub async fn ensure_cli_from(
     if !have_good_zip {
         let part = dir.join(format!("{asset}.part"));
         let url = format!("{}/{asset}", base_url.trim_end_matches('/'));
-        let actual = match fetch(&url, &part).await {
+        let actual = match fetch(&url, &part, max_bytes).await {
             Ok(h) => h,
             Err(e) => {
                 let _ = tokio::fs::remove_file(&part).await;
@@ -97,14 +130,17 @@ pub async fn ensure_cli_from(
 
     let dest = dir.join(BINARY_NAME);
     let (zip_path2, dest2) = (zip_path.clone(), dest.clone());
-    tokio::task::spawn_blocking(move || extract_binary(&zip_path2, &dest2))
+    let sha256 = tokio::task::spawn_blocking(move || extract_binary(&zip_path2, &dest2))
         .await
         .map_err(|e| BwError::Download(format!("unpacking: {e}")))??;
-    Ok(dest)
+    Ok(CliBinary { path: dest, sha256 })
 }
 
-/// Stream `url` into `path`, hashing as it goes. Returns the SHA-256 hex.
-async fn fetch(url: &str, path: &Path) -> Result<String, BwError> {
+/// Stream `url` into `path`, hashing as it goes. Returns the SHA-256 hex. `path` must not
+/// exist when the writing starts (a leftover is removed first; a symbolic link planted there
+/// is refused, not followed), and no more than `max_bytes` are accepted.
+async fn fetch(url: &str, path: &Path, max_bytes: u64) -> Result<String, BwError> {
+    let too_large = || BwError::Download("the download is larger than expected".into());
     let dl = |e: &dyn std::fmt::Display| BwError::Download(e.to_string());
     let client = reqwest::Client::builder()
         .connect_timeout(CONNECT_TIMEOUT)
@@ -118,9 +154,23 @@ async fn fetch(url: &str, path: &Path) -> Result<String, BwError> {
             resp.status()
         )));
     }
-    let mut file = tokio::fs::File::create(path).await.map_err(|e| dl(&e))?;
+    if resp.content_length().is_some_and(|len| len > max_bytes) {
+        return Err(too_large());
+    }
+    let _ = tokio::fs::remove_file(path).await;
+    let mut file = tokio::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(path)
+        .await
+        .map_err(|e| dl(&e))?;
     let mut hasher = Sha256::new();
+    let mut received: u64 = 0;
     while let Some(chunk) = resp.chunk().await.map_err(|e| dl(&e))? {
+        received += chunk.len() as u64;
+        if received > max_bytes {
+            return Err(too_large());
+        }
         hasher.update(&chunk);
         file.write_all(&chunk).await.map_err(|e| dl(&e))?;
     }
@@ -128,7 +178,7 @@ async fn fetch(url: &str, path: &Path) -> Result<String, BwError> {
     Ok(hex::encode(hasher.finalize()))
 }
 
-async fn sha256_of_file(path: &Path) -> std::io::Result<String> {
+pub(crate) async fn sha256_of_file(path: &Path) -> std::io::Result<String> {
     let path = path.to_owned();
     tokio::task::spawn_blocking(move || {
         let mut f = std::fs::File::open(path)?;
@@ -140,8 +190,11 @@ async fn sha256_of_file(path: &Path) -> std::io::Result<String> {
     .map_err(std::io::Error::other)?
 }
 
-/// Pull the single `bw` entry out of the verified zip and make it executable.
-fn extract_binary(zip_path: &Path, dest: &Path) -> Result<(), BwError> {
+/// Pull the single `bw` entry out of the verified zip, make it executable, and put it in
+/// place of whatever `dest` was. Returns the SHA-256 hex of the bytes written. The temporary
+/// file must be new: a leftover is removed first, and a symbolic link planted at its name is
+/// refused, not followed.
+fn extract_binary(zip_path: &Path, dest: &Path) -> Result<String, BwError> {
     let err = |e: &dyn std::fmt::Display| BwError::Download(format!("unpacking: {e}"));
     let file = std::fs::File::open(zip_path).map_err(|e| err(&e))?;
     let mut archive = zip::ZipArchive::new(file).map_err(|e| err(&e))?;
@@ -149,9 +202,24 @@ fn extract_binary(zip_path: &Path, dest: &Path) -> Result<(), BwError> {
         .by_name(BINARY_NAME)
         .map_err(|_| BwError::Download("the download did not contain the bw program".into()))?;
     let tmp = dest.with_extension("partial");
+    let _ = std::fs::remove_file(&tmp);
+    let mut hasher = Sha256::new();
     {
-        let mut out = std::fs::File::create(&tmp).map_err(|e| err(&e))?;
-        std::io::copy(&mut entry, &mut out).map_err(|e| err(&e))?;
+        let mut out = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&tmp)
+            .map_err(|e| err(&e))?;
+        let mut buf = vec![0u8; 64 * 1024];
+        loop {
+            let n = std::io::Read::read(&mut entry, &mut buf).map_err(|e| err(&e))?;
+            if n == 0 {
+                break;
+            }
+            hasher.update(&buf[..n]);
+            std::io::Write::write_all(&mut out, &buf[..n]).map_err(|e| err(&e))?;
+        }
+        out.sync_all().map_err(|e| err(&e))?;
     }
     #[cfg(unix)]
     {
@@ -160,7 +228,7 @@ fn extract_binary(zip_path: &Path, dest: &Path) -> Result<(), BwError> {
             .map_err(|e| err(&e))?;
     }
     std::fs::rename(&tmp, dest).map_err(|e| err(&e))?;
-    Ok(())
+    Ok(hex::encode(hasher.finalize()))
 }
 
 #[cfg(test)]

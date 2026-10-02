@@ -504,10 +504,8 @@ mod tests {
         assert_eq!(unlocked.tokens.len(), 3);
         assert_eq!(unlocked.invalid.len(), 1);
         assert_eq!(unlocked.invalid[0].name, "Too many rounds");
-        assert!(
-            MAX_KDF_ITERATIONS >= 20 * 100_000,
-            "room above Authy's 100,000"
-        );
+        // Room above Authy's 100,000.
+        const { assert!(MAX_KDF_ITERATIONS >= 20 * 100_000) };
     }
 
     #[test]

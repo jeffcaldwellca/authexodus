@@ -4,6 +4,15 @@
 //! an environment variable named by `--passwordenv`; it is never an argument, never logged. The
 //! session key is held in memory (zeroized on drop) and handed to each child as `BW_SESSION`.
 //! Item JSON (which carries the authenticator key) goes to the child on stdin, never argv.
+//!
+//! The child gets an environment built from nothing (see [`child_environment`]): none of the
+//! parent's proxy, certificate, Node or loader variables can steer where the master password
+//! goes. What is placed in argv is checked first: the email and the server address by
+//! [`check_login_input`], item and folder ids by [`is_vault_id`].
+//!
+//! The binary: `ensure_cli` extracts it afresh from the hash-checked zip into a folder only
+//! this user can open and records its SHA-256; the client checks the file against that hash at
+//! the start of every sign-in (not before every one of the many runs that follow it).
 
 use std::collections::BTreeSet;
 use std::path::PathBuf;
@@ -17,7 +26,10 @@ use tokio::io::AsyncWriteExt;
 use tokio::process::Command;
 use zeroize::Zeroizing;
 
-use super::{BwClient, BwError, LoginOutcome, Region, SetTotp, VaultLogin, IMPORT_FOLDER};
+use super::{
+    check_login_input, is_vault_id, BwClient, BwError, CodeMark, LoginOutcome, Region, SetTotp,
+    VaultLogin, IMPORT_FOLDER,
+};
 
 // ---- Text of `bw` failures we react to. All matched case-insensitively as substrings of stderr.
 //
@@ -29,21 +41,43 @@ const BAD_CREDENTIALS: &[&str] = &[
     // older CLIs relayed the server's wording
     "username or password is incorrect",
 ];
-/// A non-interactive login without `--code` ends with `badRequest("Code is required.")`.
-const TWO_FACTOR_REQUIRED: &[&str] = &["code is required"];
+// The next four are VERIFIED the same way, in `LoginCommand.run` of CLI 2026.9.1 (read, not
+// run). What each means depends on whether a code was sent: see `classify_login_failure`.
+/// `badRequest("Code is required.")`. Without `--code`: the account needs a two-step code. It
+/// is also what a non-interactive login ends with when Bitwarden wants the code it emails to a
+/// new device, and that is the only way to get it when `--code` WAS given (with a code, the
+/// two-step branch never asks for one).
+const CODE_REQUIRED: &[&str] = &["code is required"];
+/// `error("Login failed. No provider selected.")`: the account has several two-step methods and
+/// none was chosen (no `--method`), or the one chosen with `--method 0` is not among them.
+const NO_PROVIDER_SELECTED: &[&str] = &["no provider selected"];
+/// `badRequest("No providers available for this client.")`: every two-step method on the
+/// account is one the tool cannot do (a hardware security key, Duo).
+const NO_PROVIDERS: &[&str] = &["no providers available"];
+/// `error("Login failed.")`, nothing after it: the code was sent and Bitwarden asked for
+/// two-step again. Matched as the whole message, since longer messages start the same way.
+const LOGIN_FAILED_BARE: &str = "login failed.";
 /// Vault not unlocked / session key unusable (`"Vault is locked."`, `"You are not logged in."`).
 const SESSION_GONE: &[&str] = &[
     "vault is locked",
     "you are not logged in",
     "session key is invalid",
 ];
-// ASSUMED (not found in the CLI source because the wording comes from the server): a wrong
-// two-step code. Treated like "two-step needed" so the user is asked for a fresh code.
+// ASSUMED (not in the CLI source: the wording comes from the server and the tool passes it
+// through; "Two-step token is invalid. Try again." is the server's text as last read, not
+// observed live): a wrong two-step code.
 const WRONG_TWO_FACTOR_CODE: &[&str] = &[
     "two-step token is invalid",
     "invalid token",
     "invalid two-step",
 ];
+
+/// Shown when Bitwarden wants a code it sent by email. (Our wording; the condition it reports
+/// is VERIFIED against CLI 2026.9.1, see [`CODE_REQUIRED`].)
+pub const EMAIL_CODE_UNSUPPORTED: &str = "Bitwarden wants a verification code that it sends by email (it does this for a new device, or when email is the account's two-step method). This app can only sign in with a code from an authenticator app. Save a Bitwarden import file instead and import it in Bitwarden yourself.";
+/// Shown when the account has no authenticator-app two-step method. (Our wording; conditions
+/// VERIFIED against CLI 2026.9.1, see [`NO_PROVIDER_SELECTED`] and [`NO_PROVIDERS`].)
+pub const METHOD_UNSUPPORTED: &str = "This Bitwarden account uses a two-step method this app cannot do (an emailed code or a hardware security key). This app can only sign in with a code from an authenticator app. Save a Bitwarden import file instead and import it in Bitwarden yourself.";
 // ASSUMED (typical Node/HTTP failure wording; the CLI passes these through): the server or the
 // network to it failed. Worth running again. Phrases only: a bare "500" or "network" can appear in
 // an unrelated message (an item named "Network 500"), so status codes are matched with their
@@ -74,31 +108,49 @@ const STATUS_CONTEXTS: &[&str] = &[
 ];
 const SERVER_STATUS_CODES: &[&str] = &["500", "502", "503", "504"];
 
-/// Variables from the user's own shell that would steer or leak into the child (their session,
-/// API-key login, output-format switches). All removed before ours are set.
-const SCRUBBED_ENV: &[&str] = &[
-    "BW_SESSION",
-    "BW_PASSWORD",
-    "BW_CLIENTID",
-    "BW_CLIENTSECRET",
-    "BW_QUIET",
-    "BW_RESPONSE",
-    "BW_RAW",
-    "BW_PRETTY",
-    "BW_CLEANEXIT",
-    "BITWARDENCLI_DEBUG",
-    "BITWARDENCLI_APPDATA_DIR",
-    "NODE_OPTIONS",
-];
+/// The only variables of this process the child may inherit, and only when they are set. The
+/// rest of the child's environment is built by [`child_environment`].
+const INHERITED_ENV: &[&str] = &["HOME", "TMPDIR", "LANG", "LC_ALL", "LC_CTYPE"];
+/// The child's `PATH`: the system's own folders, never the person's shell path.
+const CHILD_PATH: &str = "/usr/bin:/bin:/usr/sbin:/sbin";
 
 const PASSWORD_ENV: &str = "AUTHEXODUS_BW_PASSWORD";
 const RUN_TIMEOUT: Duration = Duration::from_secs(180);
 
 pub struct CliClient {
     binary: PathBuf,
+    /// The SHA-256 the binary must have, when it is known.
+    binary_sha256: Option<String>,
     data_dir: PathBuf,
     session: Option<Zeroizing<String>>,
     folder_id: Mutex<Option<String>>,
+}
+
+/// The whole environment of a `bw` child: nothing of the parent's except [`INHERITED_ENV`], a
+/// fixed `PATH`, and the tool's own settings. So `HTTPS_PROXY`, `HTTP_PROXY`, `ALL_PROXY`,
+/// `NO_PROXY`, `NODE_EXTRA_CA_CERTS`, `NODE_TLS_REJECT_UNAUTHORIZED`, `NODE_OPTIONS`,
+/// `SSL_CERT_FILE`, `DYLD_*`, `LD_*` and any `BW_*` or `BITWARDENCLI_*` setting of the person's
+/// shell never reach it.
+fn child_environment(
+    parent: impl Fn(&str) -> Option<std::ffi::OsString>,
+    data_dir: &std::path::Path,
+    session: Option<&str>,
+    password: Option<&str>,
+) -> Vec<(String, std::ffi::OsString)> {
+    let mut env: Vec<(String, std::ffi::OsString)> = INHERITED_ENV
+        .iter()
+        .filter_map(|name| Some(((*name).to_owned(), parent(name)?)))
+        .collect();
+    env.push(("PATH".into(), CHILD_PATH.into()));
+    env.push(("BW_NOINTERACTION".into(), "true".into()));
+    env.push(("BITWARDENCLI_APPDATA_DIR".into(), data_dir.into()));
+    if let Some(session) = session {
+        env.push(("BW_SESSION".into(), session.into()));
+    }
+    if let Some(password) = password {
+        env.push((PASSWORD_ENV.into(), password.into()));
+    }
+    env
 }
 
 impl CliClient {
@@ -106,9 +158,28 @@ impl CliClient {
     pub fn new(binary: PathBuf, data_dir: PathBuf) -> CliClient {
         CliClient {
             binary,
+            binary_sha256: None,
             data_dir,
             session: None,
             folder_id: Mutex::new(None),
+        }
+    }
+
+    /// Refuse to sign in unless the binary still has this SHA-256 (hex): the hash recorded
+    /// when it was extracted from the verified download.
+    pub fn expecting_sha256(mut self, sha256: impl Into<String>) -> CliClient {
+        self.binary_sha256 = Some(sha256.into());
+        self
+    }
+
+    /// Is the binary still the file that was extracted from the verified download?
+    async fn verify_binary(&self) -> Result<(), BwError> {
+        let Some(expected) = &self.binary_sha256 else {
+            return Ok(());
+        };
+        match super::download::sha256_of_file(&self.binary).await {
+            Ok(actual) if actual.eq_ignore_ascii_case(expected) => Ok(()),
+            _ => Err(BwError::ChecksumMismatch),
         }
     }
 
@@ -122,7 +193,13 @@ impl CliClient {
         let mut cmd = Command::new(&self.binary);
         cmd.args(args)
             .arg("--nointeraction")
-            .env("BW_NOINTERACTION", "true")
+            .env_clear()
+            .envs(child_environment(
+                |name| std::env::var_os(name),
+                &self.data_dir,
+                self.session.as_ref().map(|s| s.as_str()),
+                password,
+            ))
             .stdin(if stdin.is_some() {
                 Stdio::piped()
             } else {
@@ -131,17 +208,6 @@ impl CliClient {
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             .kill_on_drop(true);
-        for var in SCRUBBED_ENV {
-            cmd.env_remove(var);
-        }
-        cmd.env("BITWARDENCLI_APPDATA_DIR", &self.data_dir);
-        if let Some(s) = &self.session {
-            cmd.env("BW_SESSION", s.as_str());
-        }
-        cmd.env_remove(PASSWORD_ENV);
-        if let Some(p) = password {
-            cmd.env(PASSWORD_ENV, p);
-        }
         let mut child = cmd
             .spawn()
             .map_err(|e| BwError::Cli(format!("could not start the Bitwarden tool: {e}")))?;
@@ -197,6 +263,11 @@ impl CliClient {
             .flatten()
             .find(|f| f["name"].as_str() == Some(IMPORT_FOLDER))
             .and_then(|f| f["id"].as_str().map(str::to_owned));
+        if found.as_deref().is_some_and(|id| !is_vault_id(id)) {
+            return Err(BwError::Cli(
+                "Bitwarden returned a folder id of an unexpected form".into(),
+            ));
+        }
         let id = match found {
             Some(id) => Some(id),
             None if create => {
@@ -206,7 +277,10 @@ impl CliClient {
                     .await?;
                 let v: Value = serde_json::from_str(made.trim())
                     .map_err(|_| BwError::Cli("unexpected output creating the folder".into()))?;
-                v["id"].as_str().map(str::to_owned)
+                let id = v["id"].as_str().filter(|id| is_vault_id(id));
+                Some(id.map(str::to_owned).ok_or_else(|| {
+                    BwError::Cli("Bitwarden returned a folder id of an unexpected form".into())
+                })?)
             }
             None => None,
         };
@@ -256,14 +330,42 @@ fn has_server_status(lower: &str) -> bool {
     })
 }
 
-/// Classify the stderr of a failed `bw login`.
-fn classify_login_failure(stderr: &str) -> Result<LoginOutcome, BwError> {
+/// Classify the stderr of a failed `bw login`. `code_sent` says whether a two-step code was
+/// given, which decides what the tool's few messages mean:
+///
+/// | the tool says | no code was sent | a code was sent |
+/// |---|---|---|
+/// | wrong master password | `BadCredentials` | `BadCredentials` |
+/// | the server's "token is invalid" (ASSUMED) | `BadTwoFactorCode` | `BadTwoFactorCode` |
+/// | "Code is required." | `NeedsTwoFactor` | emailed code wanted: unsupported |
+/// | "No provider selected." | `NeedsTwoFactor` (several methods) | no authenticator app: unsupported |
+/// | "No providers available" | unsupported | unsupported |
+/// | "Login failed." alone | (other error) | `BadTwoFactorCode` (asked again) |
+///
+/// `NeedsTwoFactor` is never returned when a code was sent.
+fn classify_login_failure(stderr: &str, code_sent: bool) -> Result<LoginOutcome, BwError> {
     let lower = stderr.to_lowercase();
     let any = |needles: &[&str]| needles.iter().any(|n| lower.contains(n));
     if any(BAD_CREDENTIALS) {
         Ok(LoginOutcome::BadCredentials)
-    } else if any(TWO_FACTOR_REQUIRED) || any(WRONG_TWO_FACTOR_CODE) {
-        Ok(LoginOutcome::NeedsTwoFactor)
+    } else if any(WRONG_TWO_FACTOR_CODE) {
+        Ok(LoginOutcome::BadTwoFactorCode)
+    } else if any(NO_PROVIDERS) {
+        Err(BwError::Unsupported(METHOD_UNSUPPORTED.into()))
+    } else if any(CODE_REQUIRED) {
+        if code_sent {
+            Err(BwError::Unsupported(EMAIL_CODE_UNSUPPORTED.into()))
+        } else {
+            Ok(LoginOutcome::NeedsTwoFactor)
+        }
+    } else if any(NO_PROVIDER_SELECTED) {
+        if code_sent {
+            Err(BwError::Unsupported(METHOD_UNSUPPORTED.into()))
+        } else {
+            Ok(LoginOutcome::NeedsTwoFactor)
+        }
+    } else if code_sent && lower.trim() == LOGIN_FAILED_BARE {
+        Ok(LoginOutcome::BadTwoFactorCode)
     } else {
         Err(classify_failure(stderr))
     }
@@ -298,12 +400,14 @@ pub fn parse_login_items(json: &str) -> Result<Vec<VaultLogin>, BwError> {
             .filter_map(|u| u["uri"].as_str())
             .filter_map(host_of)
             .collect();
+        let totp = login["totp"].as_str().filter(|t| !t.trim().is_empty());
         out.push(VaultLogin {
             id: id.to_owned(),
             name: name.to_owned(),
             username,
             hosts: hosts.into_iter().collect(),
-            has_totp: login["totp"].as_str().is_some_and(|t| !t.trim().is_empty()),
+            has_totp: totp.is_some(),
+            code: totp.and_then(CodeMark::of_totp_field),
         });
     }
     Ok(out)
@@ -336,6 +440,8 @@ impl BwClient for CliClient {
         region: &Region,
         two_factor: Option<&str>,
     ) -> Result<LoginOutcome, BwError> {
+        check_login_input(email, region)?;
+        self.verify_binary().await?;
         tokio::fs::create_dir_all(&self.data_dir)
             .await
             .map_err(|e| {
@@ -359,14 +465,15 @@ impl BwClient for CliClient {
         // The code has to go in argv: `bw login` (2026.9.1 `--help`) offers `--code` only, with no
         // environment-variable or file form for it as it has for the password. It is a one-time,
         // 30-second code, so the exposure in `ps` is accepted.
-        // Method 0 is "authenticator app", the common case. The CLI needs --method with --code
-        // because without it a non-interactive login cannot pick a provider.
+        // Method 0 is "authenticator app", the only one this app does. The CLI needs --method
+        // with --code because without it a non-interactive login cannot pick a provider when
+        // the account has several.
         if let Some(code) = two_factor {
             args.extend(["--method", "0", "--code", code]);
         }
         let (ok, _stdout, stderr) = self.exec(&args, None, Some(password)).await?;
         if !ok {
-            return classify_login_failure(&stderr);
+            return classify_login_failure(&stderr, two_factor.is_some());
         }
 
         let unlock_args = ["unlock", passwordenv.as_str(), "--raw"];
@@ -403,15 +510,27 @@ impl BwClient for CliClient {
     }
 
     async fn set_totp(&self, item_id: &str, otpauth: &str) -> Result<SetTotp, BwError> {
+        if !is_vault_id(item_id) {
+            return Err(BwError::Cli(
+                "that vault entry has an id of an unexpected form".into(),
+            ));
+        }
         let mut item = self.run_json(&["get", "item", item_id]).await?;
         if item["type"].as_i64() != Some(1) {
             return Err(BwError::Cli("that vault entry is not a login".into()));
         }
-        if item["login"]["totp"]
+        if let Some(existing) = item["login"]["totp"]
             .as_str()
-            .is_some_and(|t| !t.trim().is_empty())
+            .filter(|t| !t.trim().is_empty())
         {
-            return Ok(SetTotp::AlreadyHasCode);
+            // The same key as the one to set means an earlier run already did this.
+            let same = CodeMark::of_totp_field(existing)
+                .is_some_and(|mark| Some(mark) == CodeMark::of_totp_field(otpauth));
+            return Ok(if same {
+                SetTotp::AlreadySet
+            } else {
+                SetTotp::AlreadyHasCode
+            });
         }
         item["login"]["totp"] = Value::String(otpauth.to_string());
         let encoded = self.encode(&item).await?;

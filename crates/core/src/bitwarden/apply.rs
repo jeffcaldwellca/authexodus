@@ -5,14 +5,15 @@ use std::collections::HashSet;
 use crate::export::otpauth_uri;
 use crate::types::Token;
 
-use super::{BwClient, BwError, Decision, SetTotp};
+use super::{BwClient, BwError, CodeMark, Decision, SetTotp};
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct ApplyReport {
     pub attached: usize,
     pub created: usize,
     pub skipped: usize,
-    /// Titles of tokens whose login already had an authenticator key, left untouched.
+    /// Titles of tokens whose login already had a different authenticator key, left untouched.
+    /// (A login that already holds this token's own key counts as attached: it is done.)
     pub kept: Vec<String>,
     /// A plain-language message when the run stopped early; everything before it stays done.
     pub failed: Option<String>,
@@ -31,6 +32,7 @@ fn plain_message(e: &BwError) -> String {
         BwError::Download(_) | BwError::ChecksumMismatch => {
             format!("The Bitwarden tool could not be prepared. {RERUN}")
         }
+        BwError::Input(detail) | BwError::Unsupported(detail) => format!("{detail} {RERUN}"),
     }
 }
 
@@ -67,6 +69,10 @@ fn unique_titles(tokens: &[Token], decisions: &[(String, Decision)]) -> Vec<Stri
 
 /// Apply the user's decisions. Syncs first, so anything a failed earlier run did create is seen.
 /// Stops at the first Bitwarden error; `progress` gets one plain line per step.
+///
+/// Safe to run again, with the same decisions or with new ones: a login that already holds a
+/// token's code is counted as attached, not written to; and no login is created for a token
+/// whose code some login in the vault already holds, whatever that login is called.
 pub async fn apply(
     client: &dyn BwClient,
     tokens: &[Token],
@@ -100,6 +106,15 @@ async fn run(
         HashSet::new()
     };
 
+    // Every code the vault holds already, so that a token moved by an earlier run (to a login
+    // of any name, by this app or by hand) is never given a second login.
+    let mut present: HashSet<CodeMark> = client
+        .list_logins()
+        .await?
+        .into_iter()
+        .filter_map(|login| login.code)
+        .collect();
+
     let titles = unique_titles(tokens, decisions);
 
     for (n, (token_id, decision)) in decisions.iter().enumerate() {
@@ -113,7 +128,12 @@ async fn run(
                 match client.set_totp(item_id, &otpauth_uri(token)).await? {
                     SetTotp::Attached => {
                         report.attached += 1;
+                        present.extend(CodeMark::of_secret(token.secret.expose()));
                         progress(format!("Attached {}", token.title));
+                    }
+                    SetTotp::AlreadySet => {
+                        report.attached += 1;
+                        progress(format!("{} already has this code", token.title));
                     }
                     SetTotp::AlreadyHasCode => {
                         report.kept.push(token.title.clone());
@@ -128,10 +148,17 @@ async fn run(
                     progress(format!("{title} is already in the import folder"));
                     continue;
                 }
+                let mark = CodeMark::of_secret(token.secret.expose());
+                if mark.is_some_and(|mark| present.contains(&mark)) {
+                    report.skipped += 1;
+                    progress(format!("{title} already has this code in Bitwarden"));
+                    continue;
+                }
                 client
                     .create_in_import_folder(title, token.username.as_deref(), &otpauth_uri(token))
                     .await?;
                 existing.insert(title.clone());
+                present.extend(mark);
                 report.created += 1;
                 progress(format!("Created {title}"));
             }

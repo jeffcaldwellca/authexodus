@@ -6,10 +6,11 @@ use std::sync::Mutex;
 
 use async_trait::async_trait;
 use authexodus_core::bitwarden::cli::{classify_failure, parse_login_items};
-use authexodus_core::bitwarden::download::ensure_cli_from;
+use authexodus_core::bitwarden::cli::{EMAIL_CODE_UNSUPPORTED, METHOD_UNSUPPORTED};
+use authexodus_core::bitwarden::download::{ensure_cli_from, ensure_cli_within};
 use authexodus_core::bitwarden::{
-    apply, propose, BwClient, BwError, CliClient, Confidence, Decision, LoginOutcome, Region,
-    SetTotp, VaultLogin,
+    apply, check_login_input, is_vault_id, propose, BwClient, BwError, CliClient, CodeMark,
+    Confidence, Decision, LoginOutcome, Region, SetTotp, VaultLogin, BAD_EMAIL, BAD_SERVER_URL,
 };
 use authexodus_core::types::{Secret, Token};
 
@@ -44,6 +45,10 @@ fn login(
         username: username.map(Into::into),
         hosts: hosts.iter().map(|h| h.to_string()).collect(),
         has_totp,
+        // A login that came with a code holds somebody else's, not one of the tests' tokens'.
+        code: has_totp
+            .then(|| CodeMark::of_secret("KRUGKIDDN5SGKIDUNBQXIIDXMFZSA5DIMVZGK"))
+            .flatten(),
     }
 }
 
@@ -58,6 +63,8 @@ struct FakeState {
     logins: Vec<VaultLogin>,
     totp_values: HashMap<String, String>,
     folder_titles: Vec<String>,
+    /// The code of each login created in the import folder.
+    created_codes: Vec<String>,
     writes: usize,
     /// (nth write that fails, error, whether the server kept the write anyway)
     fail: Option<(usize, BwError, bool)>,
@@ -133,24 +140,27 @@ impl BwClient for FakeBw {
     }
     async fn set_totp(&self, item_id: &str, otpauth: &str) -> Result<SetTotp, BwError> {
         let mut s = self.0.lock().unwrap();
+        let wanted = CodeMark::of_totp_field(otpauth);
         let existing = s
             .logins
             .iter()
             .find(|l| l.id == item_id)
-            .map(|l| l.has_totp);
+            .map(|l| (l.has_totp, l.code));
         match existing {
             None => return Err(BwError::Cli("no such item".into())),
-            Some(true) => return Ok(SetTotp::AlreadyHasCode),
-            Some(false) => {}
+            // As the real client does: the same key is done, another key is left alone.
+            Some((true, held)) if held.is_some() && held == wanted => {
+                return Ok(SetTotp::AlreadySet)
+            }
+            Some((true, _)) => return Ok(SetTotp::AlreadyHasCode),
+            Some((false, _)) => {}
         }
         let failure = tick(&mut s);
         if failure.as_ref().is_none_or(|(_, persist)| *persist) {
             s.totp_values.insert(item_id.into(), otpauth.into());
-            s.logins
-                .iter_mut()
-                .find(|l| l.id == item_id)
-                .unwrap()
-                .has_totp = true;
+            let login = s.logins.iter_mut().find(|l| l.id == item_id).unwrap();
+            login.has_totp = true;
+            login.code = wanted;
         }
         match failure {
             Some((e, _)) => Err(e),
@@ -161,12 +171,13 @@ impl BwClient for FakeBw {
         &self,
         title: &str,
         _: Option<&str>,
-        _: &str,
+        otpauth: &str,
     ) -> Result<(), BwError> {
         let mut s = self.0.lock().unwrap();
         let failure = tick(&mut s);
         if failure.as_ref().is_none_or(|(_, persist)| *persist) {
             s.folder_titles.push(title.into());
+            s.created_codes.push(otpauth.into());
         }
         match failure {
             Some((e, _)) => Err(e),
@@ -407,9 +418,12 @@ fn alias_table_matches_aws_and_microsoft() {
 // ---------- apply ----------
 
 fn twelve() -> (Vec<Token>, Vec<VaultLogin>, Vec<(String, Decision)>) {
-    let tokens: Vec<Token> = (0..12)
-        .map(|i| tok(&format!("t{i}"), &format!("Svc{i}"), None, None))
-        .collect();
+    // Twelve accounts, so twelve different keys.
+    let tokens: Vec<Token> = distinct(
+        (0..12)
+            .map(|i| tok(&format!("t{i}"), &format!("Svc{i}"), None, None))
+            .collect(),
+    );
     let vault: Vec<VaultLogin> = (0..6)
         .map(|i| login(&format!("L{i}"), &format!("Svc{i}"), None, &[], false))
         .collect();
@@ -492,10 +506,13 @@ async fn apply_resumes_after_failure() {
             );
         }
         assert_eq!(titles.len(), 6);
-        // A third run changes nothing.
+        // A third run changes nothing in the vault.
         let writes = fake.writes();
         let third = apply(&fake, &tokens, &decisions, &no_progress()).await;
-        assert_eq!((third.attached, third.created, third.failed), (0, 0, None));
+        assert_eq!(third.created, 0);
+        assert_eq!(third.failed, None);
+        assert_eq!(third.attached, 6, "the six attaches are reported as done");
+        assert!(third.kept.is_empty(), "{:?}", third.kept);
         assert_eq!(fake.writes(), writes);
     }
 }
@@ -612,11 +629,17 @@ async fn matching_checksum_extracts_an_executable() {
     let path = ensure_cli_from(dir.path(), &base, "bw-test.zip", &expected)
         .await
         .unwrap();
-    assert_eq!(path, dir.path().join("bw"));
+    assert_eq!(path.path, dir.path().join("bw"));
     assert_eq!(
-        std::fs::read(&path).unwrap(),
+        std::fs::read(&path.path).unwrap(),
         b"#!/bin/sh\necho pretend bw\n"
     );
+    assert_eq!(
+        path.sha256,
+        sha256_hex(b"#!/bin/sh\necho pretend bw\n"),
+        "the hash of the extracted program is handed back"
+    );
+    let path = path.path;
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
@@ -629,7 +652,7 @@ async fn matching_checksum_extracts_an_executable() {
     let again = ensure_cli_from(dir.path(), "http://127.0.0.1:1", "bw-test.zip", &expected)
         .await
         .unwrap();
-    assert_eq!(again, path);
+    assert_eq!(again.path, path);
 }
 
 #[tokio::test]
@@ -655,7 +678,7 @@ async fn live_download_matches_pinned_checksum() {
     let path = authexodus_core::bitwarden::ensure_cli(dir.path())
         .await
         .unwrap();
-    assert!(path.exists());
+    assert!(path.path.exists());
 }
 
 // ---------- CliClient ----------
@@ -881,7 +904,8 @@ async fn cli_client_set_totp_edits_only_codeless_items_and_keeps_secrets_off_arg
         .unwrap();
     let uri = "otpauth://totp/x?secret=JBSWY3DPEHPK3PXP";
 
-    assert_eq!(c.set_totp("item-1", uri).await.unwrap(), SetTotp::Attached);
+    const ITEM: &str = "11111111-0000-4000-8000-000000000001";
+    assert_eq!(c.set_totp(ITEM, uri).await.unwrap(), SetTotp::Attached);
     assert!(
         sb.log("encode.in").contains(uri),
         "item JSON with the new code went to `bw encode` on stdin"
@@ -895,13 +919,19 @@ async fn cli_client_set_totp_edits_only_codeless_items_and_keeps_secrets_off_arg
     std::fs::write(sb.bin_dir.join("item_has_code"), "").unwrap();
     std::fs::remove_file(sb.bin_dir.join("edit.stdin")).unwrap();
     assert_eq!(
-        c.set_totp("item-1", uri).await.unwrap(),
+        c.set_totp(ITEM, uri).await.unwrap(),
         SetTotp::AlreadyHasCode
     );
     assert!(
         !sb.bin_dir.join("edit.stdin").exists(),
         "no edit when a code exists"
     );
+
+    // The login holds this very key already (written differently, under another label): an
+    // earlier run did the work. Done, and still no edit.
+    std::fs::write(sb.bin_dir.join("item_has_same_code"), "").unwrap();
+    assert_eq!(c.set_totp(ITEM, uri).await.unwrap(), SetTotp::AlreadySet);
+    assert!(!sb.bin_dir.join("edit.stdin").exists());
 }
 
 #[tokio::test]
@@ -922,7 +952,7 @@ async fn cli_client_creates_in_the_existing_import_folder() {
     let sent: serde_json::Value = serde_json::from_str(&sb.log("encode.in")).unwrap();
     assert_eq!(sent["type"], 1);
     assert_eq!(sent["name"], "Quillpad (sam)");
-    assert_eq!(sent["folderId"], "f2");
+    assert_eq!(sent["folderId"], "22222222-0000-4000-8000-000000000002");
     assert_eq!(sent["login"]["username"], "sam@example.test");
     assert!(!sb.log("args.log").contains("JBSWY3DPEHPK3PXP"));
     assert_eq!(sb.log("create.stdin").trim(), "ENCODEDJSON");
@@ -1059,6 +1089,22 @@ async fn parent_bitwarden_environment_does_not_reach_the_child() {
         ("BW_CLIENTSECRET", "parent-secret"),
         ("BW_RESPONSE", "true"),
         ("BITWARDENCLI_APPDATA_DIR", "/somewhere/else"),
+        // Where the master password would go, and whether its TLS would be checked.
+        ("HTTPS_PROXY", "http://parent-proxy.invalid:3128"),
+        ("https_proxy", "http://parent-proxy.invalid:3128"),
+        ("HTTP_PROXY", "http://parent-proxy.invalid:3128"),
+        ("ALL_PROXY", "socks5://parent-proxy.invalid:1080"),
+        ("NO_PROXY", "parent-noproxy.invalid"),
+        ("NODE_EXTRA_CA_CERTS", "/parent/extra-ca.pem"),
+        ("NODE_TLS_REJECT_UNAUTHORIZED", "0"),
+        ("NODE_OPTIONS", "--require=/parent/hook.js"),
+        ("SSL_CERT_FILE", "/parent/certs.pem"),
+        // What code the child would load.
+        ("DYLD_INSERT_LIBRARIES", "/parent/inject.dylib"),
+        ("DYLD_LIBRARY_PATH", "/parent/lib"),
+        ("LD_PRELOAD", "/parent/inject.so"),
+        // And anything else at all.
+        ("AUTHEXODUS_TEST_UNRELATED", "parent-unrelated"),
     ];
     // SAFETY: every test that reads the environment runs a script under SCRIPT_LOCK, held here.
     for (k, v) in vars {
@@ -1078,6 +1124,55 @@ async fn parent_bitwarden_environment_does_not_reach_the_child() {
     assert!(!env.contains("resp=true"), "{env}");
     assert!(!env.contains("/somewhere/else"), "{env}");
     assert!(env.contains(&format!("appdata={}", sb.data_dir.display())));
+
+    // The whole environment of every run of the child, as `env` printed it.
+    let full = sb.log("env.full");
+    assert!(full.contains("BW_NOINTERACTION=true"), "{full}");
+    for (name, value) in vars {
+        if name == "BITWARDENCLI_APPDATA_DIR" || name == "BW_SESSION" {
+            // The app sets these itself; the parent's value must not be the one used.
+            assert!(
+                !full.contains(value),
+                "{name} came from the parent:\n{full}"
+            );
+        } else {
+            assert!(
+                !full.lines().any(|l| l.starts_with(&format!("{name}="))),
+                "{name} reached the child:\n{full}"
+            );
+        }
+    }
+    assert!(!full.contains("parent"), "{full}");
+    // What it does get: a fixed PATH, the app's settings, and a short list from the parent.
+    assert!(
+        full.contains("PATH=/usr/bin:/bin:/usr/sbin:/sbin\n"),
+        "{full}"
+    );
+    let allowed = [
+        "HOME",
+        "TMPDIR",
+        "LANG",
+        "LC_ALL",
+        "LC_CTYPE",
+        "PATH",
+        "BW_NOINTERACTION",
+        "BITWARDENCLI_APPDATA_DIR",
+        "BW_SESSION",
+        "AUTHEXODUS_BW_PASSWORD",
+        // set by the shell that runs the stand-in script, not by the app
+        "PWD",
+        "SHLVL",
+        "OLDPWD",
+        "_",
+        "__CF_USER_TEXT_ENCODING",
+    ];
+    for line in full.lines() {
+        let name = line.split('=').next().unwrap();
+        assert!(
+            allowed.contains(&name),
+            "unexpected {name} in the child:\n{full}"
+        );
+    }
 }
 
 #[tokio::test]
@@ -1087,6 +1182,8 @@ async fn two_tokens_with_one_title_make_two_logins_and_rerun_adds_nothing() {
     let mut b = tok("b", "Admin", Some("Shop"), None);
     a.title = "Shop (Admin)".into();
     b.title = "Shop (Admin)".into();
+    // Two accounts that happen to share a name: each has its own key.
+    b.secret = Secret::new("GEZDGNBVGY3TQOJQGEZDGNBVGY3TQOJQ".into());
     let tokens = [a, b];
     let decisions = vec![
         ("a".to_string(), Decision::CreateNew),
@@ -1210,4 +1307,567 @@ fn ip_address_hosts_never_match_a_key() {
         let p = propose(&[tok("t", key, Some(key), None)], &vault);
         assert_eq!(p[0].decision, Decision::CreateNew, "{key}");
     }
+}
+
+// ---------- final review ----------
+
+/// Tokens with secrets of their own (the shared builder gives every token the same one).
+fn distinct(tokens: Vec<Token>) -> Vec<Token> {
+    const SECRETS: &[&str] = &[
+        "JBSWY3DPEHPK3PXP",
+        "GEZDGNBVGY3TQOJQGEZDGNBVGY3TQOJQ",
+        "MFRGGZDFMZTWQ2LKNNWG23TPOBYXE43U",
+        "ON4W45DIMV2GSYZAORSXG5BANNSXSIBU",
+        "KRUGS4ZANFZSAYJAON4W45DIMV2GSYZA",
+        "MZXW6YTBOJRGC6RAON4W45DIMV2GSYZA",
+        "NBSWY3DPEB3W64TMMQQGM33SEB2GK43U",
+        "OBQXG43XN5ZGIIDGN5ZCA5DFON2HGIDP",
+        "ONSWG4TFOQQGM33SEB2GK43UOMQG63TM",
+        "ORSXG5BAONSWG4TFOQQG4ZLWMVZCA4TF",
+        "MFWCAIDGN5ZCA5DFON2HGIDPNZWHSIDP",
+        "NZWHSIDGN5ZCA5DFON2HGIDBNZSCA3TP",
+    ];
+    assert!(tokens.len() <= SECRETS.len());
+    tokens
+        .into_iter()
+        .zip(SECRETS)
+        .map(|(mut t, secret)| {
+            t.secret = Secret::new((*secret).into());
+            t
+        })
+        .collect()
+}
+
+#[tokio::test]
+async fn a_rerun_reports_its_own_attaches_as_done_not_as_codes_that_were_already_there() {
+    let (tokens, vault, decisions) = twelve();
+    let fake = FakeBw::new(vault);
+    let first = apply(&fake, &tokens, &decisions, &no_progress()).await;
+    assert_eq!((first.attached, first.created, first.failed), (6, 6, None));
+    assert!(first.kept.is_empty());
+
+    let writes = fake.writes();
+    let lines = Mutex::new(Vec::new());
+    let second = apply(&fake, &tokens, &decisions, &|line| {
+        lines.lock().unwrap().push(line)
+    })
+    .await;
+    assert_eq!(second.failed, None);
+    assert_eq!(fake.writes(), writes, "nothing is written twice");
+    assert!(
+        second.kept.is_empty(),
+        "the codes this app attached are not \"codes that were already there\": {:?}",
+        second.kept
+    );
+    assert_eq!(second.attached, 6, "they are done");
+    assert_eq!((second.created, second.skipped), (0, 6));
+    let lines = lines.into_inner().unwrap();
+    assert!(
+        lines.iter().any(|l| l == "Svc0 already has this code"),
+        "{lines:?}"
+    );
+    for line in &lines {
+        for token in &tokens {
+            assert!(
+                !line.contains(token.secret.expose()),
+                "a secret in {line:?}"
+            );
+        }
+    }
+
+    // A login that holds a different code is still left alone, and still reported as kept.
+    let other = FakeBw::new(vec![login("L0", "Svc0", None, &[], false)]);
+    let earlier = tok("x", "Svc0", None, None); // the shared builder's secret
+    apply(
+        &other,
+        std::slice::from_ref(&earlier),
+        &[("x".to_string(), attach("L0"))],
+        &no_progress(),
+    )
+    .await;
+    let mine = &tokens[1]; // a different secret
+    let r = apply(
+        &other,
+        std::slice::from_ref(mine),
+        &[(mine.id.clone(), attach("L0"))],
+        &no_progress(),
+    )
+    .await;
+    assert_eq!((r.attached, r.kept.clone()), (0, vec![mine.title.clone()]));
+    assert!(other.totp_of("L0").unwrap().contains("JBSWY3DPEHPK3PXP"));
+}
+
+#[test]
+fn a_token_whose_only_matches_already_hold_a_code_is_a_question() {
+    let vault = vec![
+        login(
+            "gh",
+            "GitHub",
+            Some("sam@example.test"),
+            &["github.com"],
+            true,
+        ),
+        login("gh2", "GitHub (work)", None, &["github.com"], true),
+        login("x", "Unrelated", None, &["example.test"], false),
+    ];
+    let p = propose(
+        &[tok(
+            "t1",
+            "GitHub",
+            Some("GitHub"),
+            Some("sam@example.test"),
+        )],
+        &vault,
+    );
+    assert_eq!(p[0].decision, Decision::CreateNew);
+    assert_eq!(
+        p[0].confidence,
+        Confidence::Low,
+        "creating a second GitHub login is not to be decided silently"
+    );
+    assert_eq!(p[0].candidates, ["gh", "gh2"], "the person sees why");
+}
+
+#[tokio::test]
+async fn apply_half_sign_in_again_propose_apply_makes_no_duplicates() {
+    for persisted in [false, true] {
+        // Twelve tokens: six match a login by name, six match nothing.
+        let (tokens, vault, _) = twelve();
+        let fake = FakeBw::new(vault);
+        let decide = |fake: &FakeBw| -> Vec<(String, Decision)> {
+            let vault = fake.0.lock().unwrap().logins.clone();
+            propose(&tokens, &vault)
+                .into_iter()
+                .map(|p| (p.token_id, p.decision))
+                .collect()
+        };
+
+        // The first run stops part of the way through the attaches.
+        let first_decisions = decide(&fake);
+        fake.0.lock().unwrap().fail = Some((
+            4,
+            BwError::Server("503 Service Unavailable".into()),
+            persisted,
+        ));
+        let first = apply(&fake, &tokens, &first_decisions, &no_progress()).await;
+        assert!(first.failed.is_some());
+        assert_eq!(first.attached, 3);
+
+        // The person signs in again and is shown fresh proposals, and accepts them as they
+        // are: the worst case, in which nobody notices anything.
+        fake.clear_failure();
+        let second_decisions = decide(&fake);
+        let second = apply(&fake, &tokens, &second_decisions, &no_progress()).await;
+        assert_eq!(second.failed, None);
+        // And once more for good measure.
+        let third_decisions = decide(&fake);
+        let third = apply(&fake, &tokens, &third_decisions, &no_progress()).await;
+        assert_eq!((third.failed, third.created), (None, 0));
+
+        // Every token's code is in the vault exactly once.
+        let state = fake.0.lock().unwrap();
+        for token in &tokens {
+            let holders = state
+                .totp_values
+                .values()
+                .chain(state.created_codes.iter())
+                .filter(|value| value.contains(&format!("secret={}", token.secret.expose())))
+                .count();
+            assert_eq!(
+                holders, 1,
+                "{} is in the vault {holders} times (server kept the failed write: {persisted})",
+                token.title
+            );
+        }
+        assert_eq!(state.folder_titles.len(), 6, "{:?}", state.folder_titles);
+        assert_eq!(state.totp_values.len(), 6);
+    }
+}
+
+#[tokio::test]
+async fn two_step_outcomes_follow_what_the_tool_says_and_whether_a_code_was_sent() {
+    let _g = SCRIPT_LOCK.lock().await;
+    let try_login = |flag: &'static str, code: Option<&'static str>| async move {
+        let sb = sandbox();
+        std::fs::write(sb.bin_dir.join(flag), "").unwrap();
+        let mut c = sb.client();
+        c.login("sam@example.test", "correct horse", &Region::Us, code)
+            .await
+    };
+    let unsupported = |message: &str| Err(BwError::Unsupported(message.to_string()));
+
+    // No code yet: Bitwarden wants one.
+    assert_eq!(
+        try_login("needs2fa", None).await,
+        Ok(LoginOutcome::NeedsTwoFactor)
+    );
+    // Several two-step methods and none chosen: the app's next try names the authenticator app.
+    assert_eq!(
+        try_login("manymethods", None).await,
+        Ok(LoginOutcome::NeedsTwoFactor)
+    );
+    assert_eq!(
+        try_login("manymethods", Some("123456")).await,
+        Ok(LoginOutcome::Ok)
+    );
+
+    // A code was sent and refused: never "needs a code" again.
+    assert_eq!(
+        try_login("wrong2fa", Some("000000")).await,
+        Ok(LoginOutcome::BadTwoFactorCode)
+    );
+    assert_eq!(
+        try_login("askedagain", Some("000000")).await,
+        Ok(LoginOutcome::BadTwoFactorCode)
+    );
+
+    // Methods this app cannot do are said plainly, not reported as a failure to connect.
+    assert_eq!(
+        try_login("devicecheck", Some("123456")).await,
+        unsupported(EMAIL_CODE_UNSUPPORTED),
+        "a code was sent and the tool still asks for one: it is the emailed code it wants"
+    );
+    assert_eq!(
+        try_login("noauthapp", Some("123456")).await,
+        unsupported(METHOD_UNSUPPORTED)
+    );
+    assert_eq!(
+        try_login("noproviders", None).await,
+        unsupported(METHOD_UNSUPPORTED)
+    );
+    assert_eq!(
+        try_login("noproviders", Some("123456")).await,
+        unsupported(METHOD_UNSUPPORTED)
+    );
+    for message in [EMAIL_CODE_UNSUPPORTED, METHOD_UNSUPPORTED] {
+        assert!(message.contains("authenticator app"), "{message}");
+        assert!(message.contains("import file"), "{message}");
+        assert_eq!(BwError::Unsupported(message.into()).to_string(), message);
+    }
+
+    // The wrong master password is still that, code or no code.
+    let sb = sandbox();
+    std::fs::write(sb.bin_dir.join("wrong2fa"), "").unwrap();
+    let mut c = sb.client();
+    assert_eq!(
+        c.login("sam@example.test", "wrong", &Region::Us, Some("123456"))
+            .await,
+        Ok(LoginOutcome::BadCredentials)
+    );
+}
+
+#[test]
+fn sign_in_input_is_checked_before_it_can_reach_the_tool() {
+    let ok = |email: &str, region: Region| check_login_input(email, &region);
+    assert_eq!(ok("sam@example.test", Region::Us), Ok(()));
+    assert_eq!(ok("sam+tag@example.test", Region::Eu), Ok(()));
+    for good in [
+        "https://vault.example.test",
+        "  https://vault.example.test/  ",
+        "https://vault.example.test:8443/bitwarden",
+        "https://192.0.2.10",
+        "HTTPS://Vault.Example.Test",
+    ] {
+        assert_eq!(
+            ok("sam@example.test", Region::SelfHosted(good.into())),
+            Ok(()),
+            "{good}"
+        );
+    }
+    for bad in [
+        "",
+        "   ",
+        "vault.example.test",
+        "http://vault.example.test",
+        "ftp://vault.example.test",
+        "https://",
+        "https://sam:hunter2@vault.example.test",
+        "https://sam@vault.example.test",
+        "--help",
+        "--server=https://evil.example.test",
+        "file:///etc/passwd",
+        "javascript:alert(1)",
+    ] {
+        assert_eq!(
+            ok("sam@example.test", Region::SelfHosted(bad.into())),
+            Err(BwError::Input(BAD_SERVER_URL.into())),
+            "{bad:?}"
+        );
+    }
+    for bad in [
+        "",
+        "sam",
+        "@example.test",
+        "sam@",
+        "-sam@example.test",
+        "--passwordenv=HOME@x",
+        "sam @example.test",
+        "sam@example.test\n--raw",
+    ] {
+        assert_eq!(
+            ok(bad, Region::Us),
+            Err(BwError::Input(BAD_EMAIL.into())),
+            "{bad:?}"
+        );
+    }
+    // What goes to `bw config server` is the address as parsed, without the padding.
+    assert_eq!(
+        Region::SelfHosted("  https://Vault.Example.Test/  ".into()).server_url(),
+        "https://vault.example.test"
+    );
+    assert_eq!(
+        Region::SelfHosted("https://vault.example.test:8443/bitwarden/".into()).server_url(),
+        "https://vault.example.test:8443/bitwarden"
+    );
+
+    assert!(is_vault_id("11111111-0000-4000-8000-000000000001"));
+    assert!(is_vault_id("ABCDEF12-abcd-4ABC-8abc-abcdefABCDEF"));
+    for bad in [
+        "",
+        "--help",
+        "item-1",
+        "11111111-0000-4000-8000-00000000000",
+        "11111111-0000-4000-8000-0000000000011",
+        "11111111_0000_4000_8000_000000000001",
+        "1111111g-0000-4000-8000-000000000001",
+        "-1111111-0000-4000-8000-000000000001",
+    ] {
+        assert!(!is_vault_id(bad), "{bad:?}");
+    }
+}
+
+#[tokio::test]
+async fn the_client_refuses_bad_input_and_odd_ids_without_running_the_tool_on_them() {
+    let _g = SCRIPT_LOCK.lock().await;
+    let sb = sandbox();
+    let mut c = sb.client();
+    assert_eq!(
+        c.login(
+            "sam@example.test",
+            "correct horse",
+            &Region::SelfHosted("http://vault.example.test".into()),
+            None
+        )
+        .await,
+        Err(BwError::Input(BAD_SERVER_URL.into()))
+    );
+    assert_eq!(
+        c.login("--raw", "correct horse", &Region::Us, None).await,
+        Err(BwError::Input(BAD_EMAIL.into()))
+    );
+    assert_eq!(sb.log("args.log"), "", "the tool was never started");
+    assert!(!sb.data_dir.exists());
+
+    c.login("sam@example.test", "correct horse", &Region::Us, None)
+        .await
+        .unwrap();
+    let before = sb.log("args.log");
+    let uri = "otpauth://totp/x?secret=JBSWY3DPEHPK3PXP";
+    for odd in [
+        "--help",
+        "item-1",
+        "",
+        "11111111-0000-4000-8000-000000000001 --pretty",
+    ] {
+        assert!(
+            matches!(c.set_totp(odd, uri).await, Err(BwError::Cli(_))),
+            "{odd:?}"
+        );
+    }
+    assert_eq!(sb.log("args.log"), before, "no run was made with an odd id");
+
+    // A folder id of the wrong shape, as a hostile server could send, is not used either:
+    // neither one that is listed, nor one handed back when the folder is created.
+    std::fs::write(sb.bin_dir.join("odd_folder_id"), "").unwrap();
+    assert!(matches!(
+        c.import_folder_titles().await,
+        Err(BwError::Cli(_))
+    ));
+    assert!(matches!(
+        c.create_in_import_folder("T", None, uri).await,
+        Err(BwError::Cli(_))
+    ));
+    std::fs::remove_file(sb.bin_dir.join("odd_folder_id")).unwrap();
+    std::fs::write(sb.bin_dir.join("no_import_folder"), "").unwrap();
+    std::fs::write(sb.bin_dir.join("odd_new_id"), "").unwrap();
+    assert!(matches!(
+        c.create_in_import_folder("T", None, uri).await,
+        Err(BwError::Cli(_))
+    ));
+    let args = sb.log("args.log");
+    assert!(
+        !args.contains("--pretty") && !args.contains("--organizationid"),
+        "{args}"
+    );
+    assert!(!args.contains("create item"), "no item was created: {args}");
+}
+
+#[tokio::test]
+async fn a_swapped_binary_is_not_run() {
+    let _g = SCRIPT_LOCK.lock().await;
+    let sb = sandbox();
+    let script = sb.bin_dir.join("fake_bw.sh");
+    let recorded = sha256_hex(&std::fs::read(&script).unwrap());
+    let mut c = sb.client().expecting_sha256(recorded.to_uppercase());
+    assert_eq!(
+        c.login("sam@example.test", "correct horse", &Region::Us, None)
+            .await,
+        Ok(LoginOutcome::Ok)
+    );
+
+    // Something replaces the program after it was extracted and before the next sign-in.
+    let mut swapped = std::fs::read(&script).unwrap();
+    swapped.extend_from_slice(b"\n# swapped\n");
+    std::fs::write(&script, swapped).unwrap();
+    let before = sb.log("args.log");
+    let mut c = sb.client().expecting_sha256(recorded);
+    assert_eq!(
+        c.login("sam@example.test", "correct horse", &Region::Us, None)
+            .await,
+        Err(BwError::ChecksumMismatch)
+    );
+    assert_eq!(
+        sb.log("args.log"),
+        before,
+        "the swapped program was not run"
+    );
+}
+
+#[tokio::test]
+async fn an_oversized_download_is_abandoned_and_planted_links_are_not_followed() {
+    let zip = bw_zip(b"#!/bin/sh\necho pretend bw\n");
+    let expected = sha256_hex(&zip);
+    let base = file_server(zip.clone()).await;
+
+    // Larger than allowed: refused, nothing kept.
+    let dir = tempfile::tempdir().unwrap();
+    let err = ensure_cli_within(
+        dir.path(),
+        &base,
+        "bw-test.zip",
+        &expected,
+        zip.len() as u64 - 1,
+    )
+    .await
+    .unwrap_err();
+    assert!(
+        matches!(&err, BwError::Download(m) if m.contains("larger than expected")),
+        "{err:?}"
+    );
+    assert!(!dir.path().join("bw-test.zip.part").exists());
+    assert!(!dir.path().join("bw-test.zip").exists());
+    assert!(!dir.path().join("bw").exists());
+
+    // Exactly the allowed size is fine, and the folder is the owner's alone.
+    ensure_cli_within(
+        dir.path(),
+        &base,
+        "bw-test.zip",
+        &expected,
+        zip.len() as u64,
+    )
+    .await
+    .unwrap();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mode = std::fs::metadata(dir.path()).unwrap().permissions().mode();
+        assert_eq!(mode & 0o777, 0o700);
+
+        // Links planted where the temporary files go are replaced, never written through.
+        let dir = tempfile::tempdir().unwrap();
+        let victim = dir.path().join("victim");
+        std::fs::write(&victim, b"untouched").unwrap();
+        std::os::unix::fs::symlink(&victim, dir.path().join("bw-test.zip.part")).unwrap();
+        std::os::unix::fs::symlink(&victim, dir.path().join("bw.partial")).unwrap();
+        let got = ensure_cli_from(dir.path(), &base, "bw-test.zip", &expected)
+            .await
+            .unwrap();
+        assert_eq!(std::fs::read(&victim).unwrap(), b"untouched");
+        assert!(!std::fs::symlink_metadata(&got.path)
+            .unwrap()
+            .file_type()
+            .is_symlink());
+    }
+}
+
+#[test]
+fn a_code_mark_is_the_same_for_one_key_however_it_is_written_and_prints_nothing() {
+    let mark = CodeMark::of_secret("JBSWY3DPEHPK3PXP").unwrap();
+    for same in [
+        "jbswy3dpehpk3pxp",
+        "JBSW Y3DP EHPK 3PXP",
+        "JBSW-Y3DP-EHPK-3PXP",
+        "JBSWY3DPEHPK3PXP====",
+    ] {
+        assert_eq!(CodeMark::of_secret(same), Some(mark), "{same}");
+        assert_eq!(CodeMark::of_totp_field(same), Some(mark), "{same}");
+    }
+    for uri in [
+        "otpauth://totp/Example:sam?secret=JBSWY3DPEHPK3PXP&issuer=Example&digits=6&period=30",
+        "otpauth://totp/x?issuer=Other&SECRET=jbswy3dpehpk3pxp",
+        "  OTPAUTH://totp/x?secret=JBSW%20Y3DP%20EHPK%203PXP  ",
+    ] {
+        assert_eq!(CodeMark::of_totp_field(uri), Some(mark), "{uri}");
+    }
+    assert_ne!(
+        CodeMark::of_secret("GEZDGNBVGY3TQOJQGEZDGNBVGY3TQOJQ"),
+        Some(mark)
+    );
+    for none in [
+        "",
+        "   ",
+        "otpauth://totp/x?issuer=NoSecret",
+        "not base32 at all!",
+        "steam://ABC",
+    ] {
+        assert_eq!(CodeMark::of_totp_field(none), None, "{none:?}");
+    }
+    let printed = format!("{mark:?} {:?}", login("a", "A", None, &[], true));
+    assert!(printed.contains("CodeMark(..)"), "{printed}");
+    assert!(!printed.contains("JBSW"), "{printed}");
+
+    // The list of logins carries the mark, never the key.
+    let logins = parse_login_items(&fixture("list_items.json")).unwrap();
+    assert_eq!(logins[0].code, Some(mark));
+    assert_eq!(logins[1].code, None);
+    assert!(!format!("{logins:?}").contains("JBSWY3DPEHPK3PXP"));
+}
+
+#[tokio::test]
+async fn a_token_whose_code_is_already_in_the_vault_is_not_given_a_second_login() {
+    // The person moved this account by hand some time ago, to a login the matcher would
+    // never connect with it.
+    let mut held = login("x", "Something else entirely", None, &[], true);
+    held.code = CodeMark::of_secret("JBSWY3DPEHPK3PXP");
+    let fake = FakeBw::new(vec![held]);
+    let tokens = [tok("t", "Quillpad", None, None)];
+    let lines = Mutex::new(Vec::new());
+    let r = apply(
+        &fake,
+        &tokens,
+        &[("t".to_string(), Decision::CreateNew)],
+        &|line| lines.lock().unwrap().push(line),
+    )
+    .await;
+    assert_eq!((r.created, r.skipped, r.failed), (0, 1, None));
+    assert_eq!(fake.writes(), 0);
+    assert!(lines
+        .into_inner()
+        .unwrap()
+        .contains(&"Quillpad already has this code in Bitwarden".to_string()));
+
+    // Two tokens that carry one and the same key (the account was added to Authy twice)
+    // make one login, not two.
+    let fake = FakeBw::new(vec![]);
+    let twins = [
+        tok("a", "Twin A", None, None),
+        tok("b", "Twin B", None, None),
+    ];
+    let decisions = vec![
+        ("a".to_string(), Decision::CreateNew),
+        ("b".to_string(), Decision::CreateNew),
+    ];
+    let r = apply(&fake, &twins, &decisions, &no_progress()).await;
+    assert_eq!((r.created, r.skipped), (1, 1));
 }

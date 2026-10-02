@@ -5,7 +5,10 @@
 //! attach idempotently ([`apply::apply`]). Nothing here ever handles a vault password after it has
 //! been handed to the child process, and nothing prints a password, session key or token secret.
 
+use std::fmt;
+
 use async_trait::async_trait;
+use sha2::{Digest, Sha256};
 
 pub mod apply;
 pub mod cli;
@@ -14,7 +17,7 @@ pub mod matcher;
 
 pub use apply::{apply, ApplyReport};
 pub use cli::CliClient;
-pub use download::ensure_cli;
+pub use download::{ensure_cli, CliBinary};
 pub use matcher::{propose, Confidence, Decision, Proposal};
 
 /// Name of the vault folder that new logins are created in.
@@ -28,6 +31,62 @@ pub struct VaultLogin {
     pub username: Option<String>,
     pub hosts: Vec<String>,
     pub has_totp: bool,
+    /// Which authenticator key the login holds, when it holds one that could be read. Lets a
+    /// re-run recognise a code it put there itself without the key being kept.
+    pub code: Option<CodeMark>,
+}
+
+/// Stands for one authenticator key without being it: a SHA-256 over the key. Two marks are
+/// equal exactly when the keys are. It cannot be turned back into the key, and it prints as
+/// `CodeMark(..)`, so a `VaultLogin` can still be shown in a test failure or a log.
+#[derive(Clone, Copy, PartialEq, Eq, Hash)]
+pub struct CodeMark([u8; 32]);
+
+impl fmt::Debug for CodeMark {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("CodeMark(..)")
+    }
+}
+
+impl CodeMark {
+    /// The mark of a base32 key. Case, spaces, dashes and padding do not matter.
+    pub fn of_secret(base32: &str) -> Option<CodeMark> {
+        let mut cleaned: zeroize::Zeroizing<String> = zeroize::Zeroizing::new(
+            base32
+                .chars()
+                .filter(|c| !c.is_whitespace() && *c != '=' && *c != '-')
+                .map(|c| c.to_ascii_uppercase())
+                .collect(),
+        );
+        let usable = !cleaned.is_empty()
+            && cleaned
+                .bytes()
+                .all(|b| b.is_ascii_uppercase() || (b'2'..=b'7').contains(&b));
+        let mark = usable.then(|| {
+            let mut hash = Sha256::new();
+            hash.update(b"authexodus code mark\0");
+            hash.update(cleaned.as_bytes());
+            CodeMark(hash.finalize().into())
+        });
+        zeroize::Zeroize::zeroize(&mut *cleaned);
+        mark
+    }
+
+    /// The mark of what a vault login's authenticator-key field holds: an `otpauth://` URI
+    /// (its `secret` parameter) or a bare base32 key. `None` when the field is empty or holds
+    /// something else.
+    pub fn of_totp_field(value: &str) -> Option<CodeMark> {
+        let value = value.trim();
+        if value.to_ascii_lowercase().starts_with("otpauth://") {
+            let uri = url::Url::parse(value).ok()?;
+            let secret = uri
+                .query_pairs()
+                .find(|(name, _)| name.eq_ignore_ascii_case("secret"))?
+                .1;
+            return CodeMark::of_secret(&secret);
+        }
+        CodeMark::of_secret(value)
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -38,26 +97,87 @@ pub enum Region {
 }
 
 impl Region {
-    /// The server URL handed to `bw config server`.
+    /// The server URL handed to `bw config server`. For a self-hosted server it is the
+    /// address as parsed, never the text as typed (check it with [`check_login_input`]
+    /// first; an address that does not parse comes back trimmed and unchanged).
     pub fn server_url(&self) -> String {
         match self {
             Region::Us => "https://vault.bitwarden.com".to_string(),
             Region::Eu => "https://vault.bitwarden.eu".to_string(),
-            Region::SelfHosted(url) => url.trim().trim_end_matches('/').to_string(),
+            Region::SelfHosted(url) => match url::Url::parse(url.trim()) {
+                Ok(parsed) => parsed.as_str().trim_end_matches('/').to_string(),
+                Err(_) => url.trim().trim_end_matches('/').to_string(),
+            },
         }
     }
+}
+
+/// Shown when the address of a self-hosted server is not usable.
+pub const BAD_SERVER_URL: &str =
+    "The server address must start with https:// and name a server, for example https://vault.example.com.";
+/// Shown when the email address is not usable.
+pub const BAD_EMAIL: &str = "That does not look like an email address.";
+
+/// Refuse a sign-in whose email or server address must not reach the Bitwarden tool: the
+/// email is a command-line argument, and the server is where the master password's hash is
+/// sent. Checked here as well as on the screen, so that nothing depends on the screen.
+///
+/// * A self-hosted server address must parse as a URL, use `https`, name a host, and carry
+///   no user name or password.
+/// * An email must contain `@` with something on both sides, must not start with `-` (it
+///   would be read as an option), and must hold no spaces or control characters.
+pub fn check_login_input(email: &str, region: &Region) -> Result<(), BwError> {
+    if let Region::SelfHosted(url) = region {
+        let usable = url::Url::parse(url.trim()).is_ok_and(|parsed| {
+            parsed.scheme() == "https"
+                && parsed.host_str().is_some_and(|host| !host.is_empty())
+                && parsed.username().is_empty()
+                && parsed.password().is_none()
+        });
+        if !usable {
+            return Err(BwError::Input(BAD_SERVER_URL.into()));
+        }
+    }
+    let usable = !email.starts_with('-')
+        && email.len() <= 320
+        && !email.chars().any(|c| c.is_whitespace() || c.is_control())
+        && email
+            .split_once('@')
+            .is_some_and(|(local, domain)| !local.is_empty() && !domain.is_empty());
+    if !usable {
+        return Err(BwError::Input(BAD_EMAIL.into()));
+    }
+    Ok(())
+}
+
+/// Is this shaped like the ids Bitwarden gives vault items and folders (a UUID:
+/// 8-4-4-4-12 hexadecimal digits)? Ids come back from the server through the tool and are
+/// then passed to the tool as arguments, so anything else is refused.
+pub fn is_vault_id(id: &str) -> bool {
+    let bytes = id.as_bytes();
+    bytes.len() == 36
+        && bytes.iter().enumerate().all(|(i, b)| match i {
+            8 | 13 | 18 | 23 => *b == b'-',
+            _ => b.is_ascii_hexdigit(),
+        })
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum LoginOutcome {
     Ok,
+    /// Bitwarden wants a two-step code and none was given.
     NeedsTwoFactor,
     BadCredentials,
+    /// A two-step code was given and Bitwarden did not accept it.
+    BadTwoFactorCode,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SetTotp {
     Attached,
+    /// The login already holds this very code (an earlier run put it there): done.
+    AlreadySet,
+    /// The login holds a different code, which is left alone.
     AlreadyHasCode,
 }
 
@@ -74,6 +194,13 @@ pub enum BwError {
     Download(String),
     #[error("the downloaded Bitwarden CLI does not match the expected checksum")]
     ChecksumMismatch,
+    /// What was typed cannot be used. The message is for the person, as it is.
+    #[error("{0}")]
+    Input(String),
+    /// The account signs in in a way this app cannot do. The message is for the person, as
+    /// it is.
+    #[error("{0}")]
+    Unsupported(String),
 }
 
 #[async_trait]

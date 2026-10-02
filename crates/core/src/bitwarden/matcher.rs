@@ -285,8 +285,9 @@ fn scored(token: &Token, keys: &Keys, vault: &[VaultLogin]) -> Vec<Scored> {
 ///
 /// A login is proposed for at most one token. Tokens are settled strongest evidence first, so an
 /// exact (service + username) match wins its login no matter where in the list it sits; a token
-/// whose only candidates were taken becomes `CreateNew` with `Low` confidence and the taken
-/// logins listed, so the user is asked.
+/// whose only candidates were taken, or already hold a code, becomes `CreateNew` with `Low`
+/// confidence and those logins listed, so the user is asked. Only a token that matches no login
+/// at all is `CreateNew` with `High` confidence.
 pub fn propose(tokens: &[Token], vault: &[VaultLogin]) -> Vec<Proposal> {
     let keys: Vec<Keys> = tokens.iter().map(search_keys).collect();
     let scores: Vec<Vec<Scored>> = tokens
@@ -343,7 +344,10 @@ pub fn propose(tokens: &[Token], vault: &[VaultLogin]) -> Vec<Proposal> {
                     confidence,
                 )
             }
-            None if taken_by_another => (Decision::CreateNew, Confidence::Low),
+            // Something matched the service, but none of it can be attached to: taken by
+            // another token, or holding a code already (perhaps this very one, from an
+            // earlier run). Creating a second login for the service is then a question.
+            None if !candidates.is_empty() => (Decision::CreateNew, Confidence::Low),
             None => (Decision::CreateNew, Confidence::High),
         };
         out[i] = Some(Proposal {
