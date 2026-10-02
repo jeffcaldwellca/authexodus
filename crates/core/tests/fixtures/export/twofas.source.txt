@@ -1,0 +1,9 @@
+2FAS unencrypted backup (.2fas, JSON).
+No official schema document was reachable. Shape taken from published samples of real exports:
+  https://github.com/elliotwutingfeng/2fas-backup-decryptor   (service entry: name, secret, updatedAt, otp{label,account,issuer,digits,period,algorithm,tokenType,source}, order{position}, icon)
+  https://romanzipp.com/blog/convert-2fas-backup-to-plain-text-links   (services[], otp{account,counter,period,algorithm,issuer,tokenType,link,digits,source})
+  https://2fas.com/support/2fas-auth-mobile-app/2fas-auth-app-tutorial/   (.2fas = JSON; unencrypted without a password)
+  https://docs.2fauth.app/usage/migration/   (export instructions)
+schemaVersion 4 and the top-level groups/updatedAt/appVersionName come from a search-result summary, not a fetched page.
+Retrieved 2026-10-02. Secrets here are made up. The test normalises updatedAt to 0.
+Status: UNVERIFIED against 2FAS itself (third-party samples only).
