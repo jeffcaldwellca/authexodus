@@ -1131,3 +1131,83 @@ async fn truncated_download_leaves_no_part_file() {
     assert!(matches!(err, BwError::Download(_)), "{err:?}");
     assert!(!dir.path().join("bw-test.zip.part").exists());
 }
+
+// ---------- fix round 2 ----------
+
+#[test]
+fn a_key_in_a_subdomain_label_never_gives_high_confidence() {
+    for host in [
+        "apple.com.evil.example",
+        "apple.evil.com",
+        "github.evil.org",
+    ] {
+        let key = host.split('.').next().unwrap();
+        let name = if key == "apple" { "Apple" } else { "GitHub" };
+        let vault = vec![login("x", "Some site", None, &[host], false)];
+        let p = propose(&[tok("t", name, Some(name), None)], &vault);
+        assert!(
+            !(matches!(p[0].decision, Decision::Attach { .. })
+                && p[0].confidence == Confidence::High),
+            "{host}: {:?}",
+            p[0]
+        );
+    }
+}
+
+#[test]
+fn registrable_label_still_matches_with_subdomains_and_country_suffixes() {
+    let vault = vec![
+        login("ap", "Account", None, &["id.apple.com"], false),
+        login("am", "Shopping", None, &["www.amazon.co.uk"], false),
+    ];
+    let p = propose(
+        &[
+            tok("1", "Apple", Some("Apple"), None),
+            tok("2", "Amazon", Some("Amazon"), None),
+        ],
+        &vault,
+    );
+    assert_eq!(
+        (p[0].decision.clone(), p[0].confidence),
+        (attach("ap"), Confidence::High)
+    );
+    assert_eq!(
+        (p[1].decision.clone(), p[1].confidence),
+        (attach("am"), Confidence::High)
+    );
+}
+
+#[test]
+fn url_furniture_in_a_login_name_is_not_matchable() {
+    let vault = vec![login(
+        "u",
+        "https://www.example.com/login",
+        None,
+        &[],
+        false,
+    )];
+    for key in ["Com", "Https", "Www"] {
+        let p = propose(&[tok("t", key, Some(key), None)], &vault);
+        assert_eq!(p[0].decision, Decision::CreateNew, "{key}");
+        assert!(p[0].candidates.is_empty(), "{key}");
+    }
+    // The registrable label of a URL-shaped name still counts.
+    let p = propose(&[tok("t", "Example", Some("Example"), None)], &vault);
+    assert_eq!(p[0].decision, attach("u"));
+    assert_eq!(p[0].confidence, Confidence::High);
+}
+
+#[test]
+fn ip_address_hosts_never_match_a_key() {
+    let vault = vec![login(
+        "r",
+        "Router",
+        None,
+        &["192.168.0.1", "10.0.0.1", "[::1]"],
+        false,
+    )];
+    for key in ["Router2", "Admin", "192"] {
+        let p = propose(&[tok("t", key, Some(key), None)], &vault);
+        assert_eq!(p[0].decision, Decision::CreateNew, "{key}");
+    }
+}

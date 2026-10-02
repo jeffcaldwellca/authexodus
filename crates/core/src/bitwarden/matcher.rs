@@ -118,40 +118,134 @@ fn search_keys(token: &Token) -> Keys {
 }
 
 fn host_has_suffix(host: &str, suffix: &str) -> bool {
-    let host = host.to_lowercase();
     host == suffix || host.ends_with(&format!(".{suffix}"))
 }
 
-/// Whole words of the login name, or whole labels of a host; never part of a word.
-fn key_hits(key: &str, name_norm: &str, hosts: &[String]) -> bool {
-    if key.contains('.') {
-        return hosts.iter().any(|h| host_has_suffix(h, key));
-    }
-    let host_norms = hosts.iter().map(|h| norm(h));
-    if has_word_run(name_norm, key) || host_norms.clone().any(|h| has_word_run(&h, key)) {
-        return true;
-    }
-    // "Stack Overflow" vs stackoverflow.com: a multi-word key, squashed, must be a whole word
-    // or label by itself.
-    if key.contains(' ') {
-        let compact: String = key.split(' ').collect();
-        return name_norm.split(' ').any(|w| w == compact)
-            || host_norms
-                .into_iter()
-                .any(|h| h.split(' ').any(|w| w == compact));
-    }
-    false
+/// Second-level labels that, before a two-letter country code, form a public suffix (`co.uk`).
+const SECOND_LEVEL: &[&str] = &["co", "com", "org", "net", "gov", "edu", "ac"];
+/// Never matchable as a word of a login name: URL furniture and public-suffix labels.
+const NOT_WORDS: &[&str] = &[
+    "http", "https", "www", "com", "org", "net", "gov", "edu", "ac", "co",
+];
+
+/// A host split into its registrable label (the one just left of the public suffix) and the
+/// subdomain labels in front of it. No public-suffix list: the suffix is the last label, or the
+/// last two when they look like `co.uk`. IP addresses have no labels worth matching.
+struct HostLabels {
+    registrable: Option<String>,
+    subdomains: Vec<String>,
 }
 
-/// `Some(alias_only)` when the login matches the token's service.
+fn host_labels(host: &str) -> HostLabels {
+    let host = host.trim().trim_end_matches('.').to_lowercase();
+    let is_ip = host.contains(':') || host.chars().all(|c| c.is_ascii_digit() || c == '.');
+    let labels: Vec<&str> = host.split('.').filter(|l| !l.is_empty()).collect();
+    if is_ip || labels.len() < 2 {
+        return HostLabels {
+            registrable: None,
+            subdomains: Vec::new(),
+        };
+    }
+    let n = labels.len();
+    let two_part = n >= 3
+        && labels[n - 1].len() == 2
+        && labels[n - 1].chars().all(|c| c.is_ascii_alphabetic())
+        && SECOND_LEVEL.contains(&labels[n - 2]);
+    let suffix_len = if two_part { 2 } else { 1 };
+    let reg = n - suffix_len - 1;
+    HostLabels {
+        registrable: Some(labels[reg].to_string()),
+        subdomains: labels[..reg]
+            .iter()
+            .filter(|l| **l != "www")
+            .map(|l| l.to_string())
+            .collect(),
+    }
+}
+
+/// Host part of something that looks like a URL or bare host ("https://www.x.com/login",
+/// "x.com"); `None` for an ordinary name.
+fn name_as_host(name: &str) -> Option<String> {
+    let t = name.trim();
+    let has_scheme = t.contains("://");
+    if !has_scheme && (t.contains(char::is_whitespace) || !t.contains('.') || t.contains('@')) {
+        return None;
+    }
+    let rest = t.split("://").last().unwrap_or(t);
+    let rest = rest.split(['/', '?', '#']).next().unwrap_or("");
+    let rest = rest.rsplit('@').next().unwrap_or("");
+    let host = rest.split(':').next().unwrap_or("");
+    (!host.is_empty()).then(|| host.to_string())
+}
+
+/// The matchable words of a login name. A name that is a URL or host contributes only its
+/// registrable label; otherwise its words minus URL furniture and public-suffix labels.
+fn name_words(name: &str) -> Vec<String> {
+    if let Some(host) = name_as_host(name) {
+        return host_labels(&host).registrable.into_iter().collect();
+    }
+    norm(name)
+        .split(' ')
+        .filter(|w| !w.is_empty() && !NOT_WORDS.contains(w))
+        .map(str::to_string)
+        .collect()
+}
+
+fn squash(s: &str) -> String {
+    s.chars().filter(|c| c.is_alphanumeric()).collect()
+}
+
+/// How strongly `key` matches a login: `Some(false)` strong, `Some(true)` weak (only a subdomain
+/// label of a host, or a dotted alias), `None` no match.
+fn key_hits(
+    key: &str,
+    words: &[String],
+    hosts: &[HostLabels],
+    raw_hosts: &[String],
+) -> Option<bool> {
+    if key.contains('.') {
+        return raw_hosts
+            .iter()
+            .any(|h| host_has_suffix(&h.to_lowercase(), key))
+            .then_some(true);
+    }
+    // A multi-word key ("stack overflow") also matches squashed ("stackoverflow") as one word or
+    // label by itself.
+    let words_key: Vec<&str> = key.split(' ').collect();
+    let compact = squash(key);
+    let multi = words_key.len() > 1;
+    let name_run = words
+        .windows(words_key.len())
+        .any(|w| w.iter().map(String::as_str).eq(words_key.iter().copied()));
+    let label_eq = |l: &String| *l == compact || (multi && squash(l) == compact);
+    let name_word = multi && words.contains(&compact);
+    if name_run
+        || name_word
+        || hosts
+            .iter()
+            .any(|h| h.registrable.as_ref().is_some_and(label_eq))
+    {
+        return Some(false);
+    }
+    if hosts.iter().any(|h| h.subdomains.iter().any(label_eq)) {
+        return Some(true);
+    }
+    None
+}
+
+/// `Some(weak)` when the login matches the token's service; weak matches (a subdomain label, or
+/// only an alias) are never better than `Low` confidence.
 fn service_match(keys: &Keys, login: &VaultLogin) -> Option<bool> {
-    let name = norm(&login.name);
-    if keys.own.iter().any(|k| key_hits(k, &name, &login.hosts)) {
-        Some(false)
-    } else if keys.alias.iter().any(|k| key_hits(k, &name, &login.hosts)) {
-        Some(true)
-    } else {
-        None
+    let words = name_words(&login.name);
+    let hosts: Vec<HostLabels> = login.hosts.iter().map(|h| host_labels(h)).collect();
+    let best = |ks: &[String]| -> Option<bool> {
+        ks.iter()
+            .filter_map(|k| key_hits(k, &words, &hosts, &login.hosts))
+            .min() // strong (false) beats weak (true)
+    };
+    match best(&keys.own) {
+        Some(weak) => Some(weak),
+        None => best(&keys.alias).map(|_| true),
     }
 }
 
