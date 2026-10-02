@@ -194,6 +194,85 @@ mod tests {
         );
     }
 
+    /// The `version = "..."` of a `[section]` in a Cargo manifest.
+    fn manifest_version(manifest: &str, section: &str) -> Option<String> {
+        let body = manifest.split_once(&format!("[{section}]"))?.1;
+        let body = body.split("\n[").next()?;
+        body.lines().find_map(|line| {
+            let value = line.trim().strip_prefix("version")?.trim_start();
+            let value = value.strip_prefix('=')?.trim();
+            Some(value.trim_matches('"').to_string())
+        })
+    }
+
+    /// The version the app shows comes from Cargo; the bundle's from `tauri.conf.json`; the
+    /// workspace's and the UI's from their `package.json`. A release must not ship with any
+    /// two of them apart. (The release workflow makes the same comparison against the tag.)
+    #[test]
+    fn the_version_is_the_same_everywhere_it_is_written() {
+        let root = concat!(env!("CARGO_MANIFEST_DIR"), "/..");
+        let read = |path: &str| std::fs::read_to_string(format!("{root}/{path}")).ok();
+        let json_version = |path: &str| -> Option<String> {
+            let value: serde_json::Value = serde_json::from_str(&read(path)?).ok()?;
+            Some(value["version"].as_str()?.to_string())
+        };
+
+        let shown = env!("CARGO_PKG_VERSION").to_string();
+        let bundle = json_version("src-tauri/tauri.conf.json").expect("tauri.conf.json");
+        assert_eq!(
+            bundle, shown,
+            "tauri.conf.json and the version the app shows"
+        );
+
+        // The shell and the core take theirs from the workspace, so there is one in Cargo.
+        let workspace = read("Cargo.toml").expect("the workspace manifest");
+        assert_eq!(
+            manifest_version(&workspace, "workspace.package").as_deref(),
+            Some(shown.as_str())
+        );
+        for manifest in ["src-tauri/Cargo.toml", "crates/core/Cargo.toml"] {
+            let text = read(manifest).unwrap();
+            assert!(
+                text.contains("version.workspace = true"),
+                "{manifest} must take its version from the workspace"
+            );
+        }
+
+        // Where present (a source checkout always has both).
+        for package in ["package.json", "ui/package.json"] {
+            if let Some(version) = json_version(package) {
+                assert_eq!(version, shown, "{package}");
+            }
+        }
+        assert!(json_version("package.json").is_some());
+        assert!(json_version("ui/package.json").is_some());
+    }
+
+    #[test]
+    fn the_release_workflow_checks_the_tag_against_every_place_the_version_is_written() {
+        let workflow = std::fs::read_to_string(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../.github/workflows/release.yml"
+        ))
+        .unwrap();
+        let step = workflow
+            .split_once("- name: The tag must match the version everywhere it is written")
+            .expect("the step is there")
+            .1;
+        let step = step.split("\n      - ").next().unwrap();
+        for place in [
+            "src-tauri/tauri.conf.json",
+            "package.json",
+            "ui/package.json",
+            "cargo metadata",
+            "authexodus",
+            "authexodus-core",
+            "GITHUB_REF_NAME",
+        ] {
+            assert!(step.contains(place), "the tag check does not cover {place}");
+        }
+    }
+
     #[test]
     fn the_app_has_one_window_and_it_is_the_one_a_second_launch_brings_forward() {
         let config: serde_json::Value =
