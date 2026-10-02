@@ -1,7 +1,8 @@
 export type Device = "iphone" | "ipad";
 export type Step = "welcome" | "connect" | "certificate" | "authy" | "unlock" | "destination" | "verify" | "cleanup" | "done";
 export type AppState = { step: Step; device: Device | null; resumeCleanup: boolean; version: string; releasesUrl: string };
-export type ProxyInfo = { addresses: { ip: string; label: string }[]; ip: string; port: number; certUrl: string; certQrSvg: string; checkUrl: string };
+export type ProxyInfo = { addresses: { ip: string; label: string }[]; ip: string; port: number; certUrl: string; certQrSvg: string; checkUrl: string;
+  certFingerprint: string };                                 // SHA-256 of the certificate, upper-case hex pairs joined by ":"
 export type ProxyEvent =
   | { kind: "deviceConnected" } | { kind: "trustWorking" } | { kind: "tlsRejected" }
   | { kind: "backupCaptured"; count: number } | { kind: "authyError"; status: number; path: string }
@@ -12,7 +13,8 @@ export type Destination = "bitwarden" | "onePassword" | "twoFas" | "aegis" | "go
 export type LiveCode = { id: string; code: string; secondsLeft: number };
 export type BwRegion = { kind: "us" } | { kind: "eu" } | { kind: "selfHosted"; url: string };
 export type BwLogin = { email: string; password: string; region: BwRegion; twoFactorCode?: string };
-export type BwLoginResult = { kind: "ok" } | { kind: "needsTwoFactor" } | { kind: "badCredentials" };
+export type BwLoginResult = { kind: "ok" } | { kind: "needsTwoFactor" } | { kind: "badCredentials" }
+  | { kind: "badTwoFactorCode" };                             // a code was sent and Bitwarden did not accept it
 export type Decision = { kind: "attach"; itemId: string } | { kind: "createNew" } | { kind: "skip" };
 export type Proposal = { tokenId: string; decision: Decision; confidence: "high" | "low";
   candidates: { itemId: string; name: string; username: string | null; hasCode: boolean }[] };
