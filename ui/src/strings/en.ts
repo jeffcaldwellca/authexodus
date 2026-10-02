@@ -244,6 +244,7 @@ export const en = {
 
   unlock: {
     captured: (n: number) => `Captured ${plural(n, "account", "accounts")}`,
+    capturedNativeOnly: "Captured only accounts that use Authy's own codes. Unlock to see which they are and how to move each one by hand.",
     title: "Unlock your codes",
     lede: "Type your Authy backup password. It is used only on this computer, exactly as you type it, and is never saved.",
     label: "Authy backup password",

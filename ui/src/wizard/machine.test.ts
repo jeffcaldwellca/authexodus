@@ -98,9 +98,19 @@ describe("wizard machine", () => {
     expect(s.step).toBe("certificate");
   });
 
-  it("keeps the largest capture and never advances on an empty one", () => {
-    const empty = reduce(at("authy"), { type: "proxy", event: { kind: "backupCaptured", count: 0 } });
-    expect(empty.step).toBe("authy");
+  it("keeps the largest capture, and a capture of only Authy's own accounts still goes on to Unlock", () => {
+    // The shell sends a capture only when the backup grew. A count of 0 means it holds only
+    // Authy's own accounts: there is still a backup to unlock, which lists them by name.
+    const native = reduce(at("authy"), { type: "proxy", event: { kind: "backupCaptured", count: 0 } });
+    expect(native.step).toBe("unlock");
+    expect(native.captured).toBe(0);
+    // An empty answer to the tokens request may come first; the capture that follows wins.
+    const after = run(at("authy"),
+      { type: "proxy", event: { kind: "emptyBackup" } },
+      { type: "proxy", event: { kind: "backupCaptured", count: 0 } });
+    expect(after.step).toBe("unlock");
+    expect(after.emptyBackup).toBe(false);
+    expect(troubleFor(after)).toBeNull();
     let s = reduce(at("authy"), { type: "proxy", event: { kind: "backupCaptured", count: 40 } });
     s = reduce(s, { type: "proxy", event: { kind: "backupCaptured", count: 0 } });
     s = reduce(s, { type: "proxy", event: { kind: "backupCaptured", count: 12 } });

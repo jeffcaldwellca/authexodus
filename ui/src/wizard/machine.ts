@@ -202,8 +202,9 @@ function onProxy(s: WizardState, e: ProxyEvent): WizardState {
     case "addressChanged":
       return { ...s, addressChanged: true };
     case "backupCaptured": {
-      // The backup can arrive more than once and a later one can be empty: keep the largest.
-      if (e.count <= 0) return s;
+      // The shell sends this only when the backup grew. The count is of accounts that can be
+      // moved: 0 means Authy's own accounts only, which is still a backup to unlock (it lists
+      // them by name and how to move them by hand). Keep the largest count seen.
       return {
         ...s, step: "unlock", reachedAuthy: true, reachedCertificate: true, captured: Math.max(s.captured ?? 0, e.count),
         authyError: null, tlsRejected: false, deviceRefused: false, emptyBackup: false,

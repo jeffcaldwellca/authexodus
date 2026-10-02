@@ -56,7 +56,7 @@ export function Unlock({ api, state, dispatch, onRestart, restart }: ScreenProps
       lede={t.lede}
       status={
         <p className="captured" role="status" aria-live="polite">
-          {state.captured !== null ? t.captured(state.captured) : ""}
+          {state.captured === null ? "" : state.captured === 0 ? t.capturedNativeOnly : t.captured(state.captured)}
         </p>
       }
       footer={

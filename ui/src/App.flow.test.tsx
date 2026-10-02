@@ -190,6 +190,27 @@ describe("ways out and back", () => {
     expect(screen.queryByRole("heading", { name: en.failures.emptyBackup.title })).not.toBeInTheDocument();
   });
 
+  it("a backup of only Authy's own accounts reaches Unlock, even after an empty answer, and lists them with the way by hand", async () => {
+    const { api, user } = await walkTo("authy", {
+      summary: { tokens: [], native: [{ name: "Twitch" }], invalid: [] },
+    });
+    // Authy's tokens answer comes first, with nothing in it...
+    act(() => api.emitProxyEvent({ kind: "emptyBackup" }));
+    await screen.findByRole("heading", { name: en.failures.emptyBackup.title });
+    // ...then its own accounts arrive: a backup after all, with nothing this app can copy.
+    act(() => api.emitProxyEvent({ kind: "backupCaptured", count: 0 }));
+    await screen.findByRole("heading", { level: 1, name: en.unlock.title });
+    expect(screen.getByText(en.unlock.capturedNativeOnly)).toBeInTheDocument();
+    expect(screen.queryByText(en.unlock.captured(0))).not.toBeInTheDocument();
+    expect(screen.queryByRole("heading", { name: en.failures.emptyBackup.title })).not.toBeInTheDocument();
+
+    await user.type(screen.getByLabelText(en.unlock.label), api.script.password);
+    await user.click(screen.getByRole("button", { name: en.unlock.submit }));
+    await screen.findByRole("heading", { level: 1, name: en.destination.noneTitle });
+    expect(screen.getByText(en.destination.native("Twitch"))).toBeInTheDocument();
+    expect(screen.getByRole("heading", { name: en.manual.title })).toBeInTheDocument();
+  });
+
   it("when every account is one that cannot be copied, the screen says so and goes straight to clean up", async () => {
     const { api, user } = await walkTo("unlock", {
       summary: { tokens: [], native: [{ name: "Twitch" }, { name: "Authy Demo" }], invalid: [] },

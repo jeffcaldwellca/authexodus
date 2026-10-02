@@ -451,7 +451,7 @@ export function createFakeApi(initial: Partial<AppState> = {}, overrides: Partia
       // The shell's snapshot follows the same events the window is sent.
       if (e.kind === "deviceConnected") { session.deviceConnected = true; advance("certificate"); }
       if (e.kind === "trustWorking") { session.deviceConnected = true; session.trustWorking = true; advance("authy"); }
-      if (e.kind === "backupCaptured" && e.count > 0) { session.captured = Math.max(session.captured, e.count); advance("unlock"); }
+      if (e.kind === "backupCaptured") { session.captured = Math.max(session.captured, e.count); advance("unlock"); }
       proxyListeners.forEach((l) => l(e));
     },
     emitBwProgress: emitBw,
