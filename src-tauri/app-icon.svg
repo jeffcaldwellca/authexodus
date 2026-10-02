@@ -1,0 +1,41 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  The authexodus app icon: a six-digit code leaving through a doorway.
+
+  Source for every file in src-tauri/icons/. To regenerate them after changing this drawing:
+
+    rsvg-convert -w 1024 -h 1024 src-tauri/app-icon.svg -o src-tauri/icons/source.png
+    pnpm tauri icon src-tauri/icons/source.png -o src-tauri/icons
+
+  (run from the repository root). That also writes Windows Store, iOS and Android sizes, which
+  this app does not ship and tauri.conf.json does not name: delete them again.
+
+  The tile keeps the margin macOS expects (824 of 1024). Two colours and white; nothing in it
+  is lettering, so it stays readable at 32 pixels, where only the frame and the arrow remain.
+-->
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1024 1024" width="1024" height="1024">
+  <defs>
+    <linearGradient id="tile" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#15907a"/>
+      <stop offset="1" stop-color="#0a5548"/>
+    </linearGradient>
+  </defs>
+  <rect x="100" y="100" width="824" height="824" rx="186" fill="url(#tile)"/>
+  <!-- The doorway: a frame open on the side the code leaves by. -->
+  <path d="M 512 262 H 336 Q 286 262 286 312 V 712 Q 286 762 336 762 H 512"
+        fill="none" stroke="#ffffff" stroke-width="64" stroke-linecap="round" stroke-linejoin="round"/>
+  <!-- The code on its way out. -->
+  <g fill="none" stroke="#ffcf3f" stroke-width="108" stroke-linecap="round" stroke-linejoin="round">
+    <path d="M 430 512 H 790"/>
+    <path d="M 672 380 L 804 512 L 672 644"/>
+  </g>
+  <!-- Six digits, grouped three and three as authenticator apps show them. -->
+  <g fill="#0a5548">
+    <circle cx="430" cy="512" r="19"/>
+    <circle cx="484" cy="512" r="19"/>
+    <circle cx="538" cy="512" r="19"/>
+    <circle cx="606" cy="512" r="19"/>
+    <circle cx="660" cy="512" r="19"/>
+    <circle cx="714" cy="512" r="19"/>
+  </g>
+</svg>
