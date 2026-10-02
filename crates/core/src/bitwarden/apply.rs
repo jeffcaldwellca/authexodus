@@ -2,8 +2,7 @@
 
 use std::collections::HashSet;
 
-use percent_encoding::{utf8_percent_encode, AsciiSet, NON_ALPHANUMERIC};
-
+use crate::export::otpauth_uri;
 use crate::types::Token;
 
 use super::{BwClient, BwError, Decision, SetTotp};
@@ -17,32 +16,6 @@ pub struct ApplyReport {
     pub kept: Vec<String>,
     /// A plain-language message when the run stopped early; everything before it stays done.
     pub failed: Option<String>,
-}
-
-/// Everything except RFC 3986 unreserved characters is escaped.
-const URI_ESCAPE: &AsciiSet = &NON_ALPHANUMERIC
-    .remove(b'-')
-    .remove(b'_')
-    .remove(b'.')
-    .remove(b'~');
-
-// reconcile with export::otpauth_uri at merge
-fn otpauth_uri(t: &Token) -> String {
-    let mut uri = format!(
-        "otpauth://totp/{}?secret={}",
-        utf8_percent_encode(&t.name, URI_ESCAPE),
-        t.secret.expose()
-    );
-    if let Some(issuer) = t.issuer.as_deref().filter(|i| !i.is_empty()) {
-        uri.push_str(&format!(
-            "&issuer={}",
-            utf8_percent_encode(issuer, URI_ESCAPE)
-        ));
-    }
-    let digits = if t.digits == 0 { 6 } else { t.digits };
-    let period = if t.period == 0 { 30 } else { t.period };
-    uri.push_str(&format!("&digits={digits}&period={period}"));
-    uri
 }
 
 fn plain_message(e: &BwError) -> String {

@@ -7,13 +7,10 @@ license.workspace = true
 authors.workspace = true
 rust-version.workspace = true
 
-# Every dependency Batch 1 packages plausibly need is declared here up front so the four
-# packages built in parallel do not collide on this manifest. Unused ones cost nothing.
 [dependencies]
 # async runtime and plumbing
 tokio = { version = "1", features = ["full"] }
 async-trait = "0.1"
-futures = "0.3"
 tracing = "0.1"
 thiserror = "2"
 # serialisation
@@ -37,19 +34,20 @@ hex = "0.4"
 # export
 qrcode = { version = "0.14", default-features = false, features = ["svg"] }
 prost = "0.14"
-# proxy and certificate authority (hudsucker spike passed: see proxy.rs)
+# proxy and certificate authority. The proxy is hyper + tokio-rustls; hudsucker is kept only for
+# `decode_response` (undoing Content-Encoding). hyper-rustls `webpki-tokio` supplies the public
+# web roots the proxy verifies Authy against, so it is declared here rather than inherited.
 hudsucker = { version = "0.25", features = ["rcgen-ca", "rustls-client", "decoder"] }
 rcgen = { version = "0.14", features = ["x509-parser"] }
 rustls = { version = "0.23", default-features = false, features = ["aws-lc-rs", "std"] }
 tokio-rustls = { version = "0.26", default-features = false, features = ["aws-lc-rs"] }
 hyper = { version = "1", features = ["http1", "server", "client"] }
-hyper-util = { version = "0.1", features = ["tokio", "server", "client-legacy", "http1"] }
-hyper-rustls = { version = "0.27", default-features = false, features = ["http1", "aws-lc-rs"] }
+hyper-util = { version = "0.1", features = ["tokio", "server", "http1"] }
+hyper-rustls = { version = "0.27", default-features = false, features = ["http1", "aws-lc-rs", "webpki-tokio"] }
 http-body-util = "0.1"
 http = "1"
 bytes = "1"
 time = "0.3"
-tower-service = "0.3"
 # Bitwarden CLI download and unpack
 reqwest = { version = "0.13", default-features = false, features = ["rustls"] }
 zip = { version = "2", default-features = false, features = ["deflate"] }
@@ -58,6 +56,5 @@ zip = { version = "2", default-features = false, features = ["deflate"] }
 tempfile = "3"
 x509-parser = "0.18"
 reqwest = { version = "0.13", default-features = false, features = ["rustls"] }
-rustls-pemfile = "2"
 tracing-subscriber = { version = "0.3", features = ["fmt"] }
 tokio = { version = "1", features = ["full", "test-util"] }

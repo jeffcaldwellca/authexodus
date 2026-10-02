@@ -6,26 +6,17 @@
 //! * the Authy-native app list, `{"apps":[{name, digits, secret_seed, ...}], ...}`.
 //!
 //! Everything else is ignored. The native apps' `secret_seed` is never deserialised into
-//! anything: the private structs below name only the fields that are kept, and serde skips the
+//! anything: the structs in `backup` name only the fields that are kept, and serde skips the
 //! rest without building a value for them.
 //!
-//! Package 1A owns the canonical parsers (`backup::parse_tokens_response`,
-//! `backup::parse_apps_response`); the small structs here duplicate that shape so this module
-//! could be built in parallel, and are to be reconciled at merge.
+//! The parsing itself lives in `backup` (the lenient variants of `parse_tokens_response` and
+//! `parse_apps_response`); this module only decides which shape a body has.
 
-use std::fmt;
-
-use serde::de::{self, Deserializer, Visitor};
+use serde::de::IgnoredAny;
 use serde::Deserialize;
 
+use crate::backup;
 use crate::types::{CapturedBackup, EncryptedToken, NativeApp};
-
-/// Authy's fixed PBKDF2 round count before the response started carrying one per token.
-const DEFAULT_KDF_ITERATIONS: u32 = 1000;
-/// Standard tokens are six digits unless the response says otherwise.
-const DEFAULT_TOKEN_DIGITS: u32 = 6;
-/// Authy-native tokens are seven digits unless the response says otherwise.
-const DEFAULT_NATIVE_DIGITS: u32 = 7;
 
 /// Something recognised in a response body.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -40,16 +31,27 @@ pub enum Captured {
 /// to use them (a token without `encrypted_seed` or `salt`, an app without a name) are dropped
 /// rather than failing the whole body.
 pub fn inspect(body: &[u8]) -> Option<Captured> {
-    let envelope: Envelope = serde_json::from_slice(body).ok()?;
-    if let Some(raw) = envelope.authenticator_tokens {
-        let tokens = raw.into_iter().filter_map(RawToken::into_token).collect();
-        return Some(Captured::Tokens(tokens));
+    // Which shape is it? `IgnoredAny` looks at a value without building one.
+    let probe: Probe = serde_json::from_slice(body).ok()?;
+    if probe.authenticator_tokens.is_some() {
+        return backup::parse_tokens_response_lenient(body)
+            .ok()
+            .map(Captured::Tokens);
     }
-    if let Some(raw) = envelope.apps {
-        let apps = raw.into_iter().filter_map(RawApp::into_app).collect();
-        return Some(Captured::NativeApps(apps));
+    if probe.apps.is_some() {
+        return backup::parse_apps_response_lenient(body)
+            .ok()
+            .map(Captured::NativeApps);
     }
     None
+}
+
+#[derive(Deserialize)]
+struct Probe {
+    #[serde(default)]
+    authenticator_tokens: Option<IgnoredAny>,
+    #[serde(default)]
+    apps: Option<IgnoredAny>,
 }
 
 /// Fold a capture into the backup. Returns `true` if the backup grew.
@@ -69,135 +71,6 @@ pub fn merge(into: &mut CapturedBackup, new: Captured) -> bool {
         }
         _ => false,
     }
-}
-
-#[derive(Deserialize)]
-struct Envelope {
-    #[serde(default)]
-    authenticator_tokens: Option<Vec<RawToken>>,
-    #[serde(default)]
-    apps: Option<Vec<RawApp>>,
-}
-
-#[derive(Deserialize)]
-struct RawToken {
-    #[serde(default, deserialize_with = "string_or_number")]
-    unique_id: Option<String>,
-    #[serde(default)]
-    name: Option<String>,
-    #[serde(default)]
-    original_name: Option<String>,
-    #[serde(default)]
-    issuer: Option<String>,
-    #[serde(default)]
-    logo: Option<String>,
-    #[serde(default)]
-    account_type: Option<String>,
-    #[serde(default, deserialize_with = "lenient_u32")]
-    digits: Option<u32>,
-    #[serde(default)]
-    encrypted_seed: Option<String>,
-    #[serde(default)]
-    salt: Option<String>,
-    #[serde(default)]
-    unique_iv: Option<String>,
-    #[serde(default, deserialize_with = "lenient_u32")]
-    key_derivation_iterations: Option<u32>,
-}
-
-impl RawToken {
-    fn into_token(self) -> Option<EncryptedToken> {
-        let encrypted_seed = self.encrypted_seed.filter(|s| !s.is_empty())?;
-        let salt = self.salt.filter(|s| !s.is_empty())?;
-        let name = self
-            .name
-            .filter(|n| !n.is_empty())
-            .or(self.original_name)
-            .unwrap_or_default();
-        Some(EncryptedToken {
-            unique_id: self.unique_id.unwrap_or_default(),
-            name,
-            issuer: self.issuer,
-            logo: self.logo,
-            account_type: self.account_type.unwrap_or_default(),
-            digits: self.digits.unwrap_or(DEFAULT_TOKEN_DIGITS),
-            encrypted_seed,
-            salt,
-            unique_iv: self.unique_iv,
-            key_derivation_iterations: self
-                .key_derivation_iterations
-                .unwrap_or(DEFAULT_KDF_ITERATIONS),
-        })
-    }
-}
-
-/// Only the fields that are kept. `secret_seed` is deliberately absent.
-#[derive(Deserialize)]
-struct RawApp {
-    #[serde(default)]
-    name: Option<String>,
-    #[serde(default, deserialize_with = "lenient_u32")]
-    digits: Option<u32>,
-}
-
-impl RawApp {
-    fn into_app(self) -> Option<NativeApp> {
-        Some(NativeApp {
-            name: self.name.filter(|n| !n.is_empty())?,
-            digits: self.digits.unwrap_or(DEFAULT_NATIVE_DIGITS),
-        })
-    }
-}
-
-/// A JSON string, number or null, kept as a string.
-fn string_or_number<'de, D: Deserializer<'de>>(d: D) -> Result<Option<String>, D::Error> {
-    struct V;
-    impl Visitor<'_> for V {
-        type Value = Option<String>;
-        fn expecting(&self, f: &mut fmt::Formatter) -> fmt::Result {
-            f.write_str("a string, a number or null")
-        }
-        fn visit_str<E: de::Error>(self, v: &str) -> Result<Self::Value, E> {
-            Ok(Some(v.to_owned()))
-        }
-        fn visit_u64<E: de::Error>(self, v: u64) -> Result<Self::Value, E> {
-            Ok(Some(v.to_string()))
-        }
-        fn visit_i64<E: de::Error>(self, v: i64) -> Result<Self::Value, E> {
-            Ok(Some(v.to_string()))
-        }
-        fn visit_f64<E: de::Error>(self, v: f64) -> Result<Self::Value, E> {
-            Ok(Some(v.to_string()))
-        }
-        fn visit_unit<E: de::Error>(self) -> Result<Self::Value, E> {
-            Ok(None)
-        }
-    }
-    d.deserialize_any(V)
-}
-
-/// A JSON number, a string of digits, or null.
-fn lenient_u32<'de, D: Deserializer<'de>>(d: D) -> Result<Option<u32>, D::Error> {
-    struct V;
-    impl Visitor<'_> for V {
-        type Value = Option<u32>;
-        fn expecting(&self, f: &mut fmt::Formatter) -> fmt::Result {
-            f.write_str("a non-negative integer, a string of digits or null")
-        }
-        fn visit_u64<E: de::Error>(self, v: u64) -> Result<Self::Value, E> {
-            u32::try_from(v).map(Some).map_err(E::custom)
-        }
-        fn visit_i64<E: de::Error>(self, v: i64) -> Result<Self::Value, E> {
-            u32::try_from(v).map(Some).map_err(E::custom)
-        }
-        fn visit_str<E: de::Error>(self, v: &str) -> Result<Self::Value, E> {
-            v.trim().parse().map(Some).map_err(E::custom)
-        }
-        fn visit_unit<E: de::Error>(self) -> Result<Self::Value, E> {
-            Ok(None)
-        }
-    }
-    d.deserialize_any(V)
 }
 
 #[cfg(test)]

@@ -8,8 +8,10 @@ use aes::Aes256;
 use base64::{engine::general_purpose::STANDARD, Engine as _};
 use cbc::cipher::{block_padding::Pkcs7, BlockDecryptMut, KeyIvInit};
 use pbkdf2::pbkdf2_hmac;
+use serde::de::{self, Deserializer, Visitor};
 use serde::Deserialize;
 use sha1::Sha1;
+use std::fmt;
 use zeroize::Zeroize;
 
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
@@ -20,30 +22,71 @@ pub enum BackupError {
     WrongPassword,
 }
 
-#[derive(Deserialize)]
-#[serde(untagged)]
-enum IdValue {
-    Num(serde_json::Number),
-    Str(String),
-}
+/// Authy's fixed PBKDF2 round count before the response started carrying one per token.
+const DEFAULT_KDF_ITERATIONS: u32 = 1000;
+/// Standard tokens are six digits unless the response says otherwise.
+const DEFAULT_TOKEN_DIGITS: u32 = 6;
+/// Authy-native tokens are seven digits unless the response says otherwise.
+const DEFAULT_NATIVE_DIGITS: u32 = 7;
 
+/// Every field is optional here so that one entry missing something is a decision for the
+/// caller (fail the parse, or drop the entry), not a serde error that loses the whole body.
+/// A field of the wrong type is still an error.
 #[derive(Deserialize)]
 struct RawToken {
-    unique_id: IdValue,
-    name: String,
+    #[serde(default, deserialize_with = "string_or_number")]
+    unique_id: Option<String>,
+    #[serde(default)]
+    name: Option<String>,
+    #[serde(default)]
+    original_name: Option<String>,
     #[serde(default)]
     issuer: Option<String>,
     #[serde(default)]
     logo: Option<String>,
     #[serde(default)]
     account_type: Option<String>,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "lenient_u32")]
     digits: Option<u32>,
-    encrypted_seed: String,
-    salt: String,
+    #[serde(default)]
+    encrypted_seed: Option<String>,
+    #[serde(default)]
+    salt: Option<String>,
     #[serde(default)]
     unique_iv: Option<String>,
-    key_derivation_iterations: u32,
+    #[serde(default, deserialize_with = "lenient_u32")]
+    key_derivation_iterations: Option<u32>,
+}
+
+impl RawToken {
+    /// `None` when the entry lacks what is needed to use it.
+    fn into_token(self) -> Option<EncryptedToken> {
+        let unique_id = self.unique_id.filter(|s| !s.is_empty())?;
+        let encrypted_seed = self.encrypted_seed.filter(|s| !s.is_empty())?;
+        let salt = self.salt.filter(|s| !s.is_empty())?;
+        let name = self
+            .name
+            .filter(|n| !n.is_empty())
+            .or(self.original_name.filter(|n| !n.is_empty()))?;
+        Some(EncryptedToken {
+            unique_id,
+            name,
+            issuer: self.issuer,
+            logo: self.logo,
+            account_type: self.account_type.unwrap_or_default(),
+            digits: self
+                .digits
+                .filter(|d| *d != 0)
+                .unwrap_or(DEFAULT_TOKEN_DIGITS),
+            encrypted_seed,
+            salt,
+            unique_iv: self.unique_iv.filter(|s| !s.is_empty()),
+            key_derivation_iterations: self
+                .key_derivation_iterations
+                .filter(|n| *n != 0)
+                .unwrap_or(DEFAULT_KDF_ITERATIONS),
+        })
+    }
 }
 
 #[derive(Deserialize)]
@@ -51,11 +94,26 @@ struct TokensEnvelope {
     authenticator_tokens: Vec<RawToken>,
 }
 
+/// Only the fields that are kept. `secret_seed` is deliberately absent, so serde skips it
+/// without ever building a value for it.
 #[derive(Deserialize)]
 struct RawApp {
-    name: String,
     #[serde(default)]
+    name: Option<String>,
+    #[serde(default, deserialize_with = "lenient_u32")]
     digits: Option<u32>,
+}
+
+impl RawApp {
+    fn into_app(self) -> Option<NativeApp> {
+        Some(NativeApp {
+            name: self.name.filter(|n| !n.is_empty())?,
+            digits: self
+                .digits
+                .filter(|d| *d != 0)
+                .unwrap_or(DEFAULT_NATIVE_DIGITS),
+        })
+    }
 }
 
 #[derive(Deserialize)]
@@ -68,45 +126,105 @@ fn malformed(e: serde_json::Error) -> BackupError {
     BackupError::Malformed(e.to_string())
 }
 
-/// Parse `{"authenticator_tokens":[...]}`.
+fn unusable(what: &str) -> BackupError {
+    BackupError::Malformed(format!("{what} entry is missing a required field"))
+}
+
+/// Parse `{"authenticator_tokens":[...]}`. An entry that cannot be used is an error.
 pub fn parse_tokens_response(body: &[u8]) -> Result<Vec<EncryptedToken>, BackupError> {
+    let env: TokensEnvelope = serde_json::from_slice(body).map_err(malformed)?;
+    env.authenticator_tokens
+        .into_iter()
+        .map(|t| t.into_token().ok_or_else(|| unusable("token")))
+        .collect()
+}
+
+/// Parse `{"apps":[...]}`. Only name and digits are read; the seed is never deserialized.
+/// An entry that cannot be used is an error.
+pub fn parse_apps_response(body: &[u8]) -> Result<Vec<NativeApp>, BackupError> {
+    let env: AppsEnvelope = serde_json::from_slice(body).map_err(malformed)?;
+    env.apps
+        .into_iter()
+        .map(|a| a.into_app().ok_or_else(|| unusable("app")))
+        .collect()
+}
+
+/// Like [`parse_tokens_response`], but entries that cannot be used are dropped and the rest
+/// kept. For the proxy, which sees whatever Authy sends and must not lose a whole backup to
+/// one odd entry.
+pub(crate) fn parse_tokens_response_lenient(
+    body: &[u8],
+) -> Result<Vec<EncryptedToken>, BackupError> {
     let env: TokensEnvelope = serde_json::from_slice(body).map_err(malformed)?;
     Ok(env
         .authenticator_tokens
         .into_iter()
-        .map(|t| EncryptedToken {
-            unique_id: match t.unique_id {
-                IdValue::Num(n) => n.to_string(),
-                IdValue::Str(s) => s,
-            },
-            name: t.name,
-            issuer: t.issuer,
-            logo: t.logo,
-            account_type: t.account_type.unwrap_or_default(),
-            digits: t.digits.unwrap_or(6),
-            encrypted_seed: t.encrypted_seed,
-            salt: t.salt,
-            unique_iv: t.unique_iv.filter(|s| !s.is_empty()),
-            key_derivation_iterations: t.key_derivation_iterations,
-        })
+        .filter_map(RawToken::into_token)
         .collect())
 }
 
-/// Parse `{"apps":[...]}`. Only name and digits are read; the seed is never deserialized.
-pub fn parse_apps_response(body: &[u8]) -> Result<Vec<NativeApp>, BackupError> {
+/// Like [`parse_apps_response`], dropping entries that cannot be used.
+pub(crate) fn parse_apps_response_lenient(body: &[u8]) -> Result<Vec<NativeApp>, BackupError> {
     let env: AppsEnvelope = serde_json::from_slice(body).map_err(malformed)?;
-    Ok(env
-        .apps
-        .into_iter()
-        .map(|a| NativeApp {
-            name: a.name,
-            digits: a.digits.unwrap_or(7),
-        })
-        .collect())
+    Ok(env.apps.into_iter().filter_map(RawApp::into_app).collect())
+}
+
+/// A JSON string, number or null, kept as a string.
+fn string_or_number<'de, D: Deserializer<'de>>(d: D) -> Result<Option<String>, D::Error> {
+    struct V;
+    impl Visitor<'_> for V {
+        type Value = Option<String>;
+        fn expecting(&self, f: &mut fmt::Formatter) -> fmt::Result {
+            f.write_str("a string, a number or null")
+        }
+        fn visit_str<E: de::Error>(self, v: &str) -> Result<Self::Value, E> {
+            Ok(Some(v.to_owned()))
+        }
+        fn visit_u64<E: de::Error>(self, v: u64) -> Result<Self::Value, E> {
+            Ok(Some(v.to_string()))
+        }
+        fn visit_i64<E: de::Error>(self, v: i64) -> Result<Self::Value, E> {
+            Ok(Some(v.to_string()))
+        }
+        fn visit_f64<E: de::Error>(self, v: f64) -> Result<Self::Value, E> {
+            Ok(Some(v.to_string()))
+        }
+        fn visit_unit<E: de::Error>(self) -> Result<Self::Value, E> {
+            Ok(None)
+        }
+    }
+    d.deserialize_any(V)
+}
+
+/// A JSON number, a string of digits, or null.
+fn lenient_u32<'de, D: Deserializer<'de>>(d: D) -> Result<Option<u32>, D::Error> {
+    struct V;
+    impl Visitor<'_> for V {
+        type Value = Option<u32>;
+        fn expecting(&self, f: &mut fmt::Formatter) -> fmt::Result {
+            f.write_str("a non-negative integer, a string of digits or null")
+        }
+        fn visit_u64<E: de::Error>(self, v: u64) -> Result<Self::Value, E> {
+            u32::try_from(v).map(Some).map_err(E::custom)
+        }
+        fn visit_i64<E: de::Error>(self, v: i64) -> Result<Self::Value, E> {
+            u32::try_from(v).map(Some).map_err(E::custom)
+        }
+        fn visit_str<E: de::Error>(self, v: &str) -> Result<Self::Value, E> {
+            v.trim().parse().map(Some).map_err(E::custom)
+        }
+        fn visit_unit<E: de::Error>(self) -> Result<Self::Value, E> {
+            Ok(None)
+        }
+    }
+    d.deserialize_any(V)
 }
 
 /// Decrypt one token's seed. `None` when padding is invalid or the plaintext is not printable ASCII.
 fn decrypt_seed(tok: &EncryptedToken, password: &str) -> Option<String> {
+    if tok.key_derivation_iterations == 0 {
+        return None;
+    }
     let mut key = [0u8; 32];
     pbkdf2_hmac::<Sha1>(
         password.as_bytes(),
@@ -479,6 +597,25 @@ mod tests {
                 Err(BackupError::Malformed(_))
             ));
         }
+    }
+
+    #[test]
+    fn unusable_entries_fail_the_strict_parse_and_are_dropped_by_the_lenient_one() {
+        let body = br#"{"authenticator_tokens":[
+            {"unique_id":1,"name":"no seed","salt":"s"},
+            {"unique_id":2,"name":"ok","encrypted_seed":"AAAA","salt":"s","digits":0,"key_derivation_iterations":0},
+            {"name":"no id","encrypted_seed":"AAAA","salt":"s"}]}"#;
+        assert!(matches!(
+            parse_tokens_response(body),
+            Err(BackupError::Malformed(_))
+        ));
+        let t = parse_tokens_response_lenient(body).unwrap();
+        assert_eq!(t.len(), 1);
+        assert_eq!((t[0].digits, t[0].key_derivation_iterations), (6, 1000));
+
+        let apps = br#"{"apps":[{"digits":7},{"name":"Kept"}]}"#;
+        assert!(parse_apps_response(apps).is_err());
+        assert_eq!(parse_apps_response_lenient(apps).unwrap().len(), 1);
     }
 
     #[test]

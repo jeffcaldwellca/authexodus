@@ -6,36 +6,10 @@
 //! CONNECT is a blind tunnel: the bytes are copied in both directions and nothing about the
 //! connection is inspected, kept or logged. Plain HTTP is forwarded, also without a log line.
 //!
-//! # Why this is hyper + rustls directly, and not `hudsucker::Proxy`
-//!
-//! The Batch 0 spike (`spikes/proxy/`, 2026-10-02) proved the approach with `hudsucker` 0.25:
-//! intercept one host with a leaf from a CA name-constrained to `authy.com`, blind-tunnel the
-//! rest by deciding per CONNECT authority, forward plain HTTP, and reach the upstream through
-//! a custom dialler that can send Authy's host to a stand-in (the shape of [`TestUpstream`]).
-//! This module keeps that approach, on the same crates hudsucker is built from (hyper, rustls,
-//! tokio-rustls, rcgen), but runs its own accept loop and CONNECT handling instead of
-//! `hudsucker::Proxy`, because two of this package's binding requirements cannot be met
-//! through hudsucker's handler API:
-//!
-//! * **`TlsRejected`.** hudsucker performs the TLS handshake with the device internally and
-//!   reports a failure only as a `tracing` error line. A handler cannot tell "the device
-//!   refused our certificate" from "the device connected and sent nothing".
-//! * **Nothing about tunnelled hosts is logged.** hudsucker opens a `tracing` span carrying the
-//!   full request URI for every request, including the CONNECT authority of every tunnelled
-//!   host and the query string of every intercepted request, and logs tunnel failures by
-//!   authority. Whether those reach a log would depend on how the app configures its
-//!   subscriber. Here the guarantee holds by construction: the tunnel and plain-HTTP paths
-//!   contain no logging calls at all.
-//!
-//! For the same reason outbound requests use hyper's connection-level client rather than the
-//! pooling client in `hyper-util`, which writes each destination's scheme and authority to
-//! `tracing` at debug level. hyper itself and tokio log nothing.
-//!
-//! `hudsucker` is still used for one thing, `hudsucker::decode_response`, to undo a response's
-//! `Content-Encoding` before looking for the backup in it.
-//!
-//! The device is offered HTTP/1.1 only (the `http2` features of hyper are not enabled in this
-//! crate's manifest). Not yet verified against Authy's real client; Batch 4 will tell.
+//! Built directly on hyper and tokio-rustls, not on `hudsucker::Proxy`, for two reasons: the
+//! handshake with the device is ours, so a refused certificate is seen as `TlsRejected`; and
+//! the tunnel and plain-HTTP paths contain no logging, so tunnelled hosts never reach a log.
+//! `hudsucker` is used only for `decode_response`. The device is offered HTTP/1.1 only.
 
 use std::convert::Infallible;
 use std::future::Future;
