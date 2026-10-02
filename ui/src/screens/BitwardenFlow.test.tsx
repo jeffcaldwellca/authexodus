@@ -157,7 +157,7 @@ describe("bitwarden path", () => {
     const code = await screen.findByLabelText(t.twoFactor);
     expect(code).toHaveFocus();
     expect(screen.getByText(t.needsTwoFactor)).toBeInTheDocument();
-    expect(t.needsTwoFactor).toMatch(/6-digit code from your authenticator app/);
+    expect(t.needsTwoFactor).toMatch(/authenticator app for Bitwarden, type its 6-digit code/);
     expect(screen.queryByLabelText(t.password)).not.toBeInTheDocument();
     expect(screen.getByText(t.passwordHeld)).toBeInTheDocument();
     expect(passwordOnPage()).toBe(false);

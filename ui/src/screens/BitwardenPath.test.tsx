@@ -221,9 +221,49 @@ describe("sign-in with an API key", () => {
   const clientId = "user.4f2c0a1e";
   const clientSecret = "s3cr3tK3yValue";
 
-  it("when Bitwarden wants an emailed code, the API-key form appears with where to find the key and why", async () => {
-    const h = await toLogin({ loginResults: [{ kind: "needsApiKey" }] });
+  // What the shell really answers for an account with no two-step login: "a code is needed"
+  // first (the tool's words are the same as for an authenticator app), and only after a code
+  // was tried, "needs an API key".
+  it("an account without two-step login is asked for a code first, and can switch to the API key right there", async () => {
+    const h = await toLogin({ loginResults: [{ kind: "needsTwoFactor" }] });
     await typeLogin(h);
+    await h.user.click(screen.getByRole("button", { name: t.signIn }));
+
+    await screen.findByLabelText(t.twoFactor);
+    // The prompt covers both cases: an authenticator app's code, or one Bitwarden emailed.
+    expect(screen.getByText(t.needsTwoFactor)).toBeInTheDocument();
+    expect(t.needsTwoFactor).toBe("Bitwarden asked for a code. If you use an authenticator app for Bitwarden, type its 6-digit code. If Bitwarden emailed you a code instead, this app cannot use it: choose Sign in with an API key.");
+    expect(screen.getByText(t.passwordHeld)).toBeInTheDocument();
+    // The way out is on screen while the code is awaited.
+    await h.user.type(screen.getByLabelText(t.twoFactor), "9");
+    await h.user.click(screen.getByRole("button", { name: t.useApiKey }));
+
+    // Switching drops the held password and the code: all three are typed together.
+    const form = screen.getByRole("group", { name: t.apiKey.title });
+    expect(within(form).getByText(t.apiKey.where)).toBeInTheDocument();
+    expect(screen.queryByLabelText(t.twoFactor)).not.toBeInTheDocument();
+    expect(screen.queryByText(t.passwordHeld)).not.toBeInTheDocument();
+    expect(screen.getByLabelText(t.password)).toHaveValue("");
+    expect(secretsOnPage("master pw")).toBe(false);
+    expect(screen.getByRole("button", { name: t.signIn })).toBeDisabled();
+
+    await h.user.type(screen.getByLabelText(t.apiKey.clientId), clientId);
+    await h.user.type(screen.getByLabelText(t.apiKey.clientSecret), clientSecret);
+    await h.user.type(screen.getByLabelText(t.password), "master pw");
+    await h.user.click(screen.getByRole("button", { name: t.signIn }));
+    await screen.findByRole("heading", { level: 1, name: t.reviewTitle });
+    expect(logins(h.api)).toHaveLength(2);
+    expect(logins(h.api)[1]).toEqual({
+      email: "sam@example.com", password: "master pw", region: { kind: "us" }, apiKey: { clientId, clientSecret },
+    });
+    expect(secretsOnPage("master pw", clientId, clientSecret)).toBe(false);
+  });
+
+  it("a code tried on an account that wants an emailed code brings up the API-key form, with where to find the key and why", async () => {
+    const h = await toLogin({ loginResults: [{ kind: "needsTwoFactor" }, { kind: "needsApiKey" }] });
+    await typeLogin(h);
+    await h.user.click(screen.getByRole("button", { name: t.signIn }));
+    await h.user.type(await screen.findByLabelText(t.twoFactor), "123456");
     await h.user.click(screen.getByRole("button", { name: t.signIn }));
 
     const needed = await screen.findByText(t.apiKey.needed);
@@ -248,7 +288,8 @@ describe("sign-in with an API key", () => {
     await screen.findByRole("heading", { level: 1, name: t.reviewTitle });
 
     expect(logins(h.api)[0]).not.toHaveProperty("apiKey");
-    expect(logins(h.api)[1]).toEqual({
+    expect(logins(h.api)[1]).toMatchObject({ twoFactorCode: "123456" });
+    expect(logins(h.api)[2]).toEqual({
       email: "sam@example.com", password: "master pw", region: { kind: "us" }, apiKey: { clientId, clientSecret },
     });
     expect(secretsOnPage("master pw", clientId, clientSecret)).toBe(false);

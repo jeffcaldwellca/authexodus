@@ -410,7 +410,7 @@ export const en = {
     serverUrlHint: "For example https://vault.example.com",
     serverUrlInvalid: "Enter the full address, starting with https://",
     twoFactor: "Two-step login code",
-    needsTwoFactor: "Bitwarden needs your two-step login code. Enter the 6-digit code from your authenticator app and sign in again.",
+    needsTwoFactor: "Bitwarden asked for a code. If you use an authenticator app for Bitwarden, type its 6-digit code. If Bitwarden emailed you a code instead, this app cannot use it: choose Sign in with an API key.",
     wrongTwoFactor: "Bitwarden did not accept that code. Wait for a new one and try again.",
     badCredentials: "Bitwarden did not accept that email and master password. Type both again.",
     badApiKey: "Bitwarden did not accept that API key and master password. Copy the key again and type the password again.",

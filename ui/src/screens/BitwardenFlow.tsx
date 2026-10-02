@@ -98,6 +98,21 @@ export function BitwardenFlow({ api, state, tokens, onDone, onLocked }: ScreenPr
     setClientId("");
     setClientSecret("");
   };
+  /**
+   * Between the password and the API key. What was held for a two-step round trip is dropped
+   * with the code, and the key fields start empty: everything is typed again for the new way.
+   */
+  const switchMethod = () => {
+    held.current = null;
+    setHolding(false);
+    setCode("");
+    setNeedsCode(false);
+    setLoginProblem(null);
+    setClientId("");
+    setClientSecret("");
+    setWithKey((v) => !v);
+    setKeyNeeded(false);
+  };
   useEffect(() => () => { held.current = null; }, []);
   useEffect(() => { if (needsCode) codeInput.current?.focus(); }, [needsCode]);
 
@@ -371,13 +386,13 @@ export function BitwardenFlow({ api, state, tokens, onDone, onLocked }: ScreenPr
               </div>
             </>
           )}
-          {!holding && (
-            <p>
-              <button type="button" className="quiet small" disabled={busy} onClick={() => { setWithKey((v) => !v); setKeyNeeded(false); setClientId(""); setClientSecret(""); }}>
-                {withKey ? t.usePassword : t.useApiKey}
-              </button>
-            </p>
-          )}
+          {/* Offered while a code is awaited too: Bitwarden asks a new device for an emailed
+              code in the same words as for an authenticator app's, and the key is the way past it. */}
+          <p>
+            <button type="button" className="quiet small" disabled={busy} onClick={switchMethod}>
+              {withKey ? t.usePassword : t.useApiKey}
+            </button>
+          </p>
           <fieldset className="segmented">
             <legend>{t.region}</legend>
             <div className="segments">
