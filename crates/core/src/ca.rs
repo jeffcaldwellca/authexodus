@@ -8,6 +8,13 @@
 //! private key live in a [`KeyStore`] (the macOS Keychain in the app, memory in tests) until
 //! cleanup calls [`Authority::destroy`].
 //!
+//! The store is not trusted to hold what the app put there. A new run starts with
+//! [`Authority::create_fresh`], which deletes whatever the store holds before it creates
+//! anything, so the item is always this process's own. [`Authority::load_or_create`] reuses a
+//! stored root only after reading the certificate itself and finding it to be exactly what
+//! this module would have made (see `check_stored_root`); nothing in the blob's header is
+//! believed.
+//!
 //! Nothing here is Mac-only, and nothing here logs.
 
 use std::sync::{Arc, Mutex};
@@ -20,7 +27,10 @@ use rcgen::{
 use rustls::crypto::aws_lc_rs;
 use rustls::pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer};
 use rustls::ServerConfig;
+use sha2::{Digest, Sha256};
 use time::{Duration, OffsetDateTime};
+use x509_parser::extensions::{GeneralName, ParsedExtension};
+use x509_parser::prelude::{FromDer, X509Certificate};
 use zeroize::Zeroizing;
 
 /// What the person sees in Settings on the iPhone or iPad, so it says what to do with it.
@@ -103,15 +113,31 @@ pub struct Authority {
     cert_der: Vec<u8>,
     issuer: Issuer<'static, KeyPair>,
     not_after: OffsetDateTime,
+    constrained: bool,
 }
 
 impl Authority {
+    /// Create a root for a new run and store it, after deleting whatever `store` held.
+    ///
+    /// Nothing found in the store is read, reused or updated in place: an item somebody else
+    /// put there (with their own access rules, or their own key in it) is removed, and the
+    /// new item is created by this process. If the old item cannot be deleted, nothing is
+    /// created and the error says so.
+    pub fn create_fresh(store: &dyn KeyStore, constrained: bool) -> Result<Authority, CaError> {
+        store.delete()?;
+        let (authority, blob) = Authority::create(constrained)?;
+        store.store(&blob)?;
+        Ok(authority)
+    }
+
     /// Reuse the root in `store`, or create one and store it.
     ///
-    /// The stored root is reused only when it is intact, has time left, and matches
-    /// `constrained`; otherwise a new one replaces it. (A device that installed the old
-    /// certificate then has to install the new one, which is what a changed `constrained`
-    /// asks for anyway.)
+    /// The stored root is reused only when its certificate, read here, is exactly what
+    /// [`Authority::create`] makes for `constrained`: self-signed by the stored key, under
+    /// the expected name, a leaf-only authority, valid for no more than seven days with time
+    /// left, and with the name constraints of the mode asked for (or none). Anything else is
+    /// deleted and replaced, as in [`Authority::create_fresh`]. (A device that installed the
+    /// old certificate then has to install the new one.)
     pub fn load_or_create(store: &dyn KeyStore, constrained: bool) -> Result<Authority, CaError> {
         if let Some(blob) = store.load()? {
             let blob = Zeroizing::new(blob);
@@ -119,14 +145,28 @@ impl Authority {
                 return Ok(existing);
             }
         }
-        let (authority, blob) = Authority::create(constrained)?;
-        store.store(&blob)?;
-        Ok(authority)
+        Authority::create_fresh(store, constrained)
     }
 
     /// The root certificate, DER encoded: what the iPhone or iPad downloads and installs.
     pub fn cert_der(&self) -> Vec<u8> {
         self.cert_der.clone()
+    }
+
+    /// Whether the root carries the name constraint (it can vouch only for names under
+    /// [`PERMITTED_SUBTREE`]).
+    pub fn is_constrained(&self) -> bool {
+        self.constrained
+    }
+
+    /// The SHA-256 fingerprint of the certificate as an iPhone or iPad shows it under More
+    /// Details: 32 upper-case hexadecimal pairs joined by colons.
+    pub fn fingerprint(&self) -> String {
+        Sha256::digest(&self.cert_der)
+            .iter()
+            .map(|byte| format!("{byte:02X}"))
+            .collect::<Vec<_>>()
+            .join(":")
     }
 
     /// Remove the root and its key from `store`. Leaf certificates already issued die with the
@@ -154,15 +194,7 @@ impl Authority {
         params.is_ca = IsCa::Ca(BasicConstraints::Constrained(0));
         params.key_usages = vec![KeyUsagePurpose::KeyCertSign, KeyUsagePurpose::CrlSign];
         if constrained {
-            params.name_constraints = Some(NameConstraints {
-                permitted_subtrees: vec![GeneralSubtree::DnsName(PERMITTED_SUBTREE.to_owned())],
-                // A permitted dNSName subtree does not restrict names of other types
-                // (RFC 5280 4.2.1.10), so IP-address names are excluded entirely.
-                excluded_subtrees: vec![
-                    GeneralSubtree::IpAddress(CidrSubnet::from_v4_prefix([0; 4], 0)),
-                    GeneralSubtree::IpAddress(CidrSubnet::from_v6_prefix([0; 16], 0)),
-                ],
-            });
+            params.name_constraints = Some(name_constraints());
         }
 
         let key = KeyPair::generate_for(&PKCS_ECDSA_P256_SHA256)?;
@@ -174,26 +206,24 @@ impl Authority {
             cert_der,
             issuer: Issuer::new(params, key),
             not_after,
+            constrained,
         };
         Ok((authority, blob))
     }
 
-    /// `None` when the blob is damaged, expired (or nearly), or of the other kind.
+    /// `None` when the blob is damaged, or its certificate is not exactly the kind this
+    /// module makes for `constrained` (see [`check_stored_root`]).
     fn from_blob(blob: &[u8], constrained: bool) -> Option<Authority> {
         let stored = decode_blob(blob)?;
-        if stored.constrained != constrained {
-            return None;
-        }
-        if stored.not_after - OffsetDateTime::now_utc() < MIN_REMAINING {
-            return None;
-        }
         let key = KeyPair::try_from(stored.key_der).ok()?;
+        let not_after = check_stored_root(stored.cert_der, &key, constrained)?;
         let cert = CertificateDer::from(stored.cert_der);
         let issuer = Issuer::from_ca_cert_der(&cert, key).ok()?;
         Some(Authority {
             cert_der: stored.cert_der.to_vec(),
             issuer,
-            not_after: stored.not_after,
+            not_after,
+            constrained,
         })
     }
 
@@ -233,6 +263,108 @@ impl Authority {
     }
 }
 
+/// Is this certificate, with this key, exactly what [`Authority::create`] makes for
+/// `constrained`? Returns its expiry when it is. Everything is read from the certificate; the
+/// blob's header is not consulted.
+///
+/// * one subject attribute, the common name [`COMMON_NAME`], and the same issuer;
+/// * its public key is `key`'s, a P-256 key, and its signature verifies under that key;
+/// * a certificate authority that may sign leaves only (path length 0);
+/// * valid from no later than now, for no longer than [`VALID_FOR`] plus [`BACKDATE`], with
+///   at least [`MIN_REMAINING`] left;
+/// * for a constrained root, a critical name-constraints extension that permits the DNS
+///   subtree [`PERMITTED_SUBTREE`] and nothing else, and excludes every IPv4 and IPv6
+///   address; for an unconstrained one, no name-constraints extension.
+fn check_stored_root(cert_der: &[u8], key: &KeyPair, constrained: bool) -> Option<OffsetDateTime> {
+    let (rest, cert) = X509Certificate::from_der(cert_der).ok()?;
+    if !rest.is_empty() {
+        return None;
+    }
+
+    let mut names = cert.subject().iter_attributes();
+    let name = names.next()?;
+    if names.next().is_some()
+        || name.attr_type() != &x509_parser::oid_registry::OID_X509_COMMON_NAME
+        || name.as_str().ok()? != COMMON_NAME
+        || cert.subject().as_raw() != cert.issuer().as_raw()
+    {
+        return None;
+    }
+
+    if !key.is_compatible(&PKCS_ECDSA_P256_SHA256)
+        || cert.public_key().subject_public_key.data.as_ref() != key.public_key_raw()
+    {
+        return None;
+    }
+    cert.verify_signature(None).ok()?;
+
+    let basic = cert.basic_constraints().ok()??;
+    if !basic.critical || !basic.value.ca || basic.value.path_len_constraint != Some(0) {
+        return None;
+    }
+
+    let now = OffsetDateTime::now_utc();
+    let not_before = cert.validity().not_before.to_datetime();
+    let not_after = cert.validity().not_after.to_datetime();
+    if not_before > now
+        || not_after - not_before > VALID_FOR + BACKDATE
+        || not_after - now < MIN_REMAINING
+    {
+        return None;
+    }
+
+    let mut constraints = cert
+        .extensions()
+        .iter()
+        .filter(|ext| matches!(ext.parsed_extension(), ParsedExtension::NameConstraints(_)));
+    match (constrained, constraints.next()) {
+        (false, None) => {}
+        (true, Some(ext)) => {
+            let ParsedExtension::NameConstraints(found) = ext.parsed_extension() else {
+                return None;
+            };
+            let permitted = found.permitted_subtrees.as_deref()?;
+            let excluded = found.excluded_subtrees.as_deref()?;
+            let only_authy = matches!(
+                permitted,
+                [subtree] if matches!(subtree.base, GeneralName::DNSName(PERMITTED_SUBTREE))
+            );
+            // Address then mask, all zero: 0.0.0.0/0 and ::/0 (RFC 5280 4.2.1.10).
+            let every_address = |len: usize| {
+                excluded.iter().any(|subtree| {
+                    matches!(&subtree.base, GeneralName::IPAddress(bytes)
+                        if bytes.len() == len && bytes.iter().all(|b| *b == 0))
+                })
+            };
+            if !ext.critical
+                || !only_authy
+                || excluded.len() != 2
+                || !every_address(8)
+                || !every_address(32)
+                || constraints.next().is_some()
+            {
+                return None;
+            }
+        }
+        _ => return None,
+    }
+    Some(not_after)
+}
+
+/// What a constrained root is limited to: DNS names under [`PERMITTED_SUBTREE`], and no IP
+/// address at all.
+fn name_constraints() -> NameConstraints {
+    NameConstraints {
+        permitted_subtrees: vec![GeneralSubtree::DnsName(PERMITTED_SUBTREE.to_owned())],
+        // A permitted dNSName subtree does not restrict names of other types
+        // (RFC 5280 4.2.1.10), so IP-address names are excluded entirely.
+        excluded_subtrees: vec![
+            GeneralSubtree::IpAddress(CidrSubnet::from_v4_prefix([0; 4], 0)),
+            GeneralSubtree::IpAddress(CidrSubnet::from_v6_prefix([0; 16], 0)),
+        ],
+    }
+}
+
 /// 16 random bytes with the top bit clear, so the DER integer is positive and 16 bytes long.
 fn random_serial() -> SerialNumber {
     let mut bytes = *uuid::Uuid::new_v4().as_bytes();
@@ -242,13 +374,13 @@ fn random_serial() -> SerialNumber {
 }
 
 struct StoredRoot<'a> {
-    constrained: bool,
-    not_after: OffsetDateTime,
     cert_der: &'a [u8],
     key_der: &'a [u8],
 }
 
 /// The stored blob: a small header, then the certificate (DER), then the key (PKCS#8 DER).
+/// The flags and the expiry in the header are written for the record and never read back:
+/// what a stored root is, is decided from its certificate.
 fn encode_blob(
     constrained: bool,
     not_after: OffsetDateTime,
@@ -272,28 +404,18 @@ fn decode_blob(blob: &[u8]) -> Option<StoredRoot<'_>> {
     if blob.len() < BLOB_HEADER_LEN || &blob[..4] != BLOB_MAGIC || blob[4] != BLOB_VERSION {
         return None;
     }
-    let constrained = blob[5] & FLAG_CONSTRAINED != 0;
-    let not_after = i64::from_be_bytes(blob[6..14].try_into().ok()?);
-    let not_after = OffsetDateTime::from_unix_timestamp(not_after).ok()?;
     let cert_len = u32::from_be_bytes(blob[14..18].try_into().ok()?) as usize;
     let rest = &blob[BLOB_HEADER_LEN..];
     if cert_len == 0 || cert_len >= rest.len() {
         return None;
     }
     let (cert_der, key_der) = rest.split_at(cert_len);
-    Some(StoredRoot {
-        constrained,
-        not_after,
-        cert_der,
-        key_der,
-    })
+    Some(StoredRoot { cert_der, key_der })
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use x509_parser::extensions::{GeneralName, ParsedExtension};
-    use x509_parser::prelude::{FromDer, X509Certificate};
 
     fn parse(der: &[u8]) -> X509Certificate<'_> {
         let (rest, cert) = X509Certificate::from_der(der).expect("valid DER");
@@ -490,18 +612,250 @@ mod tests {
         let replaced = Authority::load_or_create(&store, true).unwrap();
         assert_ne!(store.load().unwrap().unwrap(), good);
 
-        // An expired root (same certificate and key, header says it ended a minute ago).
-        let current = store.load().unwrap().unwrap();
-        let stored = decode_blob(&current).unwrap();
-        let expired = encode_blob(
-            true,
-            OffsetDateTime::now_utc() - Duration::minutes(1),
-            stored.cert_der,
-            stored.key_der,
-        );
-        store.store(&expired).unwrap();
+        // A root with too little time left (the certificate says so; the header is not asked).
+        let store = MemoryKeyStore::new();
+        let (nearly_over, old_cert) = Planted {
+            valid_for: Duration::minutes(30),
+            ..Planted::genuine()
+        }
+        .blob();
+        store.store(&nearly_over).unwrap();
         let fresh = Authority::load_or_create(&store, true).unwrap();
+        assert_ne!(fresh.cert_der(), old_cert);
         assert_ne!(fresh.cert_der(), replaced.cert_der());
+    }
+
+    /// What an attacker with access to the store could put there: any certificate, any key,
+    /// and a header that says whatever suits.
+    struct Planted {
+        common_name: &'static str,
+        constrained: bool,
+        valid_for: Duration,
+        path_len: Option<u8>,
+        /// Sign with one key and store another.
+        swap_key: bool,
+        header_constrained: bool,
+        header_valid_for: Duration,
+    }
+
+    impl Planted {
+        /// Exactly what the app itself would have stored for a constrained root.
+        fn genuine() -> Planted {
+            Planted {
+                common_name: COMMON_NAME,
+                constrained: true,
+                valid_for: VALID_FOR,
+                path_len: Some(0),
+                swap_key: false,
+                header_constrained: true,
+                header_valid_for: VALID_FOR,
+            }
+        }
+
+        fn blob(&self) -> (Zeroizing<Vec<u8>>, Vec<u8>) {
+            let now = OffsetDateTime::now_utc().replace_nanosecond(0).unwrap();
+            let mut params = CertificateParams::default();
+            params.distinguished_name = DistinguishedName::new();
+            params
+                .distinguished_name
+                .push(DnType::CommonName, self.common_name);
+            params.not_before = now - BACKDATE;
+            params.not_after = now + self.valid_for;
+            params.serial_number = Some(random_serial());
+            params.is_ca = IsCa::Ca(match self.path_len {
+                Some(n) => BasicConstraints::Constrained(n),
+                None => BasicConstraints::Unconstrained,
+            });
+            params.key_usages = vec![KeyUsagePurpose::KeyCertSign, KeyUsagePurpose::CrlSign];
+            if self.constrained {
+                params.name_constraints = Some(name_constraints());
+            }
+            let key = KeyPair::generate_for(&PKCS_ECDSA_P256_SHA256).unwrap();
+            let cert_der = params.self_signed(&key).unwrap().der().to_vec();
+            let stored_key = if self.swap_key {
+                KeyPair::generate_for(&PKCS_ECDSA_P256_SHA256).unwrap()
+            } else {
+                key
+            };
+            let blob = encode_blob(
+                self.header_constrained,
+                now + self.header_valid_for,
+                &cert_der,
+                &stored_key.serialize_der(),
+            );
+            (blob, cert_der)
+        }
+    }
+
+    #[test]
+    fn a_stored_root_is_reused_only_when_it_is_what_the_app_would_have_made() {
+        // The genuine article is reused: the checks do not reject the app's own root.
+        let store = MemoryKeyStore::new();
+        let (blob, cert_der) = Planted::genuine().blob();
+        store.store(&blob).unwrap();
+        let reused = Authority::load_or_create(&store, true).unwrap();
+        assert_eq!(reused.cert_der(), cert_der);
+
+        let planted: Vec<(&str, Planted)> = vec![
+            (
+                "an unconstrained certificate behind a header that says constrained",
+                Planted {
+                    constrained: false,
+                    ..Planted::genuine()
+                },
+            ),
+            (
+                "a certificate valid for a year behind a header that says seven days",
+                Planted {
+                    valid_for: Duration::days(365),
+                    ..Planted::genuine()
+                },
+            ),
+            (
+                "a certificate whose key is not the stored key",
+                Planted {
+                    swap_key: true,
+                    ..Planted::genuine()
+                },
+            ),
+            (
+                "a certificate under another name",
+                Planted {
+                    common_name: "Some Trusted Root",
+                    ..Planted::genuine()
+                },
+            ),
+            (
+                "a root that may sign further certificate authorities",
+                Planted {
+                    path_len: None,
+                    ..Planted::genuine()
+                },
+            ),
+        ];
+        for (what, plant) in planted {
+            let store = MemoryKeyStore::new();
+            let (blob, cert_der) = plant.blob();
+            store.store(&blob).unwrap();
+            let authority = Authority::load_or_create(&store, true).unwrap();
+            assert_ne!(authority.cert_der(), cert_der, "served {what}");
+            assert_ne!(
+                store.load().unwrap().unwrap(),
+                blob.to_vec(),
+                "kept {what} in the store"
+            );
+        }
+
+        // The mode is read from the certificate, not the header: a constrained certificate is
+        // not reused as an unconstrained one, nor the other way round.
+        for (constrained, wanted) in [(true, false), (false, true)] {
+            let store = MemoryKeyStore::new();
+            let (blob, cert_der) = Planted {
+                constrained,
+                header_constrained: wanted,
+                ..Planted::genuine()
+            }
+            .blob();
+            store.store(&blob).unwrap();
+            let authority = Authority::load_or_create(&store, wanted).unwrap();
+            assert_ne!(authority.cert_der(), cert_der);
+        }
+    }
+
+    /// A store that notes what is done to it, and can be told to refuse a deletion.
+    #[derive(Default)]
+    struct SpyStore {
+        inner: MemoryKeyStore,
+        calls: Mutex<Vec<&'static str>>,
+        refuse_delete: bool,
+    }
+
+    impl KeyStore for SpyStore {
+        fn load(&self) -> Result<Option<Vec<u8>>, CaError> {
+            self.calls.lock().unwrap().push("load");
+            self.inner.load()
+        }
+        fn store(&self, blob: &[u8]) -> Result<(), CaError> {
+            self.calls.lock().unwrap().push("store");
+            self.inner.store(blob)
+        }
+        fn delete(&self) -> Result<(), CaError> {
+            self.calls.lock().unwrap().push("delete");
+            if self.refuse_delete {
+                return Err(CaError::Store("not allowed".into()));
+            }
+            self.inner.delete()
+        }
+    }
+
+    #[test]
+    fn a_new_run_deletes_what_the_store_held_and_never_reads_it() {
+        // Somebody planted a perfectly good-looking root before the run.
+        let spy = SpyStore::default();
+        let (planted, planted_cert) = Planted::genuine().blob();
+        spy.inner.store(&planted).unwrap();
+
+        let authority = Authority::create_fresh(&spy, true).unwrap();
+        assert_eq!(
+            *spy.calls.lock().unwrap(),
+            ["delete", "store"],
+            "the old item is deleted, never read and never updated in place"
+        );
+        assert_ne!(authority.cert_der(), planted_cert);
+        let stored = spy.inner.load().unwrap().unwrap();
+        assert_ne!(stored, planted.to_vec());
+        assert!(
+            Authority::from_blob(&stored, true).is_some(),
+            "what is stored now is the new root"
+        );
+
+        // An item that cannot be deleted is not built upon.
+        let stuck = SpyStore {
+            refuse_delete: true,
+            ..SpyStore::default()
+        };
+        stuck.inner.store(&planted).unwrap();
+        assert!(matches!(
+            Authority::create_fresh(&stuck, true),
+            Err(CaError::Store(_))
+        ));
+        assert_eq!(
+            *stuck.calls.lock().unwrap(),
+            ["delete"],
+            "nothing is stored"
+        );
+        assert_eq!(stuck.inner.load().unwrap().unwrap(), planted.to_vec());
+    }
+
+    #[test]
+    fn fingerprint_is_sha256_in_upper_case_pairs_joined_by_colons() {
+        let authority = Authority::create_fresh(&MemoryKeyStore::new(), true).unwrap();
+        let fingerprint = authority.fingerprint();
+        let pairs: Vec<&str> = fingerprint.split(':').collect();
+        assert_eq!(pairs.len(), 32, "{fingerprint}");
+        assert_eq!(fingerprint.len(), 32 * 2 + 31);
+        for pair in &pairs {
+            assert_eq!(pair.len(), 2, "{fingerprint}");
+            assert!(
+                pair.bytes()
+                    .all(|b| b.is_ascii_digit() || (b'A'..=b'F').contains(&b)),
+                "{fingerprint}"
+            );
+        }
+        // It is the SHA-256 of the DER the device downloads.
+        let digest = Sha256::digest(authority.cert_der());
+        let bytes: Vec<u8> = pairs
+            .iter()
+            .map(|pair| u8::from_str_radix(pair, 16).unwrap())
+            .collect();
+        assert_eq!(bytes, digest.as_slice());
+        // Another root, another fingerprint.
+        let other = Authority::create_fresh(&MemoryKeyStore::new(), true).unwrap();
+        assert_ne!(other.fingerprint(), fingerprint);
+
+        assert!(authority.is_constrained());
+        let open = Authority::create_fresh(&MemoryKeyStore::new(), false).unwrap();
+        assert!(!open.is_constrained());
     }
 
     #[test]
