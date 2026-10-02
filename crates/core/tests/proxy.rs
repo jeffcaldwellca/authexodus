@@ -2153,6 +2153,26 @@ async fn an_answer_with_no_accounts_is_reported_as_an_empty_backup() {
 }
 
 #[tokio::test]
+async fn a_backup_of_only_authy_native_accounts_is_not_an_empty_backup() {
+    let mut rig = phone_rig().await;
+    let client = rig.trusting_client();
+    let get = |path: &str| client.get(format!("https://{AUTHY_HOST}{path}")).send();
+
+    // Authy's own accounts arrive first, then a tokens answer with nothing in it: the backup
+    // holds accounts (that this app cannot move, but can name), so it is not empty.
+    get("/json/users/2/devices/9/apps").await.unwrap();
+    let seen = rig
+        .wait_for(|e| matches!(e, ProxyEvent::BackupCaptured { .. }))
+        .await;
+    assert_eq!(seen.last(), Some(&ProxyEvent::BackupCaptured { count: 0 }));
+    assert!(!seen.contains(&ProxyEvent::EmptyBackup), "{seen:?}");
+    get("/json/users/2/authenticator_tokens").await.unwrap();
+    assert_eq!(rig.drain().await, []);
+    assert_eq!(rig.handle.backup().native_apps.len(), 2);
+    rig.handle.shutdown().await;
+}
+
+#[tokio::test]
 async fn an_empty_answer_to_this_computer_is_not_an_empty_backup() {
     let mut rig = rig().await;
     let ca = rig.ca_der.clone();

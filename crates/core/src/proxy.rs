@@ -168,8 +168,10 @@ pub enum ProxyEvent {
     /// The captured backup grew. `count` is the number of encrypted tokens now held.
     BackupCaptured { count: usize },
     /// Authy answered the device's tokens request with no accounts at all, and none are held
-    /// from an earlier answer: backups are probably switched off in Authy. Sent at most once
-    /// every two seconds.
+    /// from an earlier answer (neither tokens nor Authy's own accounts): backups are probably
+    /// switched off in Authy. Sent at most once every two seconds. A tokens answer that comes
+    /// before the list of Authy's own accounts can still send it; the `BackupCaptured` that
+    /// follows the list then supersedes it.
     EmptyBackup,
     /// Authy answered with a 4xx or 5xx. `path` has no query string, and its all-digit
     /// segments (account and device ids) are replaced by `:id`.
@@ -1822,8 +1824,9 @@ impl CaptureSink {
             let mut backup = shared.lock_backup();
             if !capture::merge(&mut backup, captured) {
                 // Nothing grew. An answer with no accounts, while none are held from an
-                // earlier answer, is worth saying: there is nothing to wait for.
-                let nothing_held = backup.tokens.is_empty();
+                // earlier answer, is worth saying: there is nothing to wait for. Authy's own
+                // accounts count as held: a backup of only those is still one to unlock.
+                let nothing_held = backup.tokens.is_empty() && backup.native_apps.is_empty();
                 drop(backup);
                 drop(device);
                 if no_accounts && nothing_held && shared.empty_backup.ready() {

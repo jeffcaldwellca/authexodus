@@ -11,12 +11,14 @@ use super::{BwClient, BwError, CodeMark, Decision, SetTotp, IMPORT_FOLDER};
 pub struct ApplyReport {
     pub attached: usize,
     pub created: usize,
-    /// Rows the person chose to skip, and rows that were refused (their token is not in the
-    /// backup). Nothing was done for these: the accounts stay only in Authy.
+    /// Rows the person chose to skip, rows that were refused (their token is not in the
+    /// backup), and rows whose chosen login already holds a different code, which is never
+    /// replaced (see [`skipped_other_code`]). Nothing was written for these: the accounts stay
+    /// only in Authy.
     pub skipped: usize,
-    /// One sentence for every row that needed nothing written because Bitwarden already holds
-    /// a code there: see [`kept_other_code`], [`kept_same_title`] and [`kept_same_code`].
-    /// (A login that already holds this token's own key counts as attached: it is done.)
+    /// One sentence for every row that needed nothing written because this account's code is
+    /// already in Bitwarden: see [`kept_same_title`] and [`kept_same_code`]. (A login that
+    /// already holds this token's own key counts as attached: it is done.)
     pub kept: Vec<String>,
     /// A plain-language message when the run stopped early; everything before it stays done.
     pub failed: Option<String>,
@@ -28,9 +30,10 @@ pub struct ApplyReport {
 // shown to the person exactly as they are written here. Keep them plain, and never put a
 // secret in one.
 
-/// The chosen login already holds a different code, which was left alone.
-pub fn kept_other_code(title: &str) -> String {
-    format!("{title}: the login you chose already has a different code, which was left as it is. This account is still only in Authy.")
+/// The progress line for a row that was skipped because the chosen login already holds a
+/// different code, which was left alone.
+pub fn skipped_other_code(title: &str) -> String {
+    format!("Skipped {title}: the login you chose already has a different code, which was left as it is")
 }
 
 /// A login of this name is already in the import folder (an earlier run made it).
@@ -161,9 +164,11 @@ async fn run(
                         report.attached += 1;
                         progress(format!("{} already has this code", token.title));
                     }
+                    // Not this account's code: nothing was moved, so it is a skip, and the
+                    // run's log says why.
                     SetTotp::AlreadyHasCode => {
-                        report.kept.push(kept_other_code(&token.title));
-                        progress(format!("Kept the existing code for {}", token.title));
+                        report.skipped += 1;
+                        progress(skipped_other_code(&token.title));
                     }
                 }
             }

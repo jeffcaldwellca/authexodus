@@ -5,7 +5,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 
 use async_trait::async_trait;
-use authexodus_core::bitwarden::apply::{kept_other_code, kept_same_code, kept_same_title};
+use authexodus_core::bitwarden::apply::{kept_same_code, kept_same_title, skipped_other_code};
 use authexodus_core::bitwarden::cli::{classify_failure, parse_login_items};
 use authexodus_core::bitwarden::download::{ensure_cli_from, ensure_cli_within, PrepareStage};
 use authexodus_core::bitwarden::{
@@ -463,10 +463,21 @@ async fn apply_never_overwrites_existing_code() {
         ("t0".to_string(), attach("L0")),
         ("t1".to_string(), attach("L1")),
     ];
-    let r = apply(&fake, &tokens, &decisions, &no_progress()).await;
+    let lines = Mutex::new(Vec::new());
+    let r = apply(&fake, &tokens, &decisions, &|line| {
+        lines.lock().unwrap().push(line)
+    })
+    .await;
+    // The person is told why in the run's own log.
+    assert!(lines
+        .into_inner()
+        .unwrap()
+        .contains(&skipped_other_code("Has Code")));
     assert_eq!(r.attached, 1);
-    assert_eq!(r.kept, vec![kept_other_code("Has Code")]);
-    assert_eq!(r.skipped, 0, "nobody chose to skip it");
+    // Nothing was written for it, so it stays only in Authy: that is a skip, and it is not
+    // listed among the codes that are already in Bitwarden.
+    assert_eq!(r.skipped, 1);
+    assert_eq!(r.kept, Vec::<String>::new());
     assert_eq!(r.failed, None);
     assert_eq!(
         fake.totp_of("L0"),
@@ -1415,7 +1426,7 @@ async fn a_rerun_reports_its_own_attaches_as_done_not_as_codes_that_were_already
         }
     }
 
-    // A login that holds a different code is still left alone, and still reported as kept.
+    // A login that holds a different code is still left alone, and counted as skipped.
     let other = FakeBw::new(vec![login("L0", "Svc0", None, &[], false)]);
     let earlier = tok("x", "Svc0", None, None); // the shared builder's secret
     apply(
@@ -1433,10 +1444,7 @@ async fn a_rerun_reports_its_own_attaches_as_done_not_as_codes_that_were_already
         &no_progress(),
     )
     .await;
-    assert_eq!(
-        (r.attached, r.kept.clone()),
-        (0, vec![kept_other_code(&mine.title)])
-    );
+    assert_eq!((r.attached, r.skipped, r.kept.len()), (0, 1, 0));
     assert!(other.totp_of("L0").unwrap().contains("JBSWY3DPEHPK3PXP"));
 }
 
