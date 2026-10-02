@@ -88,6 +88,18 @@ describe("failures, by the shell's code", () => {
     expect(within(screen.getByRole("group", { name: en.connect.valuesLabel(iphone) })).getByText("192.168.4.109")).toBeInTheDocument();
   });
 
+  it("a restart in progress is announced, and the address cannot be changed under it", async () => {
+    const { api, user } = await walkTo("connect", { delayMs: 30 });
+    await user.click(screen.getByRole("button", { name: en.common.havingTrouble }));
+    await user.click(screen.getByRole("button", { name: en.common.restart }));
+    const busy = await screen.findByText(en.common.restarting);
+    expect(busy.closest("[role=status]")).not.toBeNull();
+    expect(screen.getByLabelText(new RegExp(en.connect.addressLabel))).toBeDisabled();
+    await waitFor(() => expect(screen.queryByText(en.common.restarting)).not.toBeInTheDocument());
+    expect(screen.getByLabelText(new RegExp(en.connect.addressLabel))).toBeEnabled();
+    expect(api.calls.filter((c) => c.method === "restartProxy")).toHaveLength(1);
+  });
+
   it("a restart that fails shows the shell's reason by code", async () => {
     const { api, user } = await walkTo("certificate");
     api.script.failures.restartProxy = [new ApiError("listen_failed", "Port 8080 is in use by another program.")];

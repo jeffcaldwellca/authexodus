@@ -87,7 +87,7 @@ export function Connect({ api, state, dispatch, proxy, proxyError, addressReject
             {proxy.addresses.length > 1 && (
               <label className="address">
                 <span>{t.addressLabel}</span>
-                <select value={proxy.ip} onChange={(e) => onPickAddress(e.target.value)}>
+                <select value={proxy.ip} disabled={restart === "busy"} onChange={(e) => onPickAddress(e.target.value)}>
                   {proxy.addresses.map((a) => <option key={a.ip} value={a.ip}>{t.addressOption(a.ip, a.label)}</option>)}
                 </select>
                 <span className="quiet-text">{t.addressHint(d)}</span>

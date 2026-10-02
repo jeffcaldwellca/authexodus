@@ -2,7 +2,7 @@
 // itself: a window that was reloaded, what not to redo after a restart, this computer's
 // address changing, a refused device with the way to recover, and a restart that did not work.
 import type { ApiError } from "../api.errors";
-import { Callout } from "../components/ui";
+import { Callout, Waiting } from "../components/ui";
 import { en } from "../strings/en";
 import type { WizardState } from "../wizard/machine";
 import { DeviceRefused } from "./DeviceRefused";
@@ -29,6 +29,7 @@ export function ConnectionNotices({ d, state, restart, restartError, onRestart }
           <p>{state.certificateInstalled ? t.noticeAfterTrust(d) : t.noticeBeforeTrust(d)}</p>
         </Callout>
       )}
+      {restart === "busy" && <Waiting>{en.common.restarting}</Waiting>}
       {restart === "failed" && restartError && (
         <Problem error={restartError} d={d} title={en.common.restartFailed}>
           <button type="button" className="secondary" onClick={onRestart}>{en.common.tryAgain}</button>
