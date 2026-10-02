@@ -57,6 +57,9 @@ pub struct ProxyInfo {
     pub cert_url: String,
     pub cert_qr_svg: String,
     pub check_url: String,
+    /// SHA-256 of the certificate: 32 upper-case hexadecimal pairs joined by colons, as an
+    /// iPhone or iPad shows it under More Details.
+    pub cert_fingerprint: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -248,8 +251,11 @@ pub struct BwLoginInput {
 #[serde(tag = "kind", rename_all = "camelCase")]
 pub enum BwLoginResult {
     Ok,
+    /// Bitwarden wants a two-step code and none was sent.
     NeedsTwoFactor,
     BadCredentials,
+    /// A two-step code was sent and Bitwarden did not accept it.
+    BadTwoFactorCode,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

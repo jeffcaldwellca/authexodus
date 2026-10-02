@@ -112,15 +112,15 @@ async fn connect_status(port: u16, target: &str) -> String {
 // ---------------------------------------------------------------------------------------------
 // The resume marker and the certificate key (S6)
 
-#[test]
-fn marker_makes_next_launch_resume_cleanup() {
+#[tokio::test]
+async fn marker_makes_next_launch_resume_cleanup() {
     let dir = tempfile::tempdir().unwrap();
     let store = Arc::new(MemoryKeyStore::new());
     let first = session(dir.path(), store.clone());
     assert!(!first.get_state().resume_cleanup);
     assert_eq!(first.get_state().step, Step::Welcome);
 
-    first.ensure_ca().unwrap();
+    first.ensure_ca().await.unwrap();
     assert_eq!(
         std::fs::read_to_string(dir.path().join("session.json")).unwrap(),
         r#"{"caCreated":true}"#
@@ -148,11 +148,11 @@ impl KeyStore for BrokenStore {
     }
 }
 
-#[test]
-fn a_key_that_could_not_be_stored_leaves_no_marker() {
+#[tokio::test]
+async fn a_key_that_could_not_be_stored_leaves_no_marker() {
     let dir = tempfile::tempdir().unwrap();
     let s = Session::new(Arc::new(BrokenStore), dir.path().to_path_buf());
-    assert!(s.ensure_ca().is_err());
+    assert!(s.ensure_ca().await.is_err());
     assert!(
         !dir.path().join("session.json").exists(),
         "no marker claims a certificate that was never created"
@@ -164,14 +164,14 @@ fn a_key_that_could_not_be_stored_leaves_no_marker() {
     );
 }
 
-#[test]
-fn a_marker_that_cannot_be_written_takes_the_key_with_it() {
+#[tokio::test]
+async fn a_marker_that_cannot_be_written_takes_the_key_with_it() {
     let dir = tempfile::tempdir().unwrap();
     // Something that is not a file sits where the marker goes.
     std::fs::create_dir(dir.path().join("session.json")).unwrap();
     let store = Arc::new(MemoryKeyStore::new());
     let s = session(dir.path(), store.clone());
-    assert!(s.ensure_ca().is_err());
+    assert!(s.ensure_ca().await.is_err());
     assert_eq!(
         store.load().unwrap(),
         None,
@@ -185,7 +185,7 @@ async fn finish_clears_the_marker_for_the_next_launch() {
     let dir = tempfile::tempdir().unwrap();
     let store = Arc::new(MemoryKeyStore::new());
     let s = session(dir.path(), store.clone());
-    s.ensure_ca().unwrap();
+    s.ensure_ca().await.unwrap();
     s.cleanup().await.unwrap();
     s.finish().await.unwrap();
     assert!(!s.get_state().resume_cleanup);
@@ -198,7 +198,7 @@ async fn finish_without_cleanup_still_destroys_the_key() {
     let dir = tempfile::tempdir().unwrap();
     let store = Arc::new(MemoryKeyStore::new());
     let s = session(dir.path(), store.clone());
-    s.ensure_ca().unwrap();
+    s.ensure_ca().await.unwrap();
     s.finish().await.unwrap();
     assert_eq!(store.load().unwrap(), None);
 }
@@ -229,6 +229,12 @@ struct FakeBw {
     /// When set: `login` says it has begun, then waits to be let go.
     entered: Option<Arc<Notify>>,
     release: Option<Arc<Notify>>,
+    /// When set, `login` fails with this instead of answering `outcome`.
+    error: Option<BwError>,
+    /// How many times `login` was called.
+    logins: Arc<AtomicUsize>,
+    /// The two-step code of the last `login`, if one was sent.
+    code_sent: Arc<Mutex<Option<String>>>,
 }
 
 fn login(id: &str, name: &str, has_totp: bool) -> VaultLogin {
@@ -238,6 +244,7 @@ fn login(id: &str, name: &str, has_totp: bool) -> VaultLogin {
         username: None,
         hosts: vec![format!("{}.com", name.to_lowercase())],
         has_totp,
+        code: None,
     }
 }
 
@@ -250,6 +257,9 @@ impl FakeBw {
             writes: Arc::default(),
             entered: None,
             release: None,
+            error: None,
+            logins: Arc::default(),
+            code_sent: Arc::default(),
         }
     }
 
@@ -275,13 +285,18 @@ impl BwClient for FakeBw {
         _: &str,
         _: &str,
         _: &Region,
-        _: Option<&str>,
+        code: Option<&str>,
     ) -> Result<LoginOutcome, BwError> {
+        self.logins.fetch_add(1, Ordering::SeqCst);
+        *lock(&self.code_sent) = code.map(str::to_owned);
         if let (Some(entered), Some(release)) = (&self.entered, &self.release) {
             entered.notify_one();
             release.notified().await;
         }
-        Ok(self.outcome)
+        match &self.error {
+            Some(error) => Err(error.clone()),
+            None => Ok(self.outcome),
+        }
     }
     async fn sync(&self) -> Result<(), BwError> {
         Ok(())
@@ -368,7 +383,7 @@ async fn cleanup_on_fresh_launch_with_only_marker_and_key() {
     let store = Arc::new(MemoryKeyStore::new());
     {
         let earlier = session(dir.path(), store.clone());
-        earlier.ensure_ca().unwrap();
+        earlier.ensure_ca().await.unwrap();
     }
 
     let fresh = session(dir.path(), store.clone());
@@ -525,9 +540,12 @@ async fn restart_proxy_starts_over_with_the_same_certificate() {
     let net = two_addresses();
 
     // Restarting with nothing running simply starts.
-    let first = s.restart_proxy(None, &net, no_emit()).await.unwrap();
-    assert_eq!(first.ip, "127.0.0.1", "the default address");
-    let certificate = s.ensure_ca().unwrap().cert_der();
+    let first = s
+        .restart_proxy(Some("127.0.0.1"), &net, no_emit())
+        .await
+        .unwrap();
+    assert_eq!(first.ip, "127.0.0.1");
+    let certificate = s.ensure_ca().await.unwrap().cert_der();
     let key = store.load().unwrap();
 
     *lock(&s.unlocked) = Some(Arc::new(unlocked_one()));
@@ -556,7 +574,7 @@ async fn restart_proxy_starts_over_with_the_same_certificate() {
     assert!(s.live_codes().is_err());
     assert_eq!(s.get_state().step, Step::Connect, "back to connecting");
     assert_eq!(
-        s.ensure_ca().unwrap().cert_der(),
+        s.ensure_ca().await.unwrap().cert_der(),
         certificate,
         "the device keeps the certificate it installed"
     );
@@ -1033,8 +1051,10 @@ async fn propose_joins_candidates_against_the_vault() {
 async fn apply_refuses_what_was_never_offered_and_applies_nothing() {
     let dir = tempfile::tempdir().unwrap();
     let s = session(dir.path(), Arc::new(MemoryKeyStore::new()));
+    let mut sample = token("2", "Sample", 6);
+    sample.secret = Secret::new("GEZDGNBVGY3TQOJQGEZDGNBVGY3TQOJQ".into());
     *lock(&s.unlocked) = Some(Arc::new(Unlocked {
-        tokens: vec![token("1", "Example", 6), token("2", "Sample", 6)],
+        tokens: vec![token("1", "Example", 6), sample],
         invalid: vec![],
         native: vec![],
     }));
@@ -1254,4 +1274,389 @@ fn decisions_and_login_deserialise_from_the_ui_shapes() {
     let e: DecisionEntry =
         serde_json::from_str(r#"{"tokenId":"1","decision":{"kind":"skip"}}"#).unwrap();
     assert_eq!(e.decision, DecisionDto::Skip);
+}
+
+// ---------------------------------------------------------------------------------------------
+// Final review fixes
+
+/// A key store whose deletion can be made to fail, as a Keychain item can refuse to go.
+#[derive(Default)]
+struct StubbornStore {
+    inner: MemoryKeyStore,
+    refuse_delete: AtomicBool,
+    /// Whether the marker file existed at the moment the key was stored.
+    marker_when_stored: Mutex<Vec<bool>>,
+    marker: Mutex<Option<PathBuf>>,
+}
+
+impl KeyStore for StubbornStore {
+    fn load(&self) -> Result<Option<Vec<u8>>, CaError> {
+        self.inner.load()
+    }
+    fn store(&self, blob: &[u8]) -> Result<(), CaError> {
+        if let Some(marker) = lock(&self.marker).as_ref() {
+            lock(&self.marker_when_stored).push(marker.exists());
+        }
+        self.inner.store(blob)
+    }
+    fn delete(&self) -> Result<(), CaError> {
+        // Like the Keychain: an item that is gone is deleted already, refusal or not.
+        let present = self.inner.load()?.is_some();
+        if present && self.refuse_delete.load(Ordering::SeqCst) {
+            return Err(CaError::Store("User interaction is not allowed.".into()));
+        }
+        self.inner.delete()
+    }
+}
+
+#[tokio::test]
+async fn the_marker_is_on_disk_before_the_key_is_stored() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = Arc::new(StubbornStore::default());
+    *lock(&store.marker) = Some(dir.path().join("session.json"));
+    let s = Session::new(store.clone(), dir.path().to_path_buf());
+    s.ensure_ca().await.unwrap();
+    assert_eq!(
+        *lock(&store.marker_when_stored),
+        [true],
+        "a crash between the two can only leave a marker without a key, never the reverse"
+    );
+}
+
+#[tokio::test]
+async fn a_key_that_will_not_go_is_reported_with_the_way_to_remove_it_by_hand() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = Arc::new(StubbornStore::default());
+    let s = Session::new(store.clone(), dir.path().to_path_buf());
+    s.tune_proxy(0, None);
+    let info = s
+        .start_proxy(Some("127.0.0.1"), &loopback(), no_emit())
+        .await
+        .unwrap();
+    *lock(&s.unlocked) = Some(Arc::new(unlocked_one()));
+    let bw = FakeBw::new();
+    s.bw_login(Box::new(bw.clone()), login_input())
+        .await
+        .unwrap();
+    std::fs::create_dir_all(dir.path().join("bw-data")).unwrap();
+    store.refuse_delete.store(true, Ordering::SeqCst);
+
+    let error = s.cleanup().await.unwrap_err().0;
+    assert!(
+        error.contains("(User interaction is not allowed)"),
+        "the reason: {error}"
+    );
+    assert!(error.contains("Keychain Access"), "{error}");
+    assert!(error.contains("\"dev.somecorp.authexodus\""), "{error}");
+    assert_eq!(error, key_not_removed("User interaction is not allowed."));
+
+    // Everything else was still done.
+    assert!(s.proxy.lock().await.is_none(), "the proxy is stopped");
+    assert!(TcpStream::connect((Ipv4Addr::LOCALHOST, info.port))
+        .await
+        .is_err());
+    assert!(bw.was_wiped());
+    assert!(!dir.path().join("bw-data").exists(), "Bitwarden data wiped");
+    assert!(lock(&s.unlocked).is_none());
+    // Nothing can be finished while the key is there; the marker stays for the next launch.
+    assert!(s.finish().await.is_err());
+    assert!(dir.path().join("session.json").exists());
+
+    // Once the person has removed it by hand, cleanup and finish go through.
+    store.inner.delete().unwrap();
+    s.cleanup().await.unwrap();
+    s.finish().await.unwrap();
+    assert!(!dir.path().join("session.json").exists());
+}
+
+#[tokio::test]
+async fn sign_in_input_is_checked_before_the_tool_is_asked() {
+    use authexodus_core::bitwarden::{BAD_EMAIL, BAD_SERVER_URL};
+    let dir = tempfile::tempdir().unwrap();
+    let s = session(dir.path(), Arc::new(MemoryKeyStore::new()));
+    let bw = FakeBw::new();
+    for (input, message) in [
+        (
+            r#"{"email":"a@example.com","password":"pw","region":{"kind":"selfHosted","url":"http://vault.example.test"}}"#,
+            BAD_SERVER_URL,
+        ),
+        (
+            r#"{"email":"a@example.com","password":"pw","region":{"kind":"selfHosted","url":"https://me:pw@vault.example.test"}}"#,
+            BAD_SERVER_URL,
+        ),
+        (
+            r#"{"email":"--raw","password":"pw","region":{"kind":"us"}}"#,
+            BAD_EMAIL,
+        ),
+        (
+            r#"{"email":"nobody","password":"pw","region":{"kind":"eu"}}"#,
+            BAD_EMAIL,
+        ),
+    ] {
+        let input: BwLoginInput = serde_json::from_str(input).unwrap();
+        let refused = s.bw_login(Box::new(bw.clone()), input).await.unwrap_err();
+        assert_eq!(refused.0, message);
+    }
+    assert_eq!(
+        bw.logins.load(Ordering::SeqCst),
+        0,
+        "the tool was never asked"
+    );
+
+    // Spaces around the address are not a reason to refuse it.
+    let input: BwLoginInput = serde_json::from_str(
+        r#"{"email":"  a@example.com ","password":"pw","region":{"kind":"selfHosted","url":" https://vault.example.test/ "}}"#,
+    )
+    .unwrap();
+    assert_eq!(
+        s.bw_login(Box::new(bw.clone()), input).await.unwrap(),
+        BwLoginResult::Ok
+    );
+}
+
+#[tokio::test]
+async fn a_refused_two_step_code_is_its_own_answer_and_unsupported_methods_say_so() {
+    use authexodus_core::bitwarden::cli::{EMAIL_CODE_UNSUPPORTED, METHOD_UNSUPPORTED};
+    let dir = tempfile::tempdir().unwrap();
+    let s = session(dir.path(), Arc::new(MemoryKeyStore::new()));
+    let with_code = || -> BwLoginInput {
+        serde_json::from_str(
+            r#"{"email":"a@example.com","password":"pw","region":{"kind":"us"},"twoFactorCode":" 123456 "}"#,
+        )
+        .unwrap()
+    };
+
+    // A code was sent and refused.
+    let mut bw = FakeBw::new();
+    bw.outcome = LoginOutcome::BadTwoFactorCode;
+    let r = s.bw_login(Box::new(bw.clone()), with_code()).await.unwrap();
+    assert_eq!(r, BwLoginResult::BadTwoFactorCode);
+    assert_eq!(
+        serde_json::to_string(&r).unwrap(),
+        r#"{"kind":"badTwoFactorCode"}"#
+    );
+    assert_eq!(lock(&bw.code_sent).as_deref(), Some("123456"), "trimmed");
+    assert!(bw.was_wiped());
+    // A client that answers "needs a code" although one was sent: that is a refused code too.
+    bw.outcome = LoginOutcome::NeedsTwoFactor;
+    assert_eq!(
+        s.bw_login(Box::new(bw.clone()), with_code()).await.unwrap(),
+        BwLoginResult::BadTwoFactorCode
+    );
+    // Without a code it is the question it always was.
+    assert_eq!(
+        s.bw_login(Box::new(bw.clone()), login_input())
+            .await
+            .unwrap(),
+        BwLoginResult::NeedsTwoFactor
+    );
+
+    // An account this app cannot sign in to: the message says why, word for word.
+    for message in [EMAIL_CODE_UNSUPPORTED, METHOD_UNSUPPORTED] {
+        let mut bw = FakeBw::new();
+        bw.error = Some(BwError::Unsupported(message.into()));
+        let error = s
+            .bw_login(Box::new(bw.clone()), with_code())
+            .await
+            .unwrap_err();
+        assert_eq!(error.0, message);
+        assert!(bw.was_wiped());
+    }
+    assert!(s.bw.lock().await.is_none());
+}
+
+#[test]
+fn the_unconstrained_root_is_only_ever_asked_for_by_name() {
+    assert!(ca_constrained(None));
+    assert!(ca_constrained(Some("")));
+    assert!(ca_constrained(Some("0")));
+    assert!(ca_constrained(Some("true")));
+    assert!(ca_constrained(Some("yes")));
+    assert!(!ca_constrained(Some("1")));
+    assert!(!ca_constrained(Some(" 1 ")));
+    assert_eq!(UNCONSTRAINED_ENV, "AUTHEXODUS_UNCONSTRAINED_CA");
+}
+
+#[tokio::test]
+async fn the_proxy_serves_the_certificate_whose_fingerprint_it_reports() {
+    for constrained in [true, false] {
+        let dir = tempfile::tempdir().unwrap();
+        let s = Session::with_ca_mode(
+            Arc::new(MemoryKeyStore::new()),
+            dir.path().to_path_buf(),
+            constrained,
+        );
+        assert_eq!(s.ca_is_constrained(), constrained);
+        s.tune_proxy(0, None);
+        let info = s
+            .start_proxy(Some("127.0.0.1"), &loopback(), no_emit())
+            .await
+            .unwrap();
+        let ca = s.ensure_ca().await.unwrap();
+        assert_eq!(ca.is_constrained(), constrained);
+        assert_eq!(info.cert_fingerprint, ca.fingerprint());
+        assert_eq!(info.cert_fingerprint.len(), 95);
+        // The same certificate after a start-over, so the same fingerprint.
+        let again = s.restart_proxy(None, &loopback(), no_emit()).await.unwrap();
+        assert_eq!(again.cert_fingerprint, info.cert_fingerprint);
+        s.cleanup().await.unwrap();
+    }
+}
+
+#[tokio::test]
+async fn the_proxy_never_listens_where_the_internet_can_reach_it() {
+    let dir = tempfile::tempdir().unwrap();
+    let s = session(dir.path(), Arc::new(MemoryKeyStore::new()));
+    s.tune_proxy(0, None);
+    // A computer whose only usable address is public (as if plugged straight into a modem).
+    let public_only = Network {
+        candidates: vec![candidate(Ipv4Addr::new(198, 51, 100, 23), "Ethernet (en0)")],
+        own: vec![IpAddr::V4(Ipv4Addr::new(198, 51, 100, 23))],
+    };
+    let none = s
+        .start_proxy(None, &public_only, no_emit())
+        .await
+        .unwrap_err();
+    assert_eq!(none.0, NO_LAN_ADDRESS);
+    assert!(none.0.contains("not on a home or office Wi-Fi network"));
+    let asked = s
+        .start_proxy(Some("198.51.100.23"), &public_only, no_emit())
+        .await
+        .unwrap_err();
+    assert_eq!(
+        asked.0, PUBLIC_ADDRESS,
+        "refused even when asked for by name"
+    );
+    let restart = s
+        .restart_proxy(Some("198.51.100.23"), &public_only, no_emit())
+        .await
+        .unwrap_err();
+    assert_eq!(restart.0, PUBLIC_ADDRESS);
+    assert!(s.proxy.lock().await.is_none(), "nothing was started");
+    assert!(
+        !dir.path().join("session.json").exists(),
+        "and no certificate was made for it"
+    );
+
+    // An address that is not this computer's.
+    let not_ours = s
+        .start_proxy(Some("10.9.8.7"), &loopback(), no_emit())
+        .await
+        .unwrap_err();
+    assert_eq!(not_ours.0, NOT_OUR_ADDRESS);
+}
+
+#[tokio::test]
+async fn a_start_over_without_an_address_stays_on_the_one_in_use() {
+    let dir = tempfile::tempdir().unwrap();
+    let s = session(dir.path(), Arc::new(MemoryKeyStore::new()));
+    s.tune_proxy(0, None);
+    let net = two_addresses();
+    // The person chose the second address, not the first.
+    let chosen = s
+        .start_proxy(Some("0.0.0.0"), &net, no_emit())
+        .await
+        .unwrap();
+    assert_eq!(chosen.ip, "0.0.0.0");
+    let restarted = s.restart_proxy(None, &net, no_emit()).await.unwrap();
+    assert_eq!(restarted.ip, "0.0.0.0", "the phone only has to reconnect");
+    // Named, it moves.
+    let moved = s
+        .restart_proxy(Some("127.0.0.1"), &net, no_emit())
+        .await
+        .unwrap();
+    assert_eq!(moved.ip, "127.0.0.1");
+    s.cleanup().await.unwrap();
+}
+
+#[test]
+fn a_code_and_its_seconds_left_come_from_the_same_instant() {
+    let unlocked = unlocked_one();
+    // The last second of one period, and the first of the next.
+    let last = 1_760_000_009 - 1_760_000_009 % 30 + 29;
+    let at_last = live_codes(&unlocked, last);
+    let at_next = live_codes(&unlocked, last + 1);
+    assert_eq!(at_last[0].seconds_left, 1);
+    assert_eq!(at_next[0].seconds_left, 30);
+    assert_eq!(
+        at_last[0].code,
+        totp::code("JBSWY3DPEHPK3PXP", 6, 30, last).unwrap()
+    );
+    assert_eq!(
+        at_next[0].code,
+        totp::code("JBSWY3DPEHPK3PXP", 6, 30, last + 1).unwrap()
+    );
+    assert_ne!(
+        at_last[0].code, at_next[0].code,
+        "a new code with a full count"
+    );
+    // Every second of a period shows the same code, counting down from 30 to 1.
+    let start = last + 1;
+    for t in start..start + 30 {
+        let codes = live_codes(&unlocked, t);
+        assert_eq!(codes[0].code, at_next[0].code);
+        assert_eq!(u64::from(codes[0].seconds_left), 30 - (t - start));
+    }
+}
+
+/// A key store that says which of its operations were used.
+#[derive(Default)]
+struct WatchedStore {
+    inner: MemoryKeyStore,
+    calls: Mutex<Vec<&'static str>>,
+}
+
+impl KeyStore for WatchedStore {
+    fn load(&self) -> Result<Option<Vec<u8>>, CaError> {
+        lock(&self.calls).push("load");
+        self.inner.load()
+    }
+    fn store(&self, blob: &[u8]) -> Result<(), CaError> {
+        lock(&self.calls).push("store");
+        self.inner.store(blob)
+    }
+    fn delete(&self) -> Result<(), CaError> {
+        lock(&self.calls).push("delete");
+        self.inner.delete()
+    }
+}
+
+#[tokio::test]
+async fn a_stored_key_is_never_read_only_replaced_or_deleted() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = Arc::new(WatchedStore::default());
+    // Something was in the store before the run began (planted, or left by a crash).
+    store.inner.store(b"planted before the run").unwrap();
+
+    // A new run: the old item is deleted and a new one made. It is not looked at.
+    let s = Session::new(store.clone(), dir.path().to_path_buf());
+    s.tune_proxy(0, None);
+    s.start_proxy(Some("127.0.0.1"), &loopback(), no_emit())
+        .await
+        .unwrap();
+    s.restart_proxy(None, &loopback(), no_emit()).await.unwrap();
+    assert_eq!(*lock(&store.calls), ["delete", "store"]);
+    assert_ne!(
+        store.inner.load().unwrap().unwrap(),
+        b"planted before the run"
+    );
+    s.on_exit();
+    drop(s);
+
+    // The next launch finds the marker. All it does with the key is delete it.
+    lock(&store.calls).clear();
+    let resumed = Session::new(store.clone(), dir.path().to_path_buf());
+    assert!(resumed.get_state().resume_cleanup);
+    resumed.cleanup().await.unwrap();
+    resumed.finish().await.unwrap();
+    assert_eq!(*lock(&store.calls), ["delete"]);
+    assert_eq!(store.inner.load().unwrap(), None);
+
+    // Finishing without having cleaned up deletes too, and still reads nothing.
+    lock(&store.calls).clear();
+    let again = Session::new(store.clone(), dir.path().to_path_buf());
+    again.ensure_ca().await.unwrap();
+    again.finish().await.unwrap();
+    assert_eq!(*lock(&store.calls), ["delete", "store", "delete"]);
+    assert_eq!(store.inner.load().unwrap(), None);
 }

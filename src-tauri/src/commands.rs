@@ -22,7 +22,7 @@
 use std::path::PathBuf;
 use std::sync::Arc;
 
-use tauri::{AppHandle, Emitter, State, WebviewWindow};
+use tauri::{AppHandle, Emitter, Manager, State, WebviewWindow};
 use tauri_plugin_dialog::DialogExt;
 use zeroize::Zeroizing;
 
@@ -103,22 +103,30 @@ pub fn google_unsupported(session: State<'_, Session>) -> Result<Vec<String>, Cm
     session.google_unsupported()
 }
 
-/// Write `file` to `chosen` (owner-only), or report that the person cancelled.
+/// Write the `file` made for `dest` to `chosen` (owner-only), or report that the person
+/// cancelled. The log gets the kind of destination and how it ended, never the place.
 pub fn finish_export(
+    dest: DestinationDto,
     file: &ExportFile,
     chosen: Option<PathBuf>,
 ) -> Result<ExportOutcome, CmdError> {
     let Some(path) = chosen else {
+        tracing::info!(destination = ?dest, "export cancelled");
         return Ok(ExportOutcome::Cancelled { cancelled: true });
     };
-    write_owner_only(&path, &file.bytes)
-        .map_err(|e| CmdError::new(format!("could not save the file: {e}")))?;
+    write_owner_only(&path, &file.bytes).map_err(|e| {
+        tracing::warn!(destination = ?dest, kind = ?e.kind(), "export could not be written");
+        CmdError::new(format!("could not save the file: {e}"))
+    })?;
+    tracing::info!(destination = ?dest, bytes = file.bytes.len(), "export written");
     Ok(ExportOutcome::Saved {
         saved: path.to_string_lossy().into_owned(),
     })
 }
 
-/// The save dialog is opened from Rust, so the webview needs no `dialog:` permission.
+/// The save dialog is opened from Rust, so the webview needs no `dialog:` permission. It opens
+/// in the Downloads folder rather than wherever the last save went, which is often a folder
+/// that is synced to a cloud service.
 #[tauri::command]
 pub async fn export_file(
     app: AppHandle,
@@ -128,13 +136,17 @@ pub async fn export_file(
 ) -> Result<ExportOutcome, CmdError> {
     let file = session.prepare_export(dest)?;
     let (tx, rx) = tokio::sync::oneshot::channel();
-    app.dialog()
+    let mut dialog = app
+        .dialog()
         .file()
         .set_parent(&window)
-        .set_file_name(&file.suggested_name)
-        .save_file(move |picked| {
-            let _ = tx.send(picked);
-        });
+        .set_file_name(&file.suggested_name);
+    if let Ok(downloads) = app.path().download_dir() {
+        dialog = dialog.set_directory(downloads);
+    }
+    dialog.save_file(move |picked| {
+        let _ = tx.send(picked);
+    });
     let picked = rx
         .await
         .map_err(|_| CmdError::new("the save dialog closed unexpectedly"))?;
@@ -145,7 +157,7 @@ pub async fn export_file(
                 .map_err(|_| CmdError::new("that location cannot be saved to"))?,
         ),
     };
-    finish_export(&file, chosen)
+    finish_export(dest, &file, chosen)
 }
 
 #[tauri::command]
@@ -473,7 +485,7 @@ mod tests {
             suggested_name: "x.csv".into(),
             bytes: b"a,b".to_vec(),
         };
-        let cancelled = finish_export(&file, None).unwrap();
+        let cancelled = finish_export(DestinationDto::Bitwarden, &file, None).unwrap();
         assert_eq!(
             serde_json::to_string(&cancelled).unwrap(),
             r#"{"cancelled":true}"#
@@ -481,7 +493,7 @@ mod tests {
 
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("x.csv");
-        let saved = finish_export(&file, Some(path.clone())).unwrap();
+        let saved = finish_export(DestinationDto::Bitwarden, &file, Some(path.clone())).unwrap();
         assert_eq!(
             serde_json::to_value(&saved).unwrap(),
             serde_json::json!({ "saved": path.to_string_lossy() })
@@ -516,6 +528,7 @@ mod tests {
             cert_url: "http://1.2.3.4:8080/".into(),
             cert_qr_svg: "<svg/>".into(),
             check_url: "https://c/".into(),
+            cert_fingerprint: "AB:CD".into(),
         };
         let v = serde_json::to_value(&info).unwrap();
         for k in [
@@ -525,6 +538,7 @@ mod tests {
             "certUrl",
             "certQrSvg",
             "checkUrl",
+            "certFingerprint",
         ] {
             assert!(v.get(k).is_some(), "missing {k}");
         }

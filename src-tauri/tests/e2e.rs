@@ -8,20 +8,34 @@
 //!   way a phone does, trusts it and nothing else, and asks Authy for its tokens;
 //! * an in-memory key store and a temporary directory.
 //!
-//! No Tauri runtime, no Keychain, no dialog, no Bitwarden, no network beyond this computer.
-//! Every name, secret and password in this file is made up.
+//! * a stand-in Bitwarden client, so the Bitwarden stages run without the real tool.
+//!
+//! The app's own log subscriber (at its most talkative) records the whole run, and the log is
+//! then searched for every secret, name, host and address that went through the app.
+//!
+//! No Tauri runtime, no Keychain, no dialog, no real Bitwarden, no network beyond this
+//! computer. Every name, secret and password in this file is made up.
 
+use std::io::Write;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::path::Path;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use aes::Aes256;
+use async_trait::async_trait;
+use authexodus_core::bitwarden::{
+    BwClient, BwError, CodeMark, LoginOutcome, Region, SetTotp, VaultLogin,
+};
 use authexodus_core::ca::{KeyStore, MemoryKeyStore};
 use authexodus_core::proxy::{TestUpstream, AUTHY_HOST};
 use authexodus_core::totp;
 use authexodus_lib::commands::finish_export;
-use authexodus_lib::dto::{DestinationDto, ExportOutcome, ProxyEventDto, Step};
+use authexodus_lib::dto::{
+    BwLoginInput, BwLoginResult, DecisionDto, DecisionEntry, DestinationDto, ExportOutcome,
+    ProxyEventDto, Step,
+};
+use authexodus_lib::logging;
 use authexodus_lib::network::{Candidate, Network};
 use authexodus_lib::session::{EmitProxy, Session, RELEASES_URL};
 use base64::Engine;
@@ -48,6 +62,19 @@ const PASSWORD: &str = " synthetic backup pässword ";
 const PHONE: &str = "192.168.1.57";
 /// The same phone after it rejoined the Wi-Fi under a new address.
 const PHONE_AGAIN: &str = "192.168.1.99";
+/// Some other device on the network, which is never the accepted one.
+const STRANGER: &str = "192.168.1.250";
+
+// Things that go through the app during the run and must never reach its log.
+const PLANTED_QUERY: &str = "planted-query-value";
+const TUNNEL_HOST: &str = "planted-tunnel-host.invalid";
+const PLAIN_HOST: &str = "planted-plain-host.invalid";
+const PLAIN_PATH: &str = "/planted-plain-path";
+const BW_EMAIL: &str = "planted-person@example.test";
+const BW_PASSWORD: &str = "planted master password";
+const BW_SERVER: &str = "planted-vault.example.test";
+const BW_CODE: &str = "135790";
+const VAULT_LOGIN_NAME: &str = "Planted Vault Login";
 
 // ---------------------------------------------------------------------------------------------
 // A synthetic backup, encrypted the way Authy's are
@@ -282,10 +309,15 @@ impl Phone {
     }
 
     async fn connect(&self) -> TcpStream {
-        let tcp = TcpStream::connect(self.proxy).await.unwrap();
+        // The local port is chosen, and the pretence registered, before the connection is
+        // made: the proxy may accept it before `connect` returns here.
+        let socket = tokio::net::TcpSocket::new_v4().unwrap();
+        socket
+            .bind(SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0))
+            .unwrap();
         self.upstream
-            .pretend_peer(tcp.local_addr().unwrap().port(), self.address);
-        tcp
+            .pretend_peer(socket.local_addr().unwrap().port(), self.address);
+        socket.connect(self.proxy).await.unwrap()
     }
 
     /// Open the certificate address shown as a QR code, follow the page's button to `/cert`,
@@ -449,9 +481,127 @@ fn secret_of(otpauth: &str) -> &str {
 }
 
 // ---------------------------------------------------------------------------------------------
+// The log
+
+#[derive(Clone, Default)]
+struct LogBuffer(Arc<Mutex<Vec<u8>>>);
+
+impl LogBuffer {
+    fn text(&self) -> String {
+        String::from_utf8_lossy(&self.0.lock().unwrap()).into_owned()
+    }
+}
+
+impl Write for LogBuffer {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        self.0.lock().unwrap().extend_from_slice(buf);
+        Ok(buf.len())
+    }
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for LogBuffer {
+    type Writer = LogBuffer;
+    fn make_writer(&'a self) -> LogBuffer {
+        self.clone()
+    }
+}
+
+/// The app's own subscriber, at its most talkative, for the whole process (every thread,
+/// the blocking pool included). This file holds one test, so nothing else shares it.
+fn record_the_log() -> LogBuffer {
+    let buffer = LogBuffer::default();
+    tracing::subscriber::set_global_default(logging::subscriber(
+        tracing::Level::TRACE,
+        buffer.clone(),
+    ))
+    .expect("the only subscriber in this test binary");
+    buffer
+}
+
+// ---------------------------------------------------------------------------------------------
+// A stand-in Bitwarden
+
+#[derive(Clone, Default)]
+struct StandInBitwarden {
+    /// Fail the next sync once, with a message that names things.
+    fail_sync_once: Arc<Mutex<bool>>,
+    created: Arc<Mutex<Vec<String>>>,
+}
+
+#[async_trait]
+impl BwClient for StandInBitwarden {
+    async fn login(
+        &mut self,
+        email: &str,
+        password: &str,
+        region: &Region,
+        code: Option<&str>,
+    ) -> Result<LoginOutcome, BwError> {
+        assert_eq!((email, password), (BW_EMAIL, BW_PASSWORD));
+        assert_eq!(region.server_url(), format!("https://{BW_SERVER}"));
+        Ok(match code {
+            None => LoginOutcome::NeedsTwoFactor,
+            Some("000000") => LoginOutcome::BadTwoFactorCode,
+            Some(_) => LoginOutcome::Ok,
+        })
+    }
+    async fn sync(&self) -> Result<(), BwError> {
+        let mut fail = self.fail_sync_once.lock().unwrap();
+        if std::mem::take(&mut *fail) {
+            return Err(BwError::Cli(format!(
+                "Item \"{VAULT_LOGIN_NAME}\" of {BW_EMAIL} on https://{BW_SERVER}/api failed"
+            )));
+        }
+        Ok(())
+    }
+    async fn list_logins(&self) -> Result<Vec<VaultLogin>, BwError> {
+        Ok(vec![VaultLogin {
+            id: "11111111-0000-4000-8000-000000000001".into(),
+            name: VAULT_LOGIN_NAME.into(),
+            username: Some(BW_EMAIL.into()),
+            hosts: vec![BW_SERVER.into()],
+            has_totp: true,
+            code: CodeMark::of_secret("KRUGKIDDN5SGKIDUNBQXIIDXMFZSA5DIMVZGK"),
+        }])
+    }
+    async fn import_folder_titles(&self) -> Result<Vec<String>, BwError> {
+        Ok(self.created.lock().unwrap().clone())
+    }
+    async fn set_totp(&self, _: &str, _: &str) -> Result<SetTotp, BwError> {
+        Ok(SetTotp::AlreadyHasCode)
+    }
+    async fn create_in_import_folder(
+        &self,
+        title: &str,
+        _: Option<&str>,
+        _: &str,
+    ) -> Result<(), BwError> {
+        self.created.lock().unwrap().push(title.into());
+        Ok(())
+    }
+    async fn logout_and_wipe(&mut self) -> Result<(), BwError> {
+        Ok(())
+    }
+}
+
+fn bw_login(code: Option<&str>) -> BwLoginInput {
+    serde_json::from_value(serde_json::json!({
+        "email": BW_EMAIL,
+        "password": BW_PASSWORD,
+        "region": { "kind": "selfHosted", "url": format!("https://{BW_SERVER}") },
+        "twoFactorCode": code,
+    }))
+    .unwrap()
+}
+
+// ---------------------------------------------------------------------------------------------
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn the_whole_flow_with_a_simulated_phone() {
+    let log = record_the_log();
     let dir = tempfile::tempdir().unwrap();
     let data_dir = dir.path().join("app-data");
     std::fs::create_dir(&data_dir).unwrap();
@@ -483,9 +633,12 @@ async fn the_whole_flow_with_a_simulated_phone() {
     assert_eq!(state.releases_url, RELEASES_URL);
     assert_eq!(store.load().unwrap(), None);
 
-    // ---- Connect: the proxy starts, on the default address.
+    // ---- Connect: the proxy starts. (Loopback is never a default, so it is named.)
     let (emit, mut heard) = events();
-    let info = session.start_proxy(None, &net, emit.clone()).await.unwrap();
+    let info = session
+        .start_proxy(Some("127.0.0.1"), &net, emit.clone())
+        .await
+        .unwrap();
     assert_eq!(info.ip, "127.0.0.1");
     assert_eq!(info.cert_url, format!("http://127.0.0.1:{}/", info.port));
     assert!(info.cert_qr_svg.contains("<svg"));
@@ -518,7 +671,9 @@ async fn the_whole_flow_with_a_simulated_phone() {
 
     // ---- Authy: the phone signs in; the backup passes through the proxy.
     let (head, body) = phone
-        .authy_get("/json/users/424242/authenticator_tokens?apps=7&api_key=synthetic")
+        .authy_get(&format!(
+            "/json/users/424242/authenticator_tokens?apps=7&api_key={PLANTED_QUERY}"
+        ))
         .await;
     assert!(head.starts_with("HTTP/1.1 200"), "{head}");
     assert_eq!(
@@ -549,10 +704,43 @@ async fn the_whole_flow_with_a_simulated_phone() {
         );
     }
 
-    // The same phone under a new address is refused, and the UI is told.
-    let stranger = Phone::new(info.port, &upstream, PHONE_AGAIN);
-    let (status, _) = stranger.connect_to_authy().await;
-    assert_eq!(status, "HTTP/1.1 403 Forbidden");
+    // The phone's other traffic: a tunnel and a plain-HTTP request, to hosts that do not
+    // exist. Neither is the app's business, and neither may reach its log.
+    let mut tunnel = phone.connect().await;
+    tunnel
+        .write_all(
+            format!("CONNECT {TUNNEL_HOST}:443 HTTP/1.1\r\nHost: {TUNNEL_HOST}:443\r\n\r\n")
+                .as_bytes(),
+        )
+        .await
+        .unwrap();
+    let mut answer = Vec::new();
+    while !answer.ends_with(b"\r\n\r\n") {
+        answer.push(tunnel.read_u8().await.unwrap());
+    }
+    assert!(String::from_utf8_lossy(&answer).starts_with("HTTP/1.1 502"));
+    let mut plain = phone.connect().await;
+    plain
+        .write_all(
+            format!(
+                "GET http://{PLAIN_HOST}{PLAIN_PATH}?q={PLANTED_QUERY} HTTP/1.1\r\n\
+                 Host: {PLAIN_HOST}\r\nConnection: close\r\n\r\n"
+            )
+            .as_bytes(),
+        )
+        .await
+        .unwrap();
+    let mut answer = Vec::new();
+    let _ = tokio::time::timeout(WAIT, plain.read_to_end(&mut answer)).await;
+    assert!(String::from_utf8_lossy(&answer).starts_with("HTTP/1.1 502"));
+
+    // The same phone under a new address is refused, and so is some other device on the
+    // network; the UI is told once (refusals are reported at most once in two seconds).
+    for address in [PHONE_AGAIN, STRANGER] {
+        let refused = Phone::new(info.port, &upstream, address);
+        let (status, _) = refused.connect_to_authy().await;
+        assert_eq!(status, "HTTP/1.1 403 Forbidden");
+    }
     assert_eq!(heard.drain().await, [ProxyEventDto::DeviceRefused]);
     assert_eq!(
         serde_json::to_string(&ProxyEventDto::DeviceRefused).unwrap(),
@@ -632,13 +820,14 @@ async fn the_whole_flow_with_a_simulated_phone() {
     assert_eq!(file.suggested_name, "authy-bitwarden-import.csv");
     // The person cancels the save dialog...
     assert_eq!(
-        serde_json::to_string(&finish_export(&file, None).unwrap()).unwrap(),
+        serde_json::to_string(&finish_export(DestinationDto::Bitwarden, &file, None).unwrap())
+            .unwrap(),
         r#"{"cancelled":true}"#
     );
     // ...then picks a place, where a file already is.
     let chosen = dir.path().join(&file.suggested_name);
     std::fs::write(&chosen, b"an older export").unwrap();
-    let saved = finish_export(&file, Some(chosen.clone())).unwrap();
+    let saved = finish_export(DestinationDto::Bitwarden, &file, Some(chosen.clone())).unwrap();
     assert_eq!(
         saved,
         ExportOutcome::Saved {
@@ -669,6 +858,38 @@ async fn the_whole_flow_with_a_simulated_phone() {
         2,
         "the app data folder and the export: no temporary file is left"
     );
+
+    // ---- Bitwarden, through the stand-in: a code is asked for, a wrong one is refused, the
+    // right one signs in; a failed listing, then proposals and an apply.
+    let bitwarden = StandInBitwarden::default();
+    let asked = session
+        .bw_login(Box::new(bitwarden.clone()), bw_login(None))
+        .await
+        .unwrap();
+    assert_eq!(asked, BwLoginResult::NeedsTwoFactor);
+    let refused = session
+        .bw_login(Box::new(bitwarden.clone()), bw_login(Some("000000")))
+        .await
+        .unwrap();
+    assert_eq!(refused, BwLoginResult::BadTwoFactorCode);
+    let signed_in = session
+        .bw_login(Box::new(bitwarden.clone()), bw_login(Some(BW_CODE)))
+        .await
+        .unwrap();
+    assert_eq!(signed_in, BwLoginResult::Ok);
+    *bitwarden.fail_sync_once.lock().unwrap() = true;
+    assert!(session.bw_propose().await.is_err());
+    let proposals = session.bw_propose().await.unwrap();
+    assert_eq!(proposals.len(), usable().count());
+    let decisions: Vec<DecisionEntry> = proposals
+        .iter()
+        .map(|p| DecisionEntry {
+            token_id: p.token_id.clone(),
+            decision: DecisionDto::CreateNew,
+        })
+        .collect();
+    let report = session.bw_apply(decisions, Arc::new(|_| {})).await.unwrap();
+    assert_eq!((report.created, report.failed), (usable().count(), None));
 
     // ---- Verify: the live codes are the codes any authenticator would show.
     let instant = 1_760_000_000;
@@ -772,4 +993,83 @@ async fn the_whole_flow_with_a_simulated_phone() {
     assert!(!next.get_state().resume_cleanup);
     assert_eq!(next.get_state().step, Step::Welcome);
     assert_eq!(store.load().unwrap(), None);
+
+    // ---- The log: every stage is there, and nothing that went through the app is.
+    tokio::time::sleep(QUIET).await;
+    let log = log.text();
+    if std::env::var_os("AUTHEXODUS_SHOW_TEST_LOG").is_some() {
+        eprintln!("{log}");
+    }
+    for expected in [
+        "certificate authority created constrained=true fingerprint=",
+        "proxy started address=127.0.0.1 port=",
+        "proxy event kind=deviceConnected forwarded=true",
+        &format!("device accepted device={PHONE} host=authy"),
+        "proxy event kind=trustWorking forwarded=true",
+        "intercepted request method=GET path=/json/users/:id/authenticator_tokens status=200",
+        &format!("backup captured tokens={} native=0", ACCOUNTS.len()),
+        &format!("proxy event kind=backupCaptured count={}", ACCOUNTS.len()),
+        "proxy event kind=deviceRefused forwarded=true",
+        "unlock attempted tokens=5 native=1",
+        "unlock failed: wrong password",
+        "unlock succeeded tokens=4 invalid=1 native=1",
+        "export cancelled destination=Bitwarden",
+        "export written destination=Bitwarden",
+        "bitwarden: signing in region=selfHosted with_code=false",
+        "bitwarden: sign-in answered outcome=NeedsTwoFactor",
+        "bitwarden: sign-in answered outcome=BadTwoFactorCode",
+        "bitwarden: sign-in answered outcome=Ok",
+        "bitwarden: failed stage=sync kind=cli error=Bitwarden CLI error: Item [removed] of [removed] on [removed] failed",
+        "bitwarden: matches proposed",
+        "bitwarden: applied attached=0 created=4",
+        "starting over: the capture and anything unlocked are discarded",
+        "cleanup: proxy stopped",
+        "cleanup: certificate key removed",
+        "cleanup: finished complete=true",
+        "finished: the resume marker is cleared",
+    ] {
+        assert!(log.contains(expected), "missing {expected:?} in:\n{log}");
+    }
+    let mut forbidden: Vec<String> = vec![
+        PASSWORD.trim().to_string(),
+        "pässword".into(),
+        PLANTED_QUERY.into(),
+        "api_key".into(),
+        "?".into(),
+        "424242".into(),
+        TUNNEL_HOST.into(),
+        PLAIN_HOST.into(),
+        PLAIN_PATH.into(),
+        ".invalid".into(),
+        STRANGER.into(),
+        BW_EMAIL.into(),
+        BW_PASSWORD.into(),
+        BW_SERVER.into(),
+        BW_CODE.into(),
+        VAULT_LOGIN_NAME.into(),
+        "otpauth".into(),
+        "secret=".into(),
+        "encrypted_seed".into(),
+        "synthetic-salt".into(),
+        file.suggested_name.clone(),
+        dir.path().to_string_lossy().into_owned(),
+        "octo@example.com".into(),
+        "Synthetic Native".into(),
+    ];
+    for account in ACCOUNTS {
+        forbidden.push(account.seed.to_string());
+        forbidden.push(account.name.to_string());
+        forbidden.extend(account.issuer.map(str::to_string));
+    }
+    forbidden.extend(titles.iter().cloned());
+    for code in &codes {
+        forbidden.push(format!(" {} ", code.code));
+        forbidden.push(format!("={}", code.code));
+    }
+    for planted in &forbidden {
+        assert!(
+            !log.contains(planted.as_str()),
+            "{planted:?} reached the log:\n{log}"
+        );
+    }
 }

@@ -5,6 +5,11 @@
 //! Ethernet, VPN tunnels, Internet Sharing bridges), so the choice is made here, shown to the
 //! person with a label, and never defaults to a loopback or tunnel address.
 //!
+//! The proxy is an open door to whoever can reach the address it listens on, so that address
+//! is never one the internet can reach: a public address is not offered, is never the
+//! default, and is refused even when asked for (see [`is_public`]). The default is always a
+//! private (RFC 1918) address; a computer that has none gets no default.
+//!
 //! `if-addrs` does not expose interface flags, so "up" is approximated by "has an IPv4
 //! address" (the system removes addresses from interfaces that are down) and "point to point"
 //! by the interface name (`utun`, `ppp`, `ipsec`, ...).
@@ -65,8 +70,8 @@ fn label_for(name: &str) -> String {
     format!("{kind} ({name})")
 }
 
-/// The addresses worth offering: IPv4, not loopback, not link-local, not on a tunnel.
-/// Order is the system's order.
+/// The addresses worth offering: IPv4, not loopback, not link-local, not on a tunnel, and not
+/// public. Order is the system's order.
 pub fn candidates(ifaces: &[Iface]) -> Vec<Candidate> {
     ifaces
         .iter()
@@ -75,6 +80,7 @@ pub fn candidates(ifaces: &[Iface]) -> Vec<Candidate> {
             IpAddr::V6(_) => None,
         })
         .filter(|(_, ip)| !ip.is_loopback() && !ip.is_link_local() && !ip.is_unspecified())
+        .filter(|(_, ip)| !is_public(*ip))
         .filter(|(i, _)| !is_tunnel(&i.name))
         .map(|(i, ip)| Candidate {
             ip,
@@ -107,14 +113,22 @@ fn is_cgnat(ip: Ipv4Addr) -> bool {
     a == 100 && (64..128).contains(&b)
 }
 
-/// The first RFC 1918 address; failing that the first that is not carrier-grade NAT space
-/// (the range VPNs and some relays use). `None` when there is nothing sensible.
+/// Could a stranger on the internet reach this address? True for anything that is not
+/// private (RFC 1918), carrier-grade NAT, loopback, link-local or unspecified. The proxy never
+/// listens on such an address.
+pub fn is_public(ip: Ipv4Addr) -> bool {
+    !(ip.is_private()
+        || is_cgnat(ip)
+        || ip.is_loopback()
+        || ip.is_link_local()
+        || ip.is_unspecified())
+}
+
+/// The first private (RFC 1918) address: the computer's address on a home or office network.
+/// `None` when it has none; nothing else is ever chosen for the person. (A carrier-grade NAT
+/// address, which some VPNs and relays use, can still be picked by hand.)
 pub fn default_ip(candidates: &[Candidate]) -> Option<Ipv4Addr> {
-    candidates
-        .iter()
-        .find(|c| c.ip.is_private())
-        .or_else(|| candidates.iter().find(|c| !is_cgnat(c.ip)))
-        .map(|c| c.ip)
+    candidates.iter().map(|c| c.ip).find(Ipv4Addr::is_private)
 }
 
 /// Read the system's interfaces. Only this function touches the system.
@@ -180,9 +194,10 @@ mod tests {
         .map(|s| s.parse().unwrap())
         .collect();
         assert_eq!(net.own, expected, "nothing is left out, in either family");
-        // The choice offered to the person is still IPv4 LAN addresses only.
+        // The choice offered to the person is still IPv4 LAN addresses only: the public
+        // address on the other adapter is this computer's, but is not offered.
         let offered: Vec<String> = net.candidates.iter().map(|c| c.ip.to_string()).collect();
-        assert_eq!(offered, ["192.168.4.109", "203.0.113.7"]);
+        assert_eq!(offered, ["192.168.4.109"]);
 
         // The same address reported twice is listed once.
         let twice = [iface("en0", [10, 0, 0, 5]), iface("en0", [10, 0, 0, 5])];
@@ -204,16 +219,71 @@ mod tests {
     }
 
     #[test]
-    fn private_beats_public_and_order_decides_among_private() {
+    fn a_public_address_is_never_offered_and_order_decides_among_private() {
         let list = [
             iface("en5", [203, 0, 113, 7]),
             iface("en7", [10, 0, 0, 5]),
             iface("en0", [192, 168, 1, 2]),
         ];
         let c = candidates(&list);
-        assert_eq!(c.len(), 3);
+        let offered: Vec<Ipv4Addr> = c.iter().map(|c| c.ip).collect();
+        assert_eq!(
+            offered,
+            [Ipv4Addr::new(10, 0, 0, 5), Ipv4Addr::new(192, 168, 1, 2)]
+        );
         assert_eq!(default_ip(&c), Some(Ipv4Addr::new(10, 0, 0, 5)));
-        assert_eq!(c[0].label, "Ethernet (en5)");
+        assert_eq!(c[0].label, "Ethernet (en7)");
+    }
+
+    #[test]
+    fn a_computer_with_only_a_public_address_gets_no_default() {
+        // Plugged straight into a modem, or on a campus network that hands out public
+        // addresses: listening there would open the proxy to the internet.
+        let list = [
+            iface("lo0", [127, 0, 0, 1]),
+            iface("en0", [198, 51, 100, 23]),
+        ];
+        let c = candidates(&list);
+        assert!(c.is_empty(), "the public address is not even offered");
+        assert_eq!(default_ip(&c), None);
+        // Even handed a list that holds one (by a caller that built it some other way), the
+        // default is never a public address, nor a carrier-grade NAT one.
+        let handed = [
+            Candidate {
+                ip: Ipv4Addr::new(198, 51, 100, 23),
+                label: "Ethernet (en0)".into(),
+            },
+            Candidate {
+                ip: Ipv4Addr::new(100, 70, 1, 1),
+                label: "Ethernet (en1)".into(),
+            },
+        ];
+        assert_eq!(default_ip(&handed), None);
+    }
+
+    #[test]
+    fn public_means_reachable_from_the_internet() {
+        for public in [
+            "198.51.100.23",
+            "203.0.113.7",
+            "8.8.8.8",
+            "172.32.0.1",
+            "100.128.0.1",
+        ] {
+            assert!(is_public(public.parse().unwrap()), "{public}");
+        }
+        for not_public in [
+            "10.0.0.5",
+            "172.16.0.1",
+            "172.31.255.254",
+            "192.168.1.2",
+            "100.64.0.2",
+            "127.0.0.1",
+            "169.254.3.3",
+            "0.0.0.0",
+        ] {
+            assert!(!is_public(not_public.parse().unwrap()), "{not_public}");
+        }
     }
 
     #[test]

@@ -4,6 +4,7 @@
 pub mod commands;
 pub mod dto;
 pub mod keychain;
+pub mod logging;
 pub mod network;
 pub mod session;
 
@@ -12,6 +13,12 @@ use std::sync::Arc;
 use tauri::{Manager, RunEvent};
 
 pub fn run() {
+    // Before anything else, so that every stage of the run can be followed from Terminal.
+    logging::init();
+    match logging::raise_open_file_limit() {
+        Some(limit) => tracing::debug!(limit, "open-file limit"),
+        None => tracing::warn!("the open-file limit could not be read"),
+    }
     let app = tauri::Builder::default()
         .plugin(tauri_plugin_dialog::init())
         .setup(|app| {
