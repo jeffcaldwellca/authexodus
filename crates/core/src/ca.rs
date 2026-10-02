@@ -1,7 +1,10 @@
 //! Certificate authority and the `KeyStore` trait (package 1C).
 //!
-//! One root per run: P-256, valid seven days, optionally name-constrained to the DNS subtree
-//! `authy.com` so that a leaked key could only ever impersonate Authy. The certificate and its
+//! One root per run: P-256, valid seven days, optionally name-constrained: DNS names are
+//! permitted only under `authy.com`, and every IP address is excluded. For a client that
+//! enforces name constraints, a leaked key could then vouch for a server only under a name
+//! inside `authy.com`. (Whether iOS enforces them on a user-installed root is checked on a real
+//! device; the unconstrained root is the fallback.) The certificate and its
 //! private key live in a [`KeyStore`] (the macOS Keychain in the app, memory in tests) until
 //! cleanup calls [`Authority::destroy`].
 //!
@@ -10,9 +13,9 @@
 use std::sync::{Arc, Mutex};
 
 use rcgen::{
-    BasicConstraints, CertificateParams, DistinguishedName, DnType, ExtendedKeyUsagePurpose,
-    GeneralSubtree, IsCa, Issuer, KeyPair, KeyUsagePurpose, NameConstraints, SanType, SerialNumber,
-    PKCS_ECDSA_P256_SHA256,
+    BasicConstraints, CertificateParams, CidrSubnet, DistinguishedName, DnType,
+    ExtendedKeyUsagePurpose, GeneralSubtree, IsCa, Issuer, KeyPair, KeyUsagePurpose,
+    NameConstraints, SanType, SerialNumber, PKCS_ECDSA_P256_SHA256,
 };
 use rustls::crypto::aws_lc_rs;
 use rustls::pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer};
@@ -153,7 +156,12 @@ impl Authority {
         if constrained {
             params.name_constraints = Some(NameConstraints {
                 permitted_subtrees: vec![GeneralSubtree::DnsName(PERMITTED_SUBTREE.to_owned())],
-                excluded_subtrees: vec![],
+                // A permitted dNSName subtree does not restrict names of other types
+                // (RFC 5280 4.2.1.10), so IP-address names are excluded entirely.
+                excluded_subtrees: vec![
+                    GeneralSubtree::IpAddress(CidrSubnet::from_v4_prefix([0; 4], 0)),
+                    GeneralSubtree::IpAddress(CidrSubnet::from_v6_prefix([0; 16], 0)),
+                ],
             });
         }
 
@@ -381,7 +389,17 @@ mod tests {
             "{:?}",
             permitted[0].base
         );
-        assert!(nc.excluded_subtrees.is_none());
+        // A dNSName constraint says nothing about IP-address names, so every IP address is
+        // excluded outright: 0.0.0.0/0 and ::/0 (address then mask, RFC 5280 4.2.1.10).
+        let excluded = nc.excluded_subtrees.as_ref().expect("excluded subtrees");
+        let excluded: Vec<&[u8]> = excluded
+            .iter()
+            .map(|subtree| match &subtree.base {
+                GeneralName::IPAddress(bytes) => *bytes,
+                other => panic!("unexpected excluded subtree {other:?}"),
+            })
+            .collect();
+        assert_eq!(excluded, [&[0u8; 8][..], &[0u8; 32][..]]);
     }
 
     #[test]
