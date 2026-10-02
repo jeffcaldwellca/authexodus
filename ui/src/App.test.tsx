@@ -190,8 +190,11 @@ describe("wizard", () => {
     await user.click(screen.getByRole("button", { name: en.common.stopAndCleanUp }));
     await user.click(within(screen.getByRole("alertdialog")).getByRole("button", { name: en.common.stopAndCleanUp }));
     await screen.findByRole("heading", { level: 1, name: en.cleanup.title });
-    // Authy was never deleted, so cleanup does not ask about it.
-    expect(screen.getAllByRole("checkbox")).toHaveLength(2);
+    // Authy was never deleted, so cleanup does not ask about it. No device ever connected, so
+    // no certificate can be on it either: that is said, not asked.
+    expect(screen.getAllByRole("checkbox")).toHaveLength(1);
+    expect(screen.getByText(en.cleanup.noCertificate(iphone))).toBeInTheDocument();
+    expect(screen.queryByRole("checkbox", { name: new RegExp(en.cleanup.items.profileRemoved.label) })).not.toBeInTheDocument();
   });
 
   it("stopping from the unlock step says to finish signing in to Authy, and cleanup asks for it", async () => {
@@ -407,8 +410,8 @@ describe("wizard", () => {
     await screen.findByRole("heading", { level: 1, name: en.done.titleNothingMoved });
     expect(screen.getByText(en.done.bodyNothingMoved)).toBeInTheDocument();
     expect(screen.getByText(en.manual.steps[0])).toBeInTheDocument();
-    expect(screen.queryByText(en.done.again)).not.toBeInTheDocument();
     expect(screen.queryByRole("heading", { name: en.done.title })).not.toBeInTheDocument();
+    expect(en.done.bodyNothingMoved).not.toMatch(/run authexodus again/);
   });
 
   it("accounts that can't move are still named as a count on Verify and on Done", async () => {
@@ -543,7 +546,7 @@ describe("wizard", () => {
     await user.click(finish);
     await screen.findByRole("heading", { level: 1, name: en.done.title });
     expect(api.calls.filter((c) => c.method === "finish")).toHaveLength(1);
-    expect(screen.getByText(en.done.again)).toBeInTheDocument();
+    expect(screen.getByText(en.done.again(iphone))).toBeInTheDocument();
   });
 
   it("a failed cleanup shows the shell's reason and a manual route, and can still be finished", async () => {

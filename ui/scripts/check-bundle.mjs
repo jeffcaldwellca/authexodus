@@ -1,15 +1,15 @@
 // Build check: the production bundle must not contain the in-memory fake or the dev-only
-// pretend phone. Run by `pnpm -C ui build` after `vite build`; exits non-zero on a leak.
+// pretend phone, and its stylesheet must not carry the pretend phone's styles. Run by `pnpm -C ui build` after `vite build`; exits non-zero on a leak.
 import { readdirSync, readFileSync } from "node:fs";
 import { join } from "node:path";
 
 const dist = new URL("../dist/", import.meta.url).pathname;
 // One marker from each dev-only module: strings/dev.ts, api.fake.ts, dev/DevPanel.tsx.
-const MARKERS = ["Pretend phone", "correct horse", "0.0.0-fake", "dev-panel\""];
+const MARKERS = ["Pretend phone", "correct horse", "0.0.0-fake", "dev-panel\"", ".dev-panel", ".dev-toggle"];
 
 function files(dir) {
   return readdirSync(dir, { withFileTypes: true }).flatMap((e) =>
-    e.isDirectory() ? files(join(dir, e.name)) : /\.(js|html)$/.test(e.name) ? [join(dir, e.name)] : []);
+    e.isDirectory() ? files(join(dir, e.name)) : /\.(js|html|css)$/.test(e.name) ? [join(dir, e.name)] : []);
 }
 
 const leaks = [];

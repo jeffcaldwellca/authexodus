@@ -1,0 +1,13 @@
+/* Styles for the dev-only pretend phone. Imported by DevPanel.tsx, which is itself loaded only
+   in a development build, so none of this reaches the production stylesheet. */
+
+.dev-panel, .dev-toggle {
+  position: fixed; left: 10px; bottom: 10px; z-index: 20;
+  background: #23202b; color: #f1eefa; border-radius: 10px; font-size: 12px;
+}
+.dev-panel { width: 184px; padding: 8px 10px; display: grid; gap: 6px; }
+.dev-title { display: flex; justify-content: space-between; align-items: center; }
+.dev-buttons { display: grid; gap: 4px; }
+.dev-panel button { background: #3a3547; padding: 4px 8px; font-size: 12px; text-align: left; border-radius: 6px; }
+.dev-title button { background: none; text-decoration: underline; padding: 0; }
+.dev-toggle { padding: 4px 10px; }

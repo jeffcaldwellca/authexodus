@@ -1,7 +1,7 @@
 // Helpers for driving the whole wizard in tests, the way a person and their phone would.
-import { act, render, screen } from "@testing-library/react";
+import { act, cleanup, render, screen } from "@testing-library/react";
 import userEvent, { type UserEvent } from "@testing-library/user-event";
-import type { AppState, Step } from "./api";
+import type { AppState, Device, Step } from "./api";
 import { createFakeApi, FAKE_PASSWORD, type FakeApi, type FakeScript } from "./api.fake";
 import { App } from "./App";
 import { en } from "./strings/en";
@@ -31,17 +31,24 @@ export async function moveByQr(user: UserEvent) {
 
 const ORDER: Step[] = ["welcome", "connect", "certificate", "authy", "unlock", "destination", "verify", "cleanup"];
 
+/** Opens the same app again in a new window, as a reload of the webview would. */
+export async function reload(api: FakeApi): Promise<void> {
+  cleanup();
+  render(<App api={api} />);
+  await screen.findByRole("heading", { level: 1 });
+}
+
 /** Walks a fresh wizard forward to `step` using only what a person could do. */
-export async function walkTo(step: Step, script: Partial<FakeScript> = {}): Promise<Harness> {
+export async function walkTo(step: Step, script: Partial<FakeScript> = {}, device: Device = "iphone"): Promise<Harness> {
   const h = await mountApp({}, script);
   const { api, user } = h;
   const reach = ORDER.indexOf(step);
   if (reach >= 1) {
-    await user.click(screen.getByRole("radio", { name: en.deviceName.iphone }));
+    await user.click(screen.getByRole("radio", { name: en.deviceName[device] }));
     await tickAllChecks(user);
     await user.click(screen.getByRole("button", { name: en.welcome.start }));
-    await screen.findByRole("heading", { level: 1, name: en.connect.title(en.deviceName.iphone) });
-    await screen.findByText(en.connect.waiting(en.deviceName.iphone));
+    await screen.findByRole("heading", { level: 1, name: en.connect.title(en.deviceName[device]) });
+    await screen.findByText(en.connect.waiting(en.deviceName[device]));
   }
   if (reach >= 2) {
     act(() => api.emitProxyEvent({ kind: "deviceConnected" }));

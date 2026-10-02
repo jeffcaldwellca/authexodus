@@ -1,10 +1,13 @@
 // Screen 2: point the phone's Wi-Fi proxy at this computer. Advances by itself when a device
 // connects.
 import type { Device } from "../api";
+import type { ApiError } from "../api.errors";
+import { DeviceSwitch } from "../components/DeviceSwitch";
 import { Callout, Guide, Screen, Waiting, type GuideStep } from "../components/ui";
 import { NetworkDetail, ProxyForm, WifiList } from "../device/scenes";
 import { ConnectionNotices } from "../failures/ConnectionNotices";
 import { Firewall } from "../failures/Firewall";
+import { Problem } from "../failures/Problem";
 import { Trouble } from "../failures/Trouble";
 import { Vpn } from "../failures/Vpn";
 import { Wifi } from "../failures/Wifi";
@@ -14,16 +17,19 @@ import { deviceLabel, type ScreenProps } from "./types";
 const t = en.connect;
 
 export type ConnectProps = ScreenProps & {
-  proxyError: boolean;
+  /** Why the connection could not be started, in the shell's terms. */
+  proxyError: ApiError | null;
   /** An address the shell refused to switch to without a restart. */
   addressRejected: string | null;
+  /** An address the shell could not switch to at all, and why. */
+  addressError: { ip: string; error: ApiError } | null;
   /** A restart landed on a different address or port than the device was set to. */
   addressChanged: boolean;
   onPickAddress: (ip: string) => void;
   onRetry: () => void;
 };
 
-export function Connect({ state, dispatch, proxy, proxyError, addressRejected, addressChanged, onPickAddress, onRetry, onRestart, restart }: ConnectProps) {
+export function Connect({ api, state, dispatch, proxy, proxyError, addressRejected, addressError, addressChanged, onPickAddress, onRetry, onRestart, restart, restartError }: ConnectProps) {
   const device: Device = state.device ?? "iphone";
   const d = deviceLabel(state.device);
   const help = { d, ip: proxy?.ip, port: proxy?.port };
@@ -51,7 +57,8 @@ export function Connect({ state, dispatch, proxy, proxyError, addressRejected, a
         </>
       }
     >
-      <ConnectionNotices d={d} state={state} restart={restart} onRestart={() => onRestart()} />
+      <DeviceSwitch api={api} state={state} dispatch={dispatch} />
+      <ConnectionNotices d={d} state={state} restart={restart} restartError={restartError} onRestart={() => onRestart()} />
       {addressChanged && <Callout tone="warn" title={t.addressChanged(d)} alert />}
       {addressRejected && (
         <Callout tone="warn" title={t.addressRejected(addressRejected)} alert>
@@ -60,15 +67,16 @@ export function Connect({ state, dispatch, proxy, proxyError, addressRejected, a
           </button>
         </Callout>
       )}
+      {addressError && <Problem error={addressError.error} d={d} title={t.addressFailed(addressError.ip)} />}
       {proxyError && (
-        <Callout tone="error" title={t.startFailed(d)} alert>
+        <Problem error={proxyError} d={d} title={t.startFailed(d)}>
           <button type="button" className="secondary" onClick={onRetry}>{en.common.tryAgain}</button>
-        </Callout>
+        </Problem>
       )}
       {!proxy && !proxyError && <Waiting>{t.starting}</Waiting>}
       {proxy && (
         <>
-          <div className="values" role="group" aria-label={t.valuesLabel(d)}>
+          <div className={addressChanged ? "values values-changed" : "values"} role="group" aria-label={t.valuesLabel(d)}>
             <div>
               <p className="values-caption">{t.valuesLabel(d)}</p>
               <dl>

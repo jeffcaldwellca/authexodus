@@ -1,4 +1,4 @@
-// Screen 1: what will happen, which device, and the four safety checks. The person cannot
+// Screen 1: what will happen, which device, and the five safety checks. The person cannot
 // start until a supported device is chosen and every check is ticked.
 import { useState } from "react";
 import type { Device } from "../api";

@@ -1,12 +1,14 @@
 // Screen 8: the app stops the proxy and destroys the certificate key, then the person undoes
 // the phone changes by hand. It is not finished until every item is ticked. A launch that
-// follows an unfinished run opens here.
+// follows an unfinished run opens here. Nothing fails quietly: a cleanup or a Finish that the
+// shell rejects is shown with its reason and what to do about it.
 import { useEffect, useRef, useState } from "react";
 import type { Device } from "../api";
+import { asApiError, type ApiError } from "../api.errors";
 import { Callout, Screen, Tick, Waiting } from "../components/ui";
 import { AuthyAccounts, DeviceManagement, ProxyForm, TrashFile } from "../device/scenes";
 import { en } from "../strings/en";
-import { canFinish, cleanupItems, type CleanupId } from "../wizard/machine";
+import { canFinish, cantMoveCount, cleanupItems, type CleanupId } from "../wizard/machine";
 import { deviceLabel, type ScreenProps } from "./types";
 
 const t = en.cleanup;
@@ -20,23 +22,31 @@ function ItemArt({ id, device }: { id: CleanupId; device: Device }) {
   }
 }
 
-export function Cleanup({ api, state, dispatch }: ScreenProps) {
+/** The key is still in the Keychain: the one failure the person can finish by hand. */
+function keychain(error: ApiError): boolean {
+  return error.code === "cleanup_keychain_failed" || error.code === "keychain_failed";
+}
+
+export function Cleanup({ api, state, dispatch, certConstrained }: ScreenProps) {
   const [core, setCore] = useState<"working" | "clean" | "failed">("working");
-  const [reason, setReason] = useState("");
+  const [failure, setFailure] = useState<ApiError | null>(null);
   const [removedByHand, setRemovedByHand] = useState(false);
   const [shown, setShown] = useState<CleanupId>("proxyOff");
   const [finishing, setFinishing] = useState(false);
+  const [finishError, setFinishError] = useState<ApiError | null>(null);
   const started = useRef(false);
   const items = cleanupItems(state);
   const left = items.filter((id) => !state.cleanupTicks[id]).length;
   const device: Device = state.device ?? "iphone";
   const d = deviceLabel(state.device);
+  const cantMove = cantMoveCount(state);
 
   const runCleanup = () => {
     setCore("working");
-    api.cleanup().then(() => setCore("clean")).catch((err: unknown) => {
+    setFinishError(null);
+    api.cleanup().then(() => { setFailure(null); setCore("clean"); }).catch((err: unknown) => {
       // The shell's own words say what could not be removed; the person needs them to act.
-      setReason(err instanceof Error ? err.message : String(err));
+      setFailure(asApiError(err));
       setCore("failed");
     });
   };
@@ -53,18 +63,24 @@ export function Cleanup({ api, state, dispatch }: ScreenProps) {
 
   const finish = async () => {
     setFinishing(true);
+    setFinishError(null);
     try {
       await api.finish();
       dispatch({ type: "finish" });
-    } catch {
+    } catch (err) {
+      // Finish runs the cleanup again in the shell. If the key is still there it says so,
+      // and the person is told: a Finish button that does nothing is the worst outcome here.
+      setFinishError(asApiError(err));
       setFinishing(false);
     }
   };
 
+  const reasonOf = (error: ApiError) => (error.message.trim() === "" ? null : <p>{t.failedReason(error.message.trim())}</p>);
+
   return (
     <Screen
       title={t.title}
-      lede={state.resumed ? t.resumed : undefined}
+      lede={state.resumed ? t.resumed : state.recovered ? t.reloaded : undefined}
       footer={
         <>
           <p className="footer-hint" aria-live="polite">{left > 0 ? t.remaining(left) : ""}</p>
@@ -79,15 +95,21 @@ export function Cleanup({ api, state, dispatch }: ScreenProps) {
         {core === "working" && <Waiting>{t.working}</Waiting>}
         {core === "clean" && <Callout tone="ok"><p>{t.clean(d)}</p></Callout>}
       </div>
-      {core === "failed" && (
+      {core === "failed" && failure && (
         <Callout tone="error" title={t.failed} alert>
-          {reason !== "" && <p>{t.failedReason(reason)}</p>}
-          <p>{t.failedManual}</p>
+          {reasonOf(failure)}
+          <p>{keychain(failure) ? t.failedManual : t.failedOther}</p>
           <button type="button" className="secondary" onClick={runCleanup}>{en.common.tryAgain}</button>
           <label className="scanned">
             <input type="checkbox" checked={removedByHand} onChange={(e) => setRemovedByHand(e.target.checked)} />
-            <span>{t.manualDone}</span>
+            <span>{keychain(failure) ? t.manualDone : t.otherDone}</span>
           </label>
+        </Callout>
+      )}
+      {finishError && (
+        <Callout tone="error" title={t.finishFailed} alert>
+          {reasonOf(finishError)}
+          <p>{keychain(finishError) ? t.finishFailedKeychain : t.finishFailedOther}</p>
         </Callout>
       )}
 
@@ -115,7 +137,7 @@ export function Cleanup({ api, state, dispatch }: ScreenProps) {
                 checked={state.cleanupTicks[id]}
                 onChange={(value) => { setShown(id); dispatch({ type: "setCleanup", id, value }); }}
                 label={text(id).label}
-                detail={text(id).how}
+                detail={id === "profileRemoved" && certConstrained === false ? `${text(id).how} ${t.unconstrained}` : text(id).how}
                 extra={
                   <button type="button" className="quiet small" aria-pressed={shown === id} aria-label={en.common.showPictureFor(text(id).label)} onClick={() => setShown(id)}>
                     {en.common.showPicture}
@@ -124,8 +146,19 @@ export function Cleanup({ api, state, dispatch }: ScreenProps) {
               />
             ))}
           </div>
+          {!items.includes("profileRemoved") && <p className="quiet-text">{t.noCertificate(d)}</p>}
           <p className="quiet-text">{t.vpnBack}</p>
           <p className="quiet-text">{t.keepAuthy}</p>
+          {cantMove > 0 && (
+            <section className="cant-move" aria-labelledby="still-in-authy">
+              <h2 id="still-in-authy">{t.cantMoveTitle(cantMove)}</h2>
+              <p className="quiet-text">{t.cantMoveLede}</p>
+              <ul>
+                {state.cantMove.native.map((name) => <li key={`native:${name}`}>{name}</li>)}
+                {state.cantMove.invalid.map((name) => <li key={`invalid:${name}`}>{name}</li>)}
+              </ul>
+            </section>
+          )}
         </div>
         <div className="split-art">
           <div className="guide-figure"><ItemArt id={shown} device={device} /></div>

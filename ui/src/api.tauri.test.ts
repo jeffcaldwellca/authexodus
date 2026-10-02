@@ -4,7 +4,8 @@ import { beforeEach, vi } from "vitest";
 import type { Api } from "./api";
 import apiSource from "./api.ts?raw";
 import { createFakeApi } from "./api.fake";
-import { createTauriApi } from "./api.tauri";
+import { ApiError, ERROR_CODES } from "./api.errors";
+import { createTauriApi, toApiError } from "./api.tauri";
 
 const invoke = vi.hoisted(() => vi.fn());
 const listen = vi.hoisted(() => vi.fn());
@@ -48,6 +49,8 @@ describe("api.tauri", () => {
       exportFile: [() => api.exportFile("aegis"), { dest: "aegis" }],
       liveCodes: [() => api.liveCodes(), undefined],
       bwPrepare: [() => api.bwPrepare(), undefined],
+      bwCancel: [() => api.bwCancel(), undefined],
+      bwLogins: [() => api.bwLogins(), undefined],
       bwLogin: [() => api.bwLogin(login), { login }],
       bwPropose: [() => api.bwPropose(), undefined],
       bwApply: [() => api.bwApply(decisions), { decisions }],
@@ -83,16 +86,65 @@ describe("api.tauri", () => {
     expect(await api.bwLogin({ email: "a@b.c", password: "pw", region: { kind: "us" }, twoFactorCode: "000000" })).toEqual({ kind: "badTwoFactorCode" });
   });
 
-  it("a failed command rejects with an Error carrying the shell's message", async () => {
+  it("a failed command rejects with a typed error: the shell's code, and its sentence as the message", async () => {
     const api = createTauriApi();
-    invoke.mockRejectedValueOnce("a backup is already captured");
-    await expect(api.startProxy("10.0.0.9")).rejects.toThrow("a backup is already captured");
+    invoke.mockRejectedValueOnce("capture_would_be_lost: A backup is already captured. Restart the connection to change address.");
+    const err = await api.startProxy("10.0.0.9").catch((e: unknown) => e);
+    expect(err).toBeInstanceOf(ApiError);
+    expect(err).toMatchObject({ code: "capture_would_be_lost", message: "A backup is already captured. Restart the connection to change address." });
+  });
+
+  it("every code the shell uses is recognised, on every command", async () => {
+    const api = createTauriApi();
+    for (const code of ERROR_CODES) {
+      invoke.mockRejectedValueOnce(`${code}: A plain sentence: with a colon in it.`);
+      await expect(api.finish()).rejects.toMatchObject({ code, message: "A plain sentence: with a colon in it." });
+    }
+  });
+
+  it("a rejection with no code, or one the UI does not know, is internal and keeps the raw text", async () => {
+    const api = createTauriApi();
+    for (const raw of ["a backup is already captured", "made_up_code: something else", "Not A Code: text", ": nothing before the colon", "bad_email"]) {
+      invoke.mockRejectedValueOnce(raw);
+      await expect(api.cleanup(), raw).rejects.toMatchObject({ code: "internal", message: raw });
+    }
     invoke.mockRejectedValueOnce(new Error("boom"));
-    await expect(api.cleanup()).rejects.toThrow("boom");
+    await expect(api.cleanup()).rejects.toMatchObject({ code: "internal", message: "boom" });
+    invoke.mockRejectedValueOnce({ unexpected: true });
+    await expect(api.cleanup()).rejects.toBeInstanceOf(ApiError);
+    invoke.mockRejectedValueOnce(undefined);
+    await expect(api.cleanup()).rejects.toMatchObject({ code: "internal" });
+  });
+
+  it("the parser keeps a sentence that spans lines and trims nothing inside it", () => {
+    expect(toApiError("bw_failed: line one\nline two")).toMatchObject({ code: "bw_failed", message: "line one\nline two" });
+    // A missing space after the colon is forgiven; an empty sentence is still that code.
+    expect(toApiError("export_failed:no space")).toMatchObject({ code: "export_failed", message: "no space" });
+    expect(toApiError("no_backup: ")).toMatchObject({ code: "no_backup", message: "" });
+    const already = new ApiError("no_backup", "x");
+    expect(toApiError(already)).toBe(already);
+  });
+
+  it("hands back the newest contract fields untouched: the session snapshot, the certificate mode, the vault list and needsApiKey", async () => {
+    const api = createTauriApi();
+    const session = { proxy: null, deviceConnected: true, trustWorking: false, captured: 3, summary: null };
+    invoke.mockResolvedValueOnce({ step: "authy", device: "ipad", resumeCleanup: false, version: "1", releasesUrl: "u", session });
+    expect((await api.getState()).session).toEqual(session);
+    invoke.mockResolvedValueOnce({ ip: "192.168.4.109", port: 8080, certConstrained: false });
+    expect((await api.startProxy()).certConstrained).toBe(false);
+    invoke.mockResolvedValueOnce({ kind: "needsApiKey" });
+    const login = { email: "a@b.c", password: "pw", region: { kind: "us" as const }, apiKey: { clientId: "user.1", clientSecret: "s" } };
+    expect(await api.bwLogin(login)).toEqual({ kind: "needsApiKey" });
+    expect(invoke).toHaveBeenLastCalledWith("bw_login", { login });
+    const vault = [{ itemId: "v1", name: "GitHub", username: null, hasCode: true }];
+    invoke.mockResolvedValueOnce(vault);
+    expect(await api.bwLogins()).toEqual(vault);
   });
 
   it.each([
     ["onProxyEvent", "proxy-event", { kind: "deviceRefused" }],
+    ["onProxyEvent", "proxy-event", { kind: "emptyBackup" }],
+    ["onProxyEvent", "proxy-event", { kind: "addressChanged" }],
     ["onBwProgress", "bw-progress", "Attached GitHub"],
   ] as const)("%s listens to %s, delivers payloads, and unsubscribes", async (method, event, payload) => {
     const unlisten = vi.fn();
@@ -149,7 +201,7 @@ describe("api.tauri", () => {
 describe("api implementations", () => {
   it("api.tauri and api.fake both implement every Api method", () => {
     const methods = apiMethods();
-    expect(methods.length).toBeGreaterThanOrEqual(18);
+    expect(methods.length).toBeGreaterThanOrEqual(20);
     const implementations: Record<string, Api> = { tauri: createTauriApi(), fake: createFakeApi() };
     for (const [name, api] of Object.entries(implementations)) {
       const missing = methods.filter((m) => typeof (api as unknown as Record<string, unknown>)[m] !== "function");

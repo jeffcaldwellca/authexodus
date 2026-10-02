@@ -129,6 +129,7 @@ describe("bitwarden path", () => {
     expect(screen.getByText(t.twoStepLimit)).toBeInTheDocument();
     expect(t.twoStepLimit).toMatch(/only codes from an authenticator app work here/);
     expect(t.twoStepLimit).toMatch(/Save a file for another app, then Bitwarden/);
+    expect(t.twoStepLimit).toMatch(/sign in with an API key instead/);
     expect(screen.getByText(t.loginLede)).toBeInTheDocument();
     expect(t.loginLede).toMatch(/does not keep it/);
   });
@@ -210,7 +211,10 @@ describe("bitwarden path", () => {
     api.bwLogin = async () => { throw new Error("bw: unexpected output"); };
     await user.click(screen.getByRole("button", { name: t.signIn }));
     await screen.findByText(t.loginFailed);
-    expect(t.loginFailed).toMatch(/Save a file for another app, then Bitwarden/);
+    // A rejection with no code: the shell's text is shown as the reason, never swallowed.
+    expect(screen.getByText(en.problems.reason("bw: unexpected output"))).toBeInTheDocument();
+    expect(screen.getByText(t.loginFailedAdvice)).toBeInTheDocument();
+    expect(t.loginFailedAdvice).toMatch(/Save a file for another app, then Bitwarden/);
     expect(screen.getByLabelText(t.password)).toHaveValue("");
     expect(passwordOnPage()).toBe(false);
   });
