@@ -12,16 +12,19 @@
 //!   `onBwProgress` -> `bw-progress` (see [`EVENTS`]).
 //! * Payloads and results serialise to the TypeScript shapes exactly (see `dto.rs`).
 //! * A failed command rejects with a plain-language string that never contains a password or a
-//!   secret. No command logs its arguments; `unlock` and `bwLogin` carry passwords.
+//!   secret. No command logs its arguments; `unlock` and `bwLogin` carry passwords, which are
+//!   held in `Zeroizing` so they are wiped from memory when the command is done.
 //!
 //! The command list is written once, in `commands!`, which also builds the Tauri handler, so
-//! `commands_match_api_contract` compares the real registered list against `api.ts`.
+//! `commands_match_api_contract` compares the real registered list against `api.ts`. It also
+//! reads this file and compares each command's argument names with the method's parameters.
 
 use std::path::PathBuf;
 use std::sync::Arc;
 
 use tauri::{AppHandle, Emitter, State, WebviewWindow};
 use tauri_plugin_dialog::DialogExt;
+use zeroize::Zeroizing;
 
 use crate::dto::*;
 use crate::network;
@@ -47,26 +50,42 @@ pub fn set_device(session: State<'_, Session>, device: Device) {
     session.set_device(device);
 }
 
+fn proxy_emitter(app: AppHandle) -> EmitProxy {
+    Arc::new(move |event| {
+        let _ = app.emit(EVENT_PROXY, event);
+    })
+}
+
+/// Idempotent: see [`Session::start_proxy`].
 #[tauri::command]
 pub async fn start_proxy(
     app: AppHandle,
     session: State<'_, Session>,
     ip: Option<String>,
 ) -> Result<ProxyInfo, CmdError> {
-    let emit: EmitProxy = Arc::new(move |event| {
-        let _ = app.emit(EVENT_PROXY, event);
-    });
     session
-        .start_proxy(ip.as_deref(), &network::system_candidates(), emit)
+        .start_proxy(ip.as_deref(), &network::system(), proxy_emitter(app))
+        .await
+}
+
+/// The explicit start-over: see [`Session::restart_proxy`].
+#[tauri::command]
+pub async fn restart_proxy(
+    app: AppHandle,
+    session: State<'_, Session>,
+    ip: Option<String>,
+) -> Result<ProxyInfo, CmdError> {
+    session
+        .restart_proxy(ip.as_deref(), &network::system(), proxy_emitter(app))
         .await
 }
 
 #[tauri::command]
 pub async fn unlock(
     session: State<'_, Session>,
-    password: String,
+    password: Zeroizing<String>,
 ) -> Result<UnlockResult, CmdError> {
-    session.unlock(&password).await
+    session.unlock(password).await
 }
 
 #[tauri::command]
@@ -77,6 +96,11 @@ pub fn token_qr(session: State<'_, Session>, id: String) -> Result<String, CmdEr
 #[tauri::command]
 pub fn google_migration_qrs(session: State<'_, Session>) -> Result<Vec<String>, CmdError> {
     session.google_migration_qrs()
+}
+
+#[tauri::command]
+pub fn google_unsupported(session: State<'_, Session>) -> Result<Vec<String>, CmdError> {
+    session.google_unsupported()
 }
 
 /// Write `file` to `chosen` (owner-only), or report that the person cancelled.
@@ -187,9 +211,11 @@ commands!(
     get_state,
     set_device,
     start_proxy,
+    restart_proxy,
     unlock,
     token_qr,
     google_migration_qrs,
+    google_unsupported,
     export_file,
     live_codes,
     bw_prepare,
@@ -218,8 +244,80 @@ mod tests {
         out
     }
 
-    /// Method names of `interface Api { ... }`, in order.
-    fn api_methods() -> Vec<String> {
+    fn camel(snake: &str) -> String {
+        let mut out = String::new();
+        let mut upper = false;
+        for c in snake.chars() {
+            if c == '_' {
+                upper = true;
+            } else if upper {
+                out.push(c.to_ascii_uppercase());
+                upper = false;
+            } else {
+                out.push(c);
+            }
+        }
+        out
+    }
+
+    /// The text between the `(` that `src` starts with and the `)` that closes it.
+    fn parenthesised(src: &str) -> &str {
+        assert!(src.starts_with('('));
+        let mut depth = 0usize;
+        for (i, c) in src.char_indices() {
+            match c {
+                '(' | '[' | '{' => depth += 1,
+                ')' | ']' | '}' => {
+                    depth -= 1;
+                    if depth == 0 {
+                        return &src[1..i];
+                    }
+                }
+                _ => {}
+            }
+        }
+        panic!("unclosed parameter list: {src:.60}");
+    }
+
+    /// `a: X, b?: { c: Y, d: Z }[]` -> `[("a", "X"), ("b", "{ c: Y, d: Z }[]")]`: split at the
+    /// commas that are not inside brackets (or the angle brackets of a generic type), then at
+    /// the first colon. A `?` after the name is dropped.
+    fn params(list: &str) -> Vec<(String, String)> {
+        let mut parts = Vec::new();
+        let mut depth = 0i32;
+        let mut current = String::new();
+        let mut previous = ' ';
+        for c in list.chars() {
+            match c {
+                '(' | '[' | '{' | '<' => depth += 1,
+                ')' | ']' | '}' => depth -= 1,
+                // Not the `>` of an arrow (`=>` or `->`).
+                '>' if previous != '=' && previous != '-' => depth -= 1,
+                _ => {}
+            }
+            if c == ',' && depth == 0 {
+                parts.push(std::mem::take(&mut current));
+            } else {
+                current.push(c);
+            }
+            previous = c;
+        }
+        parts.push(current);
+        parts
+            .iter()
+            .filter(|p| !p.trim().is_empty())
+            .map(|p| {
+                let (name, ty) = p.split_once(':').expect("a parameter has a type");
+                (
+                    name.trim().trim_end_matches('?').to_string(),
+                    ty.trim().to_string(),
+                )
+            })
+            .collect()
+    }
+
+    /// The methods of `interface Api { ... }`, in order, each with its parameter names.
+    fn api_methods() -> Vec<(String, Vec<String>)> {
         let path = concat!(env!("CARGO_MANIFEST_DIR"), "/../ui/src/api.ts");
         let src = std::fs::read_to_string(path).expect("ui/src/api.ts is in the repository");
         let start = src
@@ -235,15 +333,48 @@ mod tests {
                     .chars()
                     .take_while(|c| c.is_ascii_alphanumeric() || *c == '_')
                     .collect();
-                (!name.is_empty() && line[name.len()..].starts_with('(')).then_some(name)
+                let rest = &line[name.len()..];
+                (!name.is_empty() && rest.starts_with('(')).then(|| {
+                    let names = params(parenthesised(rest))
+                        .into_iter()
+                        .map(|(name, _)| name)
+                        .collect();
+                    (name, names)
+                })
+            })
+            .collect()
+    }
+
+    /// Every `#[tauri::command]` function in this file, with the names of the arguments the
+    /// UI supplies. What Tauri injects (the app handle, the window, managed state) is left out.
+    fn command_arguments() -> Vec<(String, Vec<String>)> {
+        const INJECTED: &[&str] = &["AppHandle", "State<", "WebviewWindow"];
+        let src = include_str!("commands.rs");
+        // Up to the handler macro: nothing after it declares a command.
+        let src = &src[..src.find("macro_rules! commands").unwrap()];
+        src.split("#[tauri::command]\n")
+            .skip(1)
+            .map(|after| {
+                let after = after
+                    .strip_prefix("pub async fn ")
+                    .or_else(|| after.strip_prefix("pub fn "))
+                    .expect("a command is a `pub fn` or a `pub async fn`");
+                let open = after.find('(').unwrap();
+                let names = params(parenthesised(&after[open..]))
+                    .into_iter()
+                    .filter(|(_, ty)| !INJECTED.iter().any(|i| ty.starts_with(i)))
+                    .map(|(name, _)| name)
+                    .collect();
+                (after[..open].to_string(), names)
             })
             .collect()
     }
 
     #[test]
     fn commands_match_api_contract() {
-        let methods = api_methods();
-        assert!(methods.len() >= 16, "parsed too few methods: {methods:?}");
+        let api = api_methods();
+        let methods: Vec<String> = api.iter().map(|(name, _)| name.clone()).collect();
+        assert!(methods.len() >= 18, "parsed too few methods: {methods:?}");
 
         let (event_methods, command_methods): (Vec<_>, Vec<_>) =
             methods.iter().partition(|m| m.starts_with("on"));
@@ -268,6 +399,64 @@ mod tests {
             on, known,
             "`on*` methods of `Api` differ from the events in commands.rs"
         );
+
+        // Every command takes exactly the arguments its method declares, under the same names
+        // (Tauri maps the UI's camelCase keys onto the snake_case Rust arguments).
+        let declared = command_arguments();
+        let declared_names: BTreeSet<String> = declared.iter().map(|(n, _)| n.clone()).collect();
+        assert_eq!(
+            declared_names, registered,
+            "the `#[tauri::command]` functions differ from the registered list"
+        );
+        for (method, parameters) in api.iter().filter(|(m, _)| !m.starts_with("on")) {
+            let (_, arguments) = declared
+                .iter()
+                .find(|(name, _)| *name == snake(method))
+                .expect("checked above");
+            let arguments: Vec<String> = arguments.iter().map(|a| camel(a)).collect();
+            assert_eq!(
+                &arguments,
+                parameters,
+                "the arguments of `{}` differ from the parameters of `Api.{method}`",
+                snake(method)
+            );
+        }
+    }
+
+    #[test]
+    fn parameter_lists_are_parsed_by_name() {
+        let names = |list: &str| -> Vec<String> {
+            params(list).into_iter().map(|(name, _)| name).collect()
+        };
+        assert_eq!(names(""), Vec::<String>::new());
+        assert_eq!(names("ip?: string"), ["ip"]);
+        assert_eq!(
+            names("decisions: { tokenId: string; decision: Decision }[]"),
+            ["decisions"]
+        );
+        assert_eq!(names("cb: (e: ProxyEvent, n: number) => void"), ["cb"]);
+        assert_eq!(names("a: Map<string, number>, b: X"), ["a", "b"]);
+        assert_eq!(
+            params("\n    session: State<'_, Session>,\n    two_words: Option<String>,\n"),
+            [
+                ("session".to_string(), "State<'_, Session>".to_string()),
+                ("two_words".to_string(), "Option<String>".to_string())
+            ]
+        );
+        assert_eq!(
+            parenthesised("(a: (b) => c): Promise<void>;"),
+            "a: (b) => c"
+        );
+        assert_eq!(camel("two_words"), "twoWords");
+        assert_eq!(camel("ip"), "ip");
+
+        // The commands of this file, as the contract test sees them.
+        let declared = command_arguments();
+        let of = |name: &str| declared.iter().find(|(n, _)| n == name).unwrap().1.clone();
+        assert_eq!(of("get_state"), Vec::<String>::new());
+        assert_eq!(of("start_proxy"), ["ip"]);
+        assert_eq!(of("bw_apply"), ["decisions"]);
+        assert_eq!(of("export_file"), ["dest"]);
     }
 
     #[test]
@@ -307,10 +496,11 @@ mod tests {
             device: Some(Device::Iphone),
             resume_cleanup: false,
             version: "0.1.0".into(),
+            releases_url: "https://example.com/releases".into(),
         };
         assert_eq!(
             serde_json::to_string(&s).unwrap(),
-            r#"{"step":"welcome","device":"iphone","resumeCleanup":false,"version":"0.1.0"}"#
+            r#"{"step":"welcome","device":"iphone","resumeCleanup":false,"version":"0.1.0","releasesUrl":"https://example.com/releases"}"#
         );
         let none = AppState { device: None, ..s };
         assert!(serde_json::to_string(&none)

@@ -6,7 +6,7 @@
 
 use std::net::{IpAddr, Ipv4Addr};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -20,9 +20,10 @@ use authexodus_core::types::{CapturedBackup, Unlocked};
 use serde::{Deserialize, Serialize};
 use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
+use zeroize::Zeroizing;
 
 use crate::dto::*;
-use crate::network::{self, Candidate};
+use crate::network::{self, Candidate, Network};
 
 /// Whether the certificate authority carries the name constraint (it may only issue for
 /// `authy.com`). Batch 4 settles whether iOS accepts a constrained root; flip it here.
@@ -31,6 +32,8 @@ pub const CA_CONSTRAINED: bool = true;
 pub const PREFERRED_PORT: u16 = 8080;
 /// The UI gets at most one `tlsRejected` in this window.
 pub const TLS_DEBOUNCE: Duration = Duration::from_secs(2);
+/// Where new versions are published. There is no auto-update: the app shows this address.
+pub const RELEASES_URL: &str = "https://github.com/jeffcaldwellca/authexodus/releases";
 
 pub type EmitProxy = Arc<dyn Fn(ProxyEventDto) + Send + Sync>;
 pub type EmitProgress = Arc<dyn Fn(String) + Send + Sync>;
@@ -103,7 +106,8 @@ fn remove_marker(paths: &Paths) -> Result<(), CmdError> {
 // Proxy events: map to the UI's union, debounce `TlsRejected`
 
 /// Maps core proxy events to the UI's and drops a `TlsRejected` that follows another within
-/// [`TLS_DEBOUNCE`]. (The proxy sends one every time the device aborts a handshake.)
+/// [`TLS_DEBOUNCE`]. (The proxy sends one every time the device aborts a handshake. It limits
+/// `DeviceRefused` itself, to one every two seconds.)
 #[derive(Default)]
 pub struct Bridge {
     last_tls_rejected: Option<Instant>,
@@ -160,6 +164,12 @@ impl ProxyRun {
         self.bridge.abort();
         self.handle.shutdown().await;
     }
+
+    /// Has anything of the backup arrived on this run?
+    fn has_capture(&self) -> bool {
+        let backup = self.handle.backup();
+        !backup.tokens.is_empty() || !backup.native_apps.is_empty()
+    }
 }
 
 /// Test seams for the proxy; production keeps the defaults.
@@ -176,25 +186,36 @@ pub struct Session {
     authority: Mutex<Option<Arc<Authority>>>,
     proxy: tokio::sync::Mutex<Option<ProxyRun>>,
     tuning: Mutex<ProxyTuning>,
+    /// Counts the times the session's secrets were thrown away (start-over, cleanup, exit).
+    /// Slow work that began before such a moment must not put anything back afterwards: an
+    /// unlock or a Bitwarden sign-in notes the count when it starts and gives up if it moved.
+    discards: AtomicU64,
     unlocked: Mutex<Option<Arc<Unlocked>>>,
     bw_binary: Mutex<Option<PathBuf>>,
+    /// Held for the whole of a sign-in, so two never run against the one data folder.
+    bw_signing_in: tokio::sync::Mutex<()>,
     bw: tokio::sync::Mutex<Option<Box<dyn BwClient>>>,
+    /// The last proposals shown to the person: what `bw_apply` may attach to.
+    proposals: Mutex<Option<Vec<ProposalDto>>>,
 }
 
-fn choose_ip(requested: Option<&str>, candidates: &[Candidate]) -> Result<Ipv4Addr, CmdError> {
+/// The address asked for, if one was.
+fn parse_ip(requested: Option<&str>) -> Result<Option<Ipv4Addr>, CmdError> {
     match requested.map(str::trim).filter(|s| !s.is_empty()) {
-        Some(s) => {
-            let ip: Ipv4Addr = s
-                .parse()
-                .map_err(|_| CmdError::new("That is not a valid network address."))?;
-            if candidates.iter().any(|c| c.ip == ip) {
-                Ok(ip)
-            } else {
-                Err(CmdError::new(
-                    "That address is not one of this computer's network addresses.",
-                ))
-            }
-        }
+        Some(s) => s
+            .parse()
+            .map(Some)
+            .map_err(|_| CmdError::new("That is not a valid network address.")),
+        None => Ok(None),
+    }
+}
+
+fn choose_ip(requested: Option<Ipv4Addr>, candidates: &[Candidate]) -> Result<Ipv4Addr, CmdError> {
+    match requested {
+        Some(ip) if candidates.iter().any(|c| c.ip == ip) => Ok(ip),
+        Some(_) => Err(CmdError::new(
+            "That address is not one of this computer's network addresses.",
+        )),
         None => network::default_ip(candidates).ok_or_else(|| {
             CmdError::new(
                 "This computer does not seem to be on a network. Connect to the same Wi-Fi as the iPhone or iPad and try again.",
@@ -239,34 +260,139 @@ pub fn live_codes(unlocked: &Unlocked, unix_time: u64) -> Vec<LiveCode> {
         .collect()
 }
 
-/// Write an export file readable by its owner only, even over an existing file.
+// ---------------------------------------------------------------------------------------------
+// Writing an export file
+
+/// Write an export file readable by its owner only, all or nothing.
+///
+/// The bytes go to a new file beside `path`, which is flushed to disk and then renamed over
+/// `path`. So `path` either keeps what it had or holds the whole export, never part of one; a
+/// file the person chose to replace is not touched until the new one is complete; and if
+/// `path` is a symbolic link, the link is replaced rather than followed. Whatever goes wrong,
+/// no partly written file with secrets in it is left behind.
 pub fn write_owner_only(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
-    use std::io::Write;
+    write_owner_only_with(path, |file| std::io::Write::write_all(file, bytes))
+}
+
+/// [`write_owner_only`] with the writing itself supplied, so a test can make it fail half-way.
+pub(crate) fn write_owner_only_with(
+    path: &Path,
+    write: impl FnOnce(&mut std::fs::File) -> std::io::Result<()>,
+) -> std::io::Result<()> {
+    static COUNTER: AtomicU64 = AtomicU64::new(0);
+    let name = path
+        .file_name()
+        .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::InvalidInput, "not a file name"))?;
+    let mut write = Some(write);
+    // A name nobody else is using. `create_new` refuses a name that exists, link or not, so a
+    // clash only costs another try.
+    for _ in 0..16 {
+        let mut temp_name = std::ffi::OsString::from(".");
+        temp_name.push(name);
+        temp_name.push(format!(
+            ".{}-{}.authexodus-tmp",
+            std::process::id(),
+            COUNTER.fetch_add(1, Ordering::Relaxed)
+        ));
+        let temp = path.with_file_name(temp_name);
+        match write_via(path, &temp, &mut write) {
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists && write.is_some() => continue,
+            done => return done,
+        }
+    }
+    Err(std::io::Error::new(
+        std::io::ErrorKind::AlreadyExists,
+        "could not make a temporary file beside the chosen one",
+    ))
+}
+
+/// Create `temp` (it must not exist: a symbolic link there is refused, not followed), fill it,
+/// flush it to disk and rename it over `path`. `write` is taken only once `temp` is ours.
+fn write_via<W>(path: &Path, temp: &Path, write: &mut Option<W>) -> std::io::Result<()>
+where
+    W: FnOnce(&mut std::fs::File) -> std::io::Result<()>,
+{
     let mut opts = std::fs::OpenOptions::new();
-    opts.write(true).create(true).truncate(true);
+    opts.write(true).create_new(true);
     #[cfg(unix)]
     {
         use std::os::unix::fs::OpenOptionsExt;
         opts.mode(0o600);
     }
-    let mut file = opts.open(path)?;
-    // `mode` only applies when the file is created; tighten one that already existed before
-    // any secret goes in.
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        file.set_permissions(std::fs::Permissions::from_mode(0o600))?;
+    let mut file = opts.open(temp)?;
+    let filled = (|| {
+        #[cfg(unix)]
+        {
+            // The mode asked for above is cut down by the umask but never widened; say it
+            // again so it is exactly owner read and write.
+            use std::os::unix::fs::PermissionsExt;
+            file.set_permissions(std::fs::Permissions::from_mode(0o600))?;
+        }
+        let write = write
+            .take()
+            .ok_or_else(|| std::io::Error::other("the export was already written"))?;
+        write(&mut file)?;
+        file.sync_all()
+    })();
+    drop(file);
+    let done = filled.and_then(|()| std::fs::rename(temp, path));
+    if done.is_err() {
+        let _ = std::fs::remove_file(temp);
+        return done;
     }
-    file.write_all(bytes)?;
-    file.flush()
+    // Make the new name durable too. Not being able to is not a failed export.
+    if let Some(dir) = path.parent().filter(|d| !d.as_os_str().is_empty()) {
+        if let Ok(dir) = std::fs::File::open(dir) {
+            let _ = dir.sync_all();
+        }
+    }
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------------------------
+
+/// Is every decision one the person could have been offered? Every token must be one of the
+/// unlocked ones, and a login may only be attached to a token it was proposed for, and only
+/// when it had no code of its own. One bad entry refuses the whole list: nothing is applied.
+fn check_decisions(
+    decisions: &[DecisionEntry],
+    unlocked: &Unlocked,
+    proposals: Option<&[ProposalDto]>,
+) -> Result<(), CmdError> {
+    for entry in decisions {
+        if !unlocked.tokens.iter().any(|t| t.id == entry.token_id) {
+            return Err(CmdError::new(
+                "One of the accounts to move is not in the unlocked backup. Nothing was changed.",
+            ));
+        }
+        let DecisionDto::Attach { item_id } = &entry.decision else {
+            continue;
+        };
+        let offered = proposals
+            .into_iter()
+            .flatten()
+            .filter(|p| p.token_id == entry.token_id)
+            .flat_map(|p| &p.candidates)
+            .any(|c| &c.item_id == item_id && !c.has_code);
+        if !offered {
+            return Err(CmdError::new(
+                "One of the chosen Bitwarden logins was not among the matches offered for that account, or already has a code. Nothing was changed.",
+            ));
+        }
+    }
+    Ok(())
 }
 
 impl Session {
     /// A session over `store`, keeping its files in `dir`. Reads the resume marker: a marker
     /// left by an earlier launch means the certificate may still be installed on a device.
+    ///
+    /// Bitwarden data left by an earlier launch is removed here: the key to it lived in that
+    /// launch's memory, so it is of no use, and a launch that crashed never wiped it.
     pub fn new(store: Arc<dyn KeyStore>, dir: PathBuf) -> Session {
         let paths = Paths::new(dir);
         let resume = marker_exists(&paths);
+        let _ = std::fs::remove_dir_all(paths.bw_data());
         Session {
             store,
             paths,
@@ -281,14 +407,20 @@ impl Session {
                 port: PREFERRED_PORT,
                 upstream: None,
             }),
+            discards: AtomicU64::new(0),
             unlocked: Mutex::new(None),
             bw_binary: Mutex::new(None),
+            bw_signing_in: tokio::sync::Mutex::new(()),
             bw: tokio::sync::Mutex::new(None),
+            proposals: Mutex::new(None),
         }
     }
 
-    #[cfg(test)]
-    pub(crate) fn tune_proxy(&self, port: u16, upstream: Option<TestUpstream>) {
+    /// For tests: the port to try first, and a stand-in for Authy. The app never calls this,
+    /// and could only ever pass `None`: a `TestUpstream` cannot be built without the core's
+    /// `test-upstream` feature, which only test builds switch on.
+    #[doc(hidden)]
+    pub fn tune_proxy(&self, port: u16, upstream: Option<TestUpstream>) {
         *lock(&self.tuning) = ProxyTuning { port, upstream };
     }
 
@@ -299,6 +431,7 @@ impl Session {
             device: ui.device,
             resume_cleanup: self.resume_cleanup.load(Ordering::SeqCst),
             version: env!("CARGO_PKG_VERSION").to_string(),
+            releases_url: RELEASES_URL.to_string(),
         }
     }
 
@@ -306,40 +439,116 @@ impl Session {
         lock(&self.ui).device = Some(device);
     }
 
-    /// Create (or reuse) the certificate authority. The marker is written first, so a crash
-    /// between the two can never leave a key behind that the next launch does not know about.
+    /// Create (or reuse) the certificate authority, then write the resume marker.
+    ///
+    /// The marker is written only once the key is stored, so a failure to create the key
+    /// leaves no marker claiming there is one. If the marker cannot be written, the key is
+    /// destroyed again: a key must never be left behind that the next launch does not know
+    /// about.
     fn ensure_ca(&self) -> Result<Arc<Authority>, CmdError> {
         let mut slot = lock(&self.authority);
         if let Some(ca) = slot.as_ref() {
             return Ok(Arc::clone(ca));
         }
-        write_marker(&self.paths)?;
         let ca = Arc::new(
             Authority::load_or_create(&*self.store, CA_CONSTRAINED)
                 .map_err(|e| CmdError::new(format!("could not create the certificate: {e}")))?,
         );
+        if let Err(e) = write_marker(&self.paths) {
+            if !marker_exists(&self.paths) {
+                let _ = Authority::destroy(&*self.store);
+            }
+            return Err(e);
+        }
         *slot = Some(Arc::clone(&ca));
         Ok(ca)
     }
 
-    /// Start the proxy on `requested` (or the default LAN address). Asking for the address it
-    /// already listens on returns the running proxy; a different address restarts it.
+    /// Make sure the proxy is running, on `requested` if an address is given.
+    ///
+    /// * Running already and no address given, or the address it is on: nothing changes; the
+    ///   running proxy is described again.
+    /// * Running on another address and nothing captured yet: it moves to the new address.
+    /// * Running on another address with a backup captured (or unlocked): an error. Moving
+    ///   would throw the backup away, and that only happens through [`Session::restart_proxy`].
     pub async fn start_proxy(
         &self,
         requested: Option<&str>,
-        candidates: &[Candidate],
+        net: &Network,
         emit: EmitProxy,
     ) -> Result<ProxyInfo, CmdError> {
-        let ip = choose_ip(requested, candidates)?;
+        let requested = parse_ip(requested)?;
         let mut slot = self.proxy.lock().await;
         if let Some(run) = slot.as_ref() {
-            if run.ip == ip {
-                return Ok(proxy_info(ip, run.handle.port(), candidates));
+            if requested.is_none_or(|ip| ip == run.ip) {
+                return Ok(proxy_info(run.ip, run.handle.port(), &net.candidates));
+            }
+        }
+        let ip = choose_ip(requested, &net.candidates)?;
+        if let Some(run) = slot.as_ref() {
+            if run.has_capture() || lock(&self.unlocked).is_some() {
+                return Err(CmdError::new(
+                    "A backup has already been captured on the current address. Changing the address means starting over.",
+                ));
             }
         }
         if let Some(old) = slot.take() {
             old.stop().await;
         }
+        let run = self.launch(ip, net, emit).await?;
+        advance(&self.ui, Step::Connect);
+        let info = proxy_info(ip, run.handle.port(), &net.candidates);
+        *slot = Some(run);
+        Ok(info)
+    }
+
+    /// Start over: stop the proxy, throw away the captured backup and anything unlocked from
+    /// it, and start a fresh proxy on `requested` (or the default address) with the same
+    /// certificate. A fresh proxy has no accepted device, so whichever iPhone or iPad
+    /// completes a trusted connection next is accepted, under whatever address it has now.
+    ///
+    /// An address that cannot be used is refused before anything is thrown away. If the new
+    /// proxy cannot start, the error is returned with the old one already gone.
+    pub async fn restart_proxy(
+        &self,
+        requested: Option<&str>,
+        net: &Network,
+        emit: EmitProxy,
+    ) -> Result<ProxyInfo, CmdError> {
+        let ip = choose_ip(parse_ip(requested)?, &net.candidates)?;
+        let mut slot = self.proxy.lock().await;
+        self.discard_secrets();
+        if let Some(old) = slot.take() {
+            old.stop().await;
+        }
+        {
+            // The one place the wizard goes back: the person asked to.
+            let mut ui = lock(&self.ui);
+            if ui.step > Step::Connect && ui.step < Step::Cleanup {
+                ui.step = Step::Connect;
+            }
+        }
+        let run = self.launch(ip, net, emit).await?;
+        advance(&self.ui, Step::Connect);
+        let info = proxy_info(ip, run.handle.port(), &net.candidates);
+        *slot = Some(run);
+        Ok(info)
+    }
+
+    /// Drop what was unlocked and what was proposed from it, and make sure an unlock or a
+    /// sign-in still under way does not put anything back.
+    fn discard_secrets(&self) {
+        self.discards.fetch_add(1, Ordering::SeqCst);
+        lock(&self.unlocked).take();
+        lock(&self.proposals).take();
+    }
+
+    async fn launch(
+        &self,
+        ip: Ipv4Addr,
+        net: &Network,
+        emit: EmitProxy,
+    ) -> Result<ProxyRun, CmdError> {
         let ca = self.ensure_ca()?;
         let (port, upstream) = {
             let t = lock(&self.tuning);
@@ -357,6 +566,9 @@ impl Session {
         )
         .await
         .map_err(|e| CmdError::new(format!("could not start listening: {e}")))?;
+        // Every address this computer has, so that none of them can be reached through the
+        // proxy on a device's behalf.
+        handle.add_local_addresses(net.own.iter().copied());
         let ui = Arc::clone(&self.ui);
         let bridge = tokio::spawn(async move {
             let mut bridge = Bridge::default();
@@ -369,25 +581,39 @@ impl Session {
                 }
             }
         });
-        advance(&self.ui, Step::Connect);
-        let info = proxy_info(ip, handle.port(), candidates);
-        *slot = Some(ProxyRun { ip, handle, bridge });
-        Ok(info)
+        Ok(ProxyRun { ip, handle, bridge })
     }
 
     /// Decrypt `backup` with `password` and keep the result in memory.
-    pub fn unlock_backup(
+    ///
+    /// The key derivation (100,000 rounds for every token in a real backup) runs on the
+    /// blocking pool, so the rest of the app keeps answering meanwhile. The password is wiped
+    /// when the work is done.
+    pub async fn unlock_backup(
         &self,
-        backup: &CapturedBackup,
-        password: &str,
+        backup: CapturedBackup,
+        password: Zeroizing<String>,
     ) -> Result<UnlockResult, CmdError> {
         if backup.tokens.is_empty() {
             return Err(CmdError::new("The backup has not arrived from Authy yet."));
         }
-        match backup::unlock(backup, password) {
+        let discards = self.discards.load(Ordering::SeqCst);
+        let outcome = tokio::task::spawn_blocking(move || backup::unlock(&backup, &password))
+            .await
+            .map_err(|_| CmdError::new("Unlocking the backup stopped unexpectedly."))?;
+        match outcome {
             Ok(unlocked) => {
                 let summary = UnlockSummary::from(&unlocked);
-                *lock(&self.unlocked) = Some(Arc::new(unlocked));
+                {
+                    let mut slot = lock(&self.unlocked);
+                    if self.discards.load(Ordering::SeqCst) != discards {
+                        return Err(CmdError::new(
+                            "The session was started over while the backup was being unlocked.",
+                        ));
+                    }
+                    *slot = Some(Arc::new(unlocked));
+                }
+                lock(&self.proposals).take();
                 advance(&self.ui, Step::Destination);
                 Ok(UnlockResult::Summary(summary))
             }
@@ -400,12 +626,12 @@ impl Session {
         }
     }
 
-    pub async fn unlock(&self, password: &str) -> Result<UnlockResult, CmdError> {
+    pub async fn unlock(&self, password: Zeroizing<String>) -> Result<UnlockResult, CmdError> {
         let backup = match self.proxy.lock().await.as_ref() {
             Some(run) => run.handle.backup(),
             None => return Err(CmdError::new("The connection is not running.")),
         };
-        self.unlock_backup(&backup, password)
+        self.unlock_backup(backup, password).await
     }
 
     fn unlocked(&self) -> Result<Arc<Unlocked>, CmdError> {
@@ -428,18 +654,30 @@ impl Session {
         Ok(export::google_migration_qrs(&self.unlocked()?.tokens))
     }
 
+    /// Titles of the tokens the Google Authenticator QR codes cannot carry.
+    pub fn google_unsupported(&self) -> Result<Vec<String>, CmdError> {
+        Ok(export::google_unsupported(&self.unlocked()?.tokens))
+    }
+
     /// The file for `dest`, ready to be written where the person chooses.
     pub fn prepare_export(&self, dest: DestinationDto) -> Result<ExportFile, CmdError> {
         export::export(&self.unlocked()?.tokens, dest.into())
             .map_err(|e| CmdError::new(e.to_string()))
     }
 
+    /// The codes at `unix_time`. Asking for them is what the Verify screen does, so the
+    /// tracked step moves there.
+    pub fn live_codes_at(&self, unix_time: u64) -> Result<Vec<LiveCode>, CmdError> {
+        let unlocked = self.unlocked()?;
+        advance(&self.ui, Step::Verify);
+        Ok(live_codes(&unlocked, unix_time))
+    }
+
     pub fn live_codes(&self) -> Result<Vec<LiveCode>, CmdError> {
         let now = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .map_or(0, |d| d.as_secs());
-        let unlocked = self.unlocked()?;
-        Ok(live_codes(&unlocked, now))
+        self.live_codes_at(now)
     }
 
     // ---- Bitwarden ----
@@ -457,25 +695,60 @@ impl Session {
         Ok(CliClient::new(binary, self.paths.bw_data()))
     }
 
+    async fn wipe_bw_data(&self) -> Result<(), CmdError> {
+        match tokio::fs::remove_dir_all(self.paths.bw_data()).await {
+            Ok(()) => Ok(()),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            Err(e) => Err(CmdError::new(format!(
+                "could not remove the Bitwarden data folder: {e}"
+            ))),
+        }
+    }
+
     /// Sign in with `client`. It is kept for the match and apply steps only on success; on any
     /// other outcome it is wiped so nothing is left in the Bitwarden data folder.
+    ///
+    /// One sign-in runs at a time. A client kept from an earlier sign-in is signed out and
+    /// wiped first. If the session is cleaned up (or started over, or the app is closing)
+    /// while this sign-in is under way, its result is thrown away and wiped as well.
     pub async fn bw_login(
         &self,
         mut client: Box<dyn BwClient>,
         input: BwLoginInput,
     ) -> Result<BwLoginResult, CmdError> {
+        let _one_at_a_time = self.bw_signing_in.lock().await;
+        let discards = self.discards.load(Ordering::SeqCst);
+        let previous = self.bw.lock().await.take();
+        if let Some(mut previous) = previous {
+            let _ = previous.logout_and_wipe().await;
+        }
+        lock(&self.proposals).take();
+
         let region = bitwarden::Region::from(input.region);
         let outcome = client
             .login(
                 &input.email,
                 &input.password,
                 &region,
-                input.two_factor_code.as_deref().filter(|c| !c.is_empty()),
+                input
+                    .two_factor_code
+                    .as_deref()
+                    .map(String::as_str)
+                    .filter(|c| !c.is_empty()),
             )
             .await;
         match outcome {
             Ok(LoginOutcome::Ok) => {
-                *self.bw.lock().await = Some(client);
+                let mut slot = self.bw.lock().await;
+                if self.discards.load(Ordering::SeqCst) != discards {
+                    drop(slot);
+                    let _ = client.logout_and_wipe().await;
+                    let _ = self.wipe_bw_data().await;
+                    return Err(CmdError::new(
+                        "The session was cleaned up while signing in to Bitwarden.",
+                    ));
+                }
+                *slot = Some(client);
                 Ok(BwLoginResult::Ok)
             }
             Ok(other) => {
@@ -500,10 +773,13 @@ impl Session {
             .ok_or_else(|| CmdError::new("You are not signed in to Bitwarden."))?;
         client.sync().await?;
         let vault = client.list_logins().await?;
-        let proposals = bitwarden::propose(&u.tokens, &vault);
-        Ok(join_proposals(&proposals, &vault))
+        let proposals = join_proposals(&bitwarden::propose(&u.tokens, &vault), &vault);
+        *lock(&self.proposals) = Some(proposals.clone());
+        Ok(proposals)
     }
 
+    /// Apply the person's decisions. They are checked against the last proposals first (see
+    /// [`check_decisions`]); if any does not hold, nothing at all is applied.
     pub async fn bw_apply(
         &self,
         decisions: Vec<DecisionEntry>,
@@ -514,6 +790,7 @@ impl Session {
         let client = guard
             .as_deref()
             .ok_or_else(|| CmdError::new("You are not signed in to Bitwarden."))?;
+        check_decisions(&decisions, &u, lock(&self.proposals).as_deref())?;
         let decisions: Vec<(String, bitwarden::Decision)> = decisions
             .into_iter()
             .map(|d| (d.token_id, d.decision.into()))
@@ -535,6 +812,8 @@ impl Session {
             first_error.get_or_insert(e);
         };
 
+        // First, so that an unlock or a sign-in still under way gives up when it finishes.
+        self.discard_secrets();
         if let Some(run) = self.proxy.lock().await.take() {
             run.stop().await;
         }
@@ -550,16 +829,29 @@ impl Session {
             }
         }
         // A previous launch may have left Bitwarden data with no client to wipe it.
-        match tokio::fs::remove_dir_all(self.paths.bw_data()).await {
-            Ok(()) => {}
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-            Err(e) => note(CmdError::new(format!(
-                "could not remove the Bitwarden data folder: {e}"
-            ))),
+        if let Err(e) = self.wipe_bw_data().await {
+            note(e);
         }
-        lock(&self.unlocked).take();
         advance(&self.ui, Step::Cleanup);
         first_error.map_or(Ok(()), Err)
+    }
+
+    /// The app is closing before the person reached cleanup. Stop the proxy and remove what
+    /// Bitwarden left on disk; keep the certificate key and the marker, so the next launch
+    /// opens on cleanup and finishes the job. Never waits: whatever is busy is skipped, and
+    /// the process ending takes care of what is in memory.
+    pub fn on_exit(&self) {
+        self.discard_secrets();
+        if let Ok(mut slot) = self.proxy.try_lock() {
+            if let Some(run) = slot.take() {
+                run.bridge.abort();
+                drop(run.handle); // dropping the handle stops the proxy
+            }
+        }
+        if let Ok(mut slot) = self.bw.try_lock() {
+            slot.take();
+        }
+        let _ = std::fs::remove_dir_all(self.paths.bw_data());
     }
 
     /// Clear the resume marker. If a key is somehow still in the store, clean up first; the
@@ -576,530 +868,5 @@ impl Session {
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-    use async_trait::async_trait;
-    use authexodus_core::bitwarden::{BwError, Region, SetTotp, VaultLogin};
-    use authexodus_core::ca::MemoryKeyStore;
-    use authexodus_core::types::{EncryptedToken, Secret, Token};
-    use std::sync::atomic::AtomicBool;
-
-    fn session(dir: &Path, store: Arc<MemoryKeyStore>) -> Session {
-        Session::new(store, dir.to_path_buf())
-    }
-
-    fn loopback() -> Vec<Candidate> {
-        vec![Candidate {
-            ip: Ipv4Addr::LOCALHOST,
-            label: "Test".into(),
-        }]
-    }
-
-    fn no_emit() -> EmitProxy {
-        Arc::new(|_| {})
-    }
-
-    /// One token, "JBSWY3DPEHPK3PXP", encrypted with password "hunter2" (PBKDF2-SHA1, 1000
-    /// rounds, salt "saltsalt", zero IV, AES-256-CBC) outside this codebase with Python and
-    /// OpenSSL, so the test does not lean on the core's own encryption.
-    fn fixture_backup() -> CapturedBackup {
-        CapturedBackup {
-            tokens: vec![EncryptedToken {
-                unique_id: "1".into(),
-                name: "Example: jeff@example.com".into(),
-                issuer: Some("Example".into()),
-                logo: None,
-                account_type: "authenticator".into(),
-                digits: 6,
-                encrypted_seed: "0iR0u266eu94XfqUtL8TzqoH44rbZbtn6tSYELbShRY=".into(),
-                salt: "saltsalt".into(),
-                unique_iv: None,
-                key_derivation_iterations: 1000,
-            }],
-            native_apps: vec![],
-        }
-    }
-
-    fn unlocked_one() -> Unlocked {
-        Unlocked {
-            tokens: vec![Token {
-                id: "1".into(),
-                title: "Example".into(),
-                name: "Example".into(),
-                issuer: None,
-                username: None,
-                secret: Secret::new("JBSWY3DPEHPK3PXP".into()),
-                digits: 6,
-                period: 30,
-            }],
-            invalid: vec![],
-            native: vec![],
-        }
-    }
-
-    #[test]
-    fn marker_makes_next_launch_resume_cleanup() {
-        let dir = tempfile::tempdir().unwrap();
-        let store = Arc::new(MemoryKeyStore::new());
-        let first = session(dir.path(), store.clone());
-        assert!(!first.get_state().resume_cleanup);
-        assert_eq!(first.get_state().step, Step::Welcome);
-
-        first.ensure_ca().unwrap();
-        assert_eq!(
-            std::fs::read_to_string(dir.path().join("session.json")).unwrap(),
-            r#"{"caCreated":true}"#
-        );
-        drop(first); // the app quits without cleaning up
-
-        let second = session(dir.path(), store);
-        let state = second.get_state();
-        assert!(state.resume_cleanup);
-        assert_eq!(state.step, Step::Cleanup);
-    }
-
-    #[tokio::test]
-    async fn finish_clears_the_marker_for_the_next_launch() {
-        let dir = tempfile::tempdir().unwrap();
-        let store = Arc::new(MemoryKeyStore::new());
-        let s = session(dir.path(), store.clone());
-        s.ensure_ca().unwrap();
-        s.cleanup().await.unwrap();
-        s.finish().await.unwrap();
-        assert!(!s.get_state().resume_cleanup);
-        assert!(!dir.path().join("session.json").exists());
-        assert!(!session(dir.path(), store).get_state().resume_cleanup);
-    }
-
-    #[tokio::test]
-    async fn finish_without_cleanup_still_destroys_the_key() {
-        let dir = tempfile::tempdir().unwrap();
-        let store = Arc::new(MemoryKeyStore::new());
-        let s = session(dir.path(), store.clone());
-        s.ensure_ca().unwrap();
-        s.finish().await.unwrap();
-        assert_eq!(store.load().unwrap(), None);
-    }
-
-    struct FakeBw {
-        wiped: Arc<AtomicBool>,
-    }
-
-    #[async_trait]
-    impl BwClient for FakeBw {
-        async fn login(
-            &mut self,
-            _: &str,
-            _: &str,
-            _: &Region,
-            _: Option<&str>,
-        ) -> Result<LoginOutcome, BwError> {
-            Ok(LoginOutcome::Ok)
-        }
-        async fn sync(&self) -> Result<(), BwError> {
-            Ok(())
-        }
-        async fn list_logins(&self) -> Result<Vec<VaultLogin>, BwError> {
-            Ok(vec![VaultLogin {
-                id: "item-1".into(),
-                name: "Example".into(),
-                username: None,
-                hosts: vec!["example.com".into()],
-                has_totp: false,
-            }])
-        }
-        async fn import_folder_titles(&self) -> Result<Vec<String>, BwError> {
-            Ok(vec![])
-        }
-        async fn set_totp(&self, _: &str, _: &str) -> Result<SetTotp, BwError> {
-            Ok(SetTotp::Attached)
-        }
-        async fn create_in_import_folder(
-            &self,
-            _: &str,
-            _: Option<&str>,
-            _: &str,
-        ) -> Result<(), BwError> {
-            Ok(())
-        }
-        async fn logout_and_wipe(&mut self) -> Result<(), BwError> {
-            self.wiped.store(true, Ordering::SeqCst);
-            Ok(())
-        }
-    }
-
-    fn login_input() -> BwLoginInput {
-        serde_json::from_str(r#"{"email":"a@example.com","password":"pw","region":{"kind":"us"}}"#)
-            .unwrap()
-    }
-
-    #[tokio::test]
-    async fn cleanup_destroys_key_and_drops_secrets() {
-        let dir = tempfile::tempdir().unwrap();
-        let store = Arc::new(MemoryKeyStore::new());
-        let s = session(dir.path(), store.clone());
-        s.tune_proxy(0, None);
-
-        s.start_proxy(Some("127.0.0.1"), &loopback(), no_emit())
-            .await
-            .unwrap();
-        assert!(store.load().unwrap().is_some(), "the key is stored");
-        *lock(&s.unlocked) = Some(Arc::new(unlocked_one()));
-        let wiped = Arc::new(AtomicBool::new(false));
-        let result = s
-            .bw_login(
-                Box::new(FakeBw {
-                    wiped: wiped.clone(),
-                }),
-                login_input(),
-            )
-            .await
-            .unwrap();
-        assert_eq!(result, BwLoginResult::Ok);
-        std::fs::create_dir_all(dir.path().join("bw-data")).unwrap();
-
-        s.cleanup().await.unwrap();
-
-        assert_eq!(store.load().unwrap(), None, "the key is gone");
-        assert!(s.proxy.lock().await.is_none(), "the proxy is stopped");
-        assert!(lock(&s.unlocked).is_none(), "secrets are dropped");
-        assert!(
-            s.bw.lock().await.is_none(),
-            "the Bitwarden client is dropped"
-        );
-        assert!(
-            wiped.load(Ordering::SeqCst),
-            "the Bitwarden session was wiped"
-        );
-        assert!(!dir.path().join("bw-data").exists());
-        assert!(s.live_codes().is_err());
-
-        // Running it again is fine.
-        s.cleanup().await.unwrap();
-    }
-
-    #[tokio::test]
-    async fn cleanup_on_fresh_launch_with_only_marker_and_key() {
-        let dir = tempfile::tempdir().unwrap();
-        let store = Arc::new(MemoryKeyStore::new());
-        {
-            let earlier = session(dir.path(), store.clone());
-            earlier.ensure_ca().unwrap();
-        }
-        std::fs::create_dir_all(dir.path().join("bw-data")).unwrap();
-        std::fs::write(dir.path().join("bw-data").join("data.json"), b"{}").unwrap();
-
-        let fresh = session(dir.path(), store.clone());
-        assert!(fresh.get_state().resume_cleanup);
-        fresh.cleanup().await.unwrap();
-        fresh.finish().await.unwrap();
-
-        assert_eq!(store.load().unwrap(), None);
-        assert!(!dir.path().join("bw-data").exists());
-        assert!(!dir.path().join("session.json").exists());
-    }
-
-    #[tokio::test]
-    async fn start_proxy_reports_the_real_port_and_restarts_on_a_new_address() {
-        let dir = tempfile::tempdir().unwrap();
-        let s = session(dir.path(), Arc::new(MemoryKeyStore::new()));
-        s.tune_proxy(0, None);
-        let mut candidates = loopback();
-        candidates.push(Candidate {
-            ip: Ipv4Addr::UNSPECIFIED,
-            label: "Other".into(),
-        });
-
-        let first = s
-            .start_proxy(Some("127.0.0.1"), &candidates, no_emit())
-            .await
-            .unwrap();
-        assert_ne!(first.port, 0);
-        assert_eq!(first.cert_url, format!("http://127.0.0.1:{}/", first.port));
-        assert_eq!(first.check_url, "https://authexodus-check.api.authy.com/");
-        assert!(first.cert_qr_svg.starts_with("<?xml") || first.cert_qr_svg.contains("<svg"));
-        assert_eq!(first.addresses.len(), 2);
-        assert_eq!(s.get_state().step, Step::Connect);
-
-        // Same address: the running proxy.
-        let again = s
-            .start_proxy(Some("127.0.0.1"), &candidates, no_emit())
-            .await
-            .unwrap();
-        assert_eq!(again.port, first.port);
-
-        // Different address: restarted there.
-        let moved = s
-            .start_proxy(Some("0.0.0.0"), &candidates, no_emit())
-            .await
-            .unwrap();
-        assert_eq!(moved.ip, "0.0.0.0");
-
-        // Not one of this computer's addresses.
-        assert!(s
-            .start_proxy(Some("8.8.8.8"), &candidates, no_emit())
-            .await
-            .is_err());
-        assert!(s
-            .start_proxy(Some("nonsense"), &candidates, no_emit())
-            .await
-            .is_err());
-        s.cleanup().await.unwrap();
-    }
-
-    #[test]
-    fn unlock_command_maps_wrong_password_to_error_variant() {
-        let dir = tempfile::tempdir().unwrap();
-        let s = session(dir.path(), Arc::new(MemoryKeyStore::new()));
-        let result = s
-            .unlock_backup(&fixture_backup(), "not the password")
-            .unwrap();
-        assert_eq!(
-            serde_json::to_string(&result).unwrap(),
-            r#"{"error":"wrongPassword"}"#
-        );
-        assert!(
-            s.unlocked().is_err(),
-            "nothing is kept after a wrong password"
-        );
-    }
-
-    #[test]
-    fn unlock_with_the_right_password_returns_the_summary_and_keeps_secrets_in_memory() {
-        let dir = tempfile::tempdir().unwrap();
-        let s = session(dir.path(), Arc::new(MemoryKeyStore::new()));
-        let result = s.unlock_backup(&fixture_backup(), "hunter2").unwrap();
-        let json = serde_json::to_value(&result).unwrap();
-        assert_eq!(json["tokens"][0]["id"], "1");
-        assert_eq!(json["tokens"][0]["username"], "jeff@example.com");
-        assert_eq!(json["invalid"], serde_json::json!([]));
-        assert_eq!(json["native"], serde_json::json!([]));
-        assert!(!json.to_string().contains("JBSWY3DPEHPK3PXP"));
-        assert_eq!(s.get_state().step, Step::Destination);
-
-        let codes = s.live_codes().unwrap();
-        assert_eq!(codes.len(), 1);
-        assert_eq!(codes[0].code.len(), 6);
-        assert!(s.token_qr("1").unwrap().contains("<svg"));
-        assert!(s.token_qr("nope").is_err());
-    }
-
-    #[test]
-    fn unlock_before_any_backup_is_an_error_not_a_wrong_password() {
-        let dir = tempfile::tempdir().unwrap();
-        let s = session(dir.path(), Arc::new(MemoryKeyStore::new()));
-        assert!(s.unlock_backup(&CapturedBackup::default(), "x").is_err());
-    }
-
-    #[test]
-    fn live_codes_match_the_core_and_count_down() {
-        let u = unlocked_one();
-        let codes = live_codes(&u, 59);
-        // RFC 6238 test vector secret differs; compare against the core directly.
-        assert_eq!(
-            codes[0].code,
-            totp::code("JBSWY3DPEHPK3PXP", 6, 30, 59).unwrap()
-        );
-        assert_eq!(codes[0].seconds_left, 1);
-        assert_eq!(live_codes(&u, 60)[0].seconds_left, 30);
-    }
-
-    #[test]
-    fn tls_rejected_is_debounced_to_one_per_two_seconds() {
-        let mut b = Bridge::default();
-        let t0 = Instant::now();
-        let ms = Duration::from_millis;
-        assert_eq!(
-            b.map(&ProxyEvent::TlsRejected, t0),
-            Some(ProxyEventDto::TlsRejected)
-        );
-        assert_eq!(b.map(&ProxyEvent::TlsRejected, t0 + ms(500)), None);
-        assert_eq!(b.map(&ProxyEvent::TlsRejected, t0 + ms(1999)), None);
-        assert_eq!(
-            b.map(&ProxyEvent::TlsRejected, t0 + ms(2000)),
-            Some(ProxyEventDto::TlsRejected)
-        );
-        // Other events are never held back.
-        assert_eq!(
-            b.map(&ProxyEvent::BackupCaptured { count: 3 }, t0 + ms(2001)),
-            Some(ProxyEventDto::BackupCaptured { count: 3 })
-        );
-    }
-
-    #[test]
-    fn proxy_events_serialise_to_the_ui_union() {
-        let j = |e: ProxyEvent| serde_json::to_string(&ProxyEventDto::from(&e)).unwrap();
-        assert_eq!(
-            j(ProxyEvent::DeviceConnected),
-            r#"{"kind":"deviceConnected"}"#
-        );
-        assert_eq!(j(ProxyEvent::TrustWorking), r#"{"kind":"trustWorking"}"#);
-        assert_eq!(j(ProxyEvent::TlsRejected), r#"{"kind":"tlsRejected"}"#);
-        assert_eq!(j(ProxyEvent::DeviceRefused), r#"{"kind":"deviceRefused"}"#);
-        assert_eq!(
-            j(ProxyEvent::BackupCaptured { count: 4 }),
-            r#"{"kind":"backupCaptured","count":4}"#
-        );
-        assert_eq!(
-            j(ProxyEvent::AuthyError {
-                status: 403,
-                path: "/x".into()
-            }),
-            r#"{"kind":"authyError","status":403,"path":"/x"}"#
-        );
-    }
-
-    #[test]
-    fn export_file_is_written_owner_only() {
-        use std::os::unix::fs::PermissionsExt;
-        let dir = tempfile::tempdir().unwrap();
-
-        let fresh = dir.path().join("fresh.csv");
-        write_owner_only(&fresh, b"secret,data").unwrap();
-        assert_eq!(std::fs::read(&fresh).unwrap(), b"secret,data");
-        assert_eq!(
-            std::fs::metadata(&fresh).unwrap().permissions().mode() & 0o777,
-            0o600
-        );
-
-        // Over a world-readable file the person chose to replace.
-        let old = dir.path().join("old.csv");
-        std::fs::write(&old, b"old and much longer content").unwrap();
-        std::fs::set_permissions(&old, std::fs::Permissions::from_mode(0o644)).unwrap();
-        write_owner_only(&old, b"new").unwrap();
-        assert_eq!(std::fs::read(&old).unwrap(), b"new");
-        assert_eq!(
-            std::fs::metadata(&old).unwrap().permissions().mode() & 0o777,
-            0o600
-        );
-    }
-
-    #[test]
-    fn export_prepares_the_files_and_refuses_google() {
-        let dir = tempfile::tempdir().unwrap();
-        let s = session(dir.path(), Arc::new(MemoryKeyStore::new()));
-        assert!(
-            s.prepare_export(DestinationDto::Bitwarden).is_err(),
-            "locked"
-        );
-        s.unlock_backup(&fixture_backup(), "hunter2").unwrap();
-        let f = s.prepare_export(DestinationDto::Bitwarden).unwrap();
-        assert_eq!(f.suggested_name, "authy-bitwarden-import.csv");
-        assert!(s
-            .prepare_export(DestinationDto::GoogleAuthenticator)
-            .is_err());
-        assert_eq!(s.google_migration_qrs().unwrap().len(), 1);
-    }
-
-    #[tokio::test]
-    async fn propose_joins_candidates_against_the_vault() {
-        let dir = tempfile::tempdir().unwrap();
-        let s = session(dir.path(), Arc::new(MemoryKeyStore::new()));
-        *lock(&s.unlocked) = Some(Arc::new(unlocked_one()));
-        let wiped = Arc::new(AtomicBool::new(false));
-        s.bw_login(Box::new(FakeBw { wiped }), login_input())
-            .await
-            .unwrap();
-        let proposals = s.bw_propose().await.unwrap();
-        assert_eq!(proposals.len(), 1);
-        let json = serde_json::to_value(&proposals[0]).unwrap();
-        assert_eq!(json["tokenId"], "1");
-        for c in json["candidates"].as_array().unwrap() {
-            assert_eq!(c["itemId"], "item-1");
-            assert_eq!(c["name"], "Example");
-            assert_eq!(c["hasCode"], false);
-        }
-        let lines = Arc::new(Mutex::new(Vec::new()));
-        let sink = lines.clone();
-        let report = s
-            .bw_apply(
-                vec![DecisionEntry {
-                    token_id: "1".into(),
-                    decision: DecisionDto::Attach {
-                        item_id: "item-1".into(),
-                    },
-                }],
-                Arc::new(move |l| lock(&sink).push(l)),
-            )
-            .await
-            .unwrap();
-        assert_eq!(report.attached, 1);
-        assert!(!lock(&lines).is_empty());
-        assert_eq!(report.failed, None);
-    }
-
-    #[tokio::test]
-    async fn bw_login_that_needs_two_factor_keeps_no_client() {
-        struct NeedsTwo(Arc<AtomicBool>);
-        #[async_trait]
-        impl BwClient for NeedsTwo {
-            async fn login(
-                &mut self,
-                _: &str,
-                _: &str,
-                _: &Region,
-                _: Option<&str>,
-            ) -> Result<LoginOutcome, BwError> {
-                Ok(LoginOutcome::NeedsTwoFactor)
-            }
-            async fn sync(&self) -> Result<(), BwError> {
-                Ok(())
-            }
-            async fn list_logins(&self) -> Result<Vec<VaultLogin>, BwError> {
-                Ok(vec![])
-            }
-            async fn import_folder_titles(&self) -> Result<Vec<String>, BwError> {
-                Ok(vec![])
-            }
-            async fn set_totp(&self, _: &str, _: &str) -> Result<SetTotp, BwError> {
-                Ok(SetTotp::Attached)
-            }
-            async fn create_in_import_folder(
-                &self,
-                _: &str,
-                _: Option<&str>,
-                _: &str,
-            ) -> Result<(), BwError> {
-                Ok(())
-            }
-            async fn logout_and_wipe(&mut self) -> Result<(), BwError> {
-                self.0.store(true, Ordering::SeqCst);
-                Ok(())
-            }
-        }
-        let dir = tempfile::tempdir().unwrap();
-        let s = session(dir.path(), Arc::new(MemoryKeyStore::new()));
-        let wiped = Arc::new(AtomicBool::new(false));
-        let r = s
-            .bw_login(Box::new(NeedsTwo(wiped.clone())), login_input())
-            .await
-            .unwrap();
-        assert_eq!(
-            serde_json::to_string(&r).unwrap(),
-            r#"{"kind":"needsTwoFactor"}"#
-        );
-        assert!(s.bw.lock().await.is_none());
-        assert!(wiped.load(Ordering::SeqCst));
-    }
-
-    #[test]
-    fn decisions_and_login_deserialise_from_the_ui_shapes() {
-        let d: DecisionDto = serde_json::from_str(r#"{"kind":"attach","itemId":"x"}"#).unwrap();
-        assert_eq!(
-            d,
-            DecisionDto::Attach {
-                item_id: "x".into()
-            }
-        );
-        let d: DecisionDto = serde_json::from_str(r#"{"kind":"createNew"}"#).unwrap();
-        assert_eq!(d, DecisionDto::CreateNew);
-        let l: BwLoginInput = serde_json::from_str(
-            r#"{"email":"e","password":"p","region":{"kind":"selfHosted","url":"https://h"},"twoFactorCode":"123456"}"#,
-        )
-        .unwrap();
-        assert_eq!(l.two_factor_code.as_deref(), Some("123456"));
-        let e: DecisionEntry =
-            serde_json::from_str(r#"{"tokenId":"1","decision":{"kind":"skip"}}"#).unwrap();
-        assert_eq!(e.decision, DecisionDto::Skip);
-    }
-}
+#[path = "session_tests.rs"]
+mod tests;

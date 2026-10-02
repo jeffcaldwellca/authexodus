@@ -8,6 +8,7 @@ use authexodus_core::export::Destination;
 use authexodus_core::proxy::ProxyEvent;
 use authexodus_core::types::{InvalidReason, Unlocked};
 use serde::{Deserialize, Serialize};
+use zeroize::Zeroizing;
 
 /// Declared in wizard order, so `Ord` says which step is further along.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
@@ -38,6 +39,7 @@ pub struct AppState {
     pub device: Option<Device>,
     pub resume_cleanup: bool,
     pub version: String,
+    pub releases_url: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -230,15 +232,16 @@ impl From<BwRegionDto> for bitwarden::Region {
     }
 }
 
-/// Holds the Bitwarden password: deliberately no `Debug`.
+/// Holds the Bitwarden password and the two-factor code: deliberately no `Debug`. Both are
+/// wiped from memory when this is dropped.
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct BwLoginInput {
     pub email: String,
-    pub password: String,
+    pub password: Zeroizing<String>,
     pub region: BwRegionDto,
     #[serde(default)]
-    pub two_factor_code: Option<String>,
+    pub two_factor_code: Option<Zeroizing<String>>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]

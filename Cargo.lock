@@ -268,18 +268,27 @@ checksum = "1505bd5d3d116872e7271a6d4e16d81d0c8570876c8de68093a09ac269d8aac0"
 name = "authexodus"
 version = "0.1.0"
 dependencies = [
+ "aes",
  "async-trait",
  "authexodus-core",
+ "base64 0.22.1",
+ "cbc",
+ "csv",
  "if-addrs",
  "keyring",
+ "pbkdf2",
+ "rcgen",
+ "rustls",
  "serde",
  "serde_json",
+ "sha1 0.10.7",
  "tauri",
  "tauri-build",
  "tauri-plugin-dialog",
  "tempfile",
  "thiserror 2.0.21",
  "tokio",
+ "tokio-rustls",
  "tracing",
  "tracing-subscriber",
  "zeroize",
@@ -6333,6 +6342,7 @@ version = "1.9.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "e13c156562582aa81c60cb29407084cdb54c4164760106ab78e6c5b0858cf64e"
 dependencies = [
+ "serde",
  "zeroize_derive",
 ]
 
