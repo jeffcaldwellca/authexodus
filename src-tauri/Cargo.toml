@@ -32,3 +32,4 @@ keyring = { version = "3", features = ["sync-secret-service", "crypto-rust"] }
 
 [dev-dependencies]
 tempfile = "3"
+async-trait = "0.1"
