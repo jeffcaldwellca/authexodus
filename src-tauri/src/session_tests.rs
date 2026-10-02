@@ -152,7 +152,10 @@ impl KeyStore for BrokenStore {
 async fn a_key_that_could_not_be_stored_leaves_no_marker() {
     let dir = tempfile::tempdir().unwrap();
     let s = Session::new(Arc::new(BrokenStore), dir.path().to_path_buf());
-    assert!(s.ensure_ca().await.is_err());
+    let error = s.ensure_ca().await.err().expect("no certificate").0;
+    assert_eq!(error, certificate_not_created("the keychain is locked"));
+    assert!(error.contains("(the keychain is locked)"), "{error}");
+    assert!(error.contains("Keychain Access"), "{error}");
     assert!(
         !dir.path().join("session.json").exists(),
         "no marker claims a certificate that was never created"

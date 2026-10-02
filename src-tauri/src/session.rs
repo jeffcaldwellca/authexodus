@@ -554,7 +554,7 @@ impl Session {
             tokio::task::spawn_blocking(move || Authority::create_fresh(&*store, constrained))
                 .await
                 .map_err(|_| "the key store stopped unexpectedly".to_string())
-                .and_then(|made| made.map_err(|e| e.to_string()));
+                .and_then(|made| made.map_err(|e| store_reason(&e)));
         let ca = match created {
             Ok(ca) => Arc::new(ca),
             Err(reason) => {
@@ -562,9 +562,7 @@ impl Session {
                     let _ = remove_marker(&self.paths);
                 }
                 tracing::error!(error = %reason, "the certificate authority could not be created");
-                return Err(CmdError::new(format!(
-                    "could not create the certificate: {reason}"
-                )));
+                return Err(CmdError::new(certificate_not_created(&reason)));
             }
         };
         if ca.is_constrained() {
@@ -627,8 +625,10 @@ impl Session {
     /// Start over: stop the proxy, throw away the captured backup and anything unlocked from
     /// it, and start a fresh proxy with the same certificate on `requested`, or, when no
     /// address is given, on the address the proxy is (or last was) on, so that the iPhone or
-    /// iPad only has to reconnect. Only with no earlier address is the default chosen. A fresh proxy has no accepted device, so whichever iPhone or iPad
-    /// completes a trusted connection next is accepted, under whatever address it has now.
+    /// iPad only has to reconnect. Only with no earlier address (or one this computer no
+    /// longer has) is the default chosen. A fresh proxy has no accepted device, so whichever
+    /// iPhone or iPad completes a trusted connection next is accepted, under whatever address
+    /// it has now.
     ///
     /// An address that cannot be used is refused before anything is thrown away. If the new
     /// proxy cannot start, the error is returned with the old one already gone.
@@ -640,7 +640,11 @@ impl Session {
     ) -> Result<ProxyInfo, CmdError> {
         let requested = parse_ip(requested)?;
         let mut slot = self.proxy.lock().await;
-        let current = slot.as_ref().map(|run| run.ip).or(*lock(&self.last_ip));
+        let current = slot
+            .as_ref()
+            .map(|run| run.ip)
+            .or(*lock(&self.last_ip))
+            .filter(|ip| net.candidates.iter().any(|c| c.ip == *ip));
         let ip = choose_ip(requested.or(current), &net.candidates).inspect_err(
             |e| tracing::warn!(error = %e, asked = requested.is_some(), "no address to listen on"),
         )?;
@@ -1141,6 +1145,17 @@ pub fn key_not_removed(reason: &str) -> String {
         "The certificate key could not be removed from this computer's keychain ({reason}). \
          To remove it by hand: open Keychain Access, search for \"{KEYCHAIN_SERVICE}\", and \
          delete the item it finds. Then try again."
+    )
+}
+
+/// What the person is told when the certificate could not be created. The usual cause is the
+/// keychain: an item of the same name that cannot be replaced, or a refused prompt.
+pub fn certificate_not_created(reason: &str) -> String {
+    let reason = reason.trim().trim_end_matches('.');
+    format!(
+        "The certificate could not be created ({reason}). If this keeps happening: open \
+         Keychain Access, search for \"{KEYCHAIN_SERVICE}\", delete the item it finds, and \
+         try again."
     )
 }
 
