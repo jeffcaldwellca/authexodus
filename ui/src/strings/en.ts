@@ -418,6 +418,10 @@ export const en = {
     loginFailed: "Signing in to Bitwarden did not work.",
     loginFailedAdvice: "Try again. If your account needs an emailed code or a security key, sign in with an API key, or use Save a file for another app, then Bitwarden.",
     loginCancelled: "Sign-in was cancelled. Nothing was changed.",
+    toolChanged: {
+      title: "The Bitwarden tool on this Mac changed after it was checked, so it was not run.",
+      action: "Download it again",
+    },
     signIn: "Sign in",
     signingIn: "Signing in…",
     matching: "Reading your vault and matching accounts…",

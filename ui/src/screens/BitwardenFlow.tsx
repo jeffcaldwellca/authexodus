@@ -423,11 +423,19 @@ export function BitwardenFlow({ api, state, tokens, onDone, onLocked }: ScreenPr
           )}
           {loginProblem?.kind === "bad" && <Callout tone="error" title={withKey ? t.badApiKey : t.badCredentials} alert />}
           {loginProblem?.kind === "cancelled" && <Callout tone="info"><p role="status">{t.loginCancelled}</p></Callout>}
-          {loginProblem?.kind === "error" && (
+          {loginProblem?.kind === "error" && (loginProblem.error.code === "bw_checksum_mismatch" ? (
+            // At sign-in this code means the tool on disk changed since it was checked, not a
+            // bad download: getting it again is the cure, not waiting.
+            <Problem error={loginProblem.error} d={d} title={t.loginFailed} heading={t.toolChanged.title} advice="">
+              <button type="button" className="secondary" onClick={() => { setLoginProblem(null); void prepare(); }}>
+                {t.toolChanged.action}
+              </button>
+            </Problem>
+          ) : (
             <Problem error={loginProblem.error} d={d} title={t.loginFailed}>
               {loginProblem.error.code === "internal" && <p>{t.loginFailedAdvice}</p>}
             </Problem>
-          )}
+          ))}
         </form>
         {vaultError && (
           <Problem error={vaultError} d={d} title={t.vaultFailed}>

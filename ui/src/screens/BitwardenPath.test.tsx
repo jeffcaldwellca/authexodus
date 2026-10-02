@@ -186,6 +186,25 @@ describe("sign-in rejections", () => {
     expect(within(alert).queryByText(t.loginFailedAdvice)).not.toBeInTheDocument();
   });
 
+  it("a tool that changed since it was checked gets its own message and downloads again, not \"try again later\"", async () => {
+    const sentence = "The Bitwarden tool on this computer has changed since this app checked it, so it was not run. Go back and let the app download it again.";
+    const h = await toLogin({ failures: { bwLogin: [new ApiError("bw_checksum_mismatch", sentence)] } });
+    await typeLogin(h);
+    await h.user.click(screen.getByRole("button", { name: t.signIn }));
+    const alert = await screen.findByRole("alert");
+    expect(within(alert).getByText(t.toolChanged.title)).toBeInTheDocument();
+    expect(within(alert).getByText(sentence)).toBeInTheDocument();
+    // The download screen's advice does not fit here.
+    expect(within(alert).queryByText(by.bw_checksum_mismatch.title(iphone))).not.toBeInTheDocument();
+    expect(alert.textContent).not.toMatch(/Try again later/);
+    expect(secretsOnPage("master pw")).toBe(false);
+
+    await h.user.click(within(alert).getByRole("button", { name: t.toolChanged.action }));
+    await screen.findByRole("heading", { level: 1, name: t.loginTitle });
+    expect(h.api.calls.filter((c) => c.method === "bwPrepare")).toHaveLength(2);
+    expect(screen.queryByRole("alert")).not.toBeInTheDocument();
+  });
+
   it("a sign-in in progress can be cancelled, and the password is dropped", async () => {
     const h = await toLogin({ hold: { bwLogin: true } });
     await typeLogin(h);
