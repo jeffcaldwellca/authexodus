@@ -24,6 +24,10 @@ pub enum BackupError {
 
 /// Authy's fixed PBKDF2 round count before the response started carrying one per token.
 const DEFAULT_KDF_ITERATIONS: u32 = 1000;
+/// The most key-derivation rounds a token may ask for. Authy uses 100,000. The number comes
+/// from the response, so without a limit a corrupted or hostile one could keep the unlock
+/// busy for hours; a token that asks for more is treated as one that cannot be decrypted.
+pub const MAX_KDF_ITERATIONS: u32 = 2_000_000;
 /// Standard tokens are six digits unless the response says otherwise.
 const DEFAULT_TOKEN_DIGITS: u32 = 6;
 /// Authy-native tokens are seven digits unless the response says otherwise.
@@ -222,7 +226,7 @@ fn lenient_u32<'de, D: Deserializer<'de>>(d: D) -> Result<Option<u32>, D::Error>
 
 /// Decrypt one token's seed. `None` when padding is invalid or the plaintext is not printable ASCII.
 fn decrypt_seed(tok: &EncryptedToken, password: &str) -> Option<String> {
-    if tok.key_derivation_iterations == 0 {
+    if tok.key_derivation_iterations == 0 || tok.key_derivation_iterations > MAX_KDF_ITERATIONS {
         return None;
     }
     let mut key = [0u8; 32];
@@ -468,6 +472,42 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn an_absurd_round_count_is_unusable_not_hours_of_work() {
+        // A hostile or corrupted response can name any number of rounds. Two thousand
+        // million would keep a processor busy for hours; it must be turned down at once.
+        let mut absurd = make(0, "Absurd", "JBSWY3DPEHPK3PXP", true, "pw");
+        absurd.key_derivation_iterations = u32::MAX;
+        let mut over = make(1, "Just over", "JBSWY3DPEHPK3PXP", true, "pw");
+        over.key_derivation_iterations = MAX_KDF_ITERATIONS + 1;
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let outcome = unlock(&backup(vec![absurd, over]), "pw");
+            let _ = tx.send(matches!(outcome, Err(BackupError::WrongPassword)));
+        });
+        let refused = rx
+            .recv_timeout(std::time::Duration::from_secs(3))
+            .expect("the round count was not capped: still deriving after three seconds");
+        assert!(refused, "nothing in it could be decrypted");
+
+        // The real count, and one well above it, still work; such a token among good ones
+        // is reported, not fatal.
+        let mut tokens: Vec<EncryptedToken> = (0..3)
+            .map(|i| make(i, &format!("Good {i}"), "JBSWY3DPEHPK3PXP", true, "pw"))
+            .collect();
+        let mut bad = make(9, "Too many rounds", "JBSWY3DPEHPK3PXP", true, "pw");
+        bad.key_derivation_iterations = u32::MAX;
+        tokens.push(bad);
+        let unlocked = unlock(&backup(tokens), "pw").unwrap();
+        assert_eq!(unlocked.tokens.len(), 3);
+        assert_eq!(unlocked.invalid.len(), 1);
+        assert_eq!(unlocked.invalid[0].name, "Too many rounds");
+        assert!(
+            MAX_KDF_ITERATIONS >= 20 * 100_000,
+            "room above Authy's 100,000"
+        );
     }
 
     #[test]
