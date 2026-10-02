@@ -36,6 +36,8 @@ function at(step: "connect" | "certificate" | "authy" | "unlock" | "destination"
 
 describe("wizard machine", () => {
   it("welcome_blocks_until_device_and_all_checks", () => {
+    expect(CHECK_IDS).toHaveLength(5);
+    expect(CHECK_IDS).toContain("sms");
     let s = initialState();
     expect(canStart(s)).toBe(false);
     expect(reduce(s, { type: "start" }).step).toBe("welcome");
@@ -134,7 +136,7 @@ describe("wizard machine", () => {
       const s = reduce(at(step), { type: "proxy", event: { kind: "deviceRefused" } });
       expect(s.step).toBe(step);
       expect(troubleFor(s)).toBe("deviceRefused");
-      const restarted = reduce(s, { type: "restarted" });
+      const restarted = reduce(s, { type: "restarting" });
       expect(restarted.step).toBe("connect");
       expect(troubleFor(restarted)).toBeNull();
     }
@@ -143,16 +145,16 @@ describe("wizard machine", () => {
 
   it("a restart goes back to connect, forgets trust and the capture, and keeps the device", () => {
     let s = reduce(at("authy"), { type: "proxy", event: { kind: "authyError", status: 400, path: "/x" } });
-    s = reduce(s, { type: "restarted" });
+    s = reduce(s, { type: "restarting" });
     expect(s).toMatchObject({ step: "connect", trustProven: false, captured: null, authyError: null, device: "iphone", reachedAuthy: true });
     // The phone still has its certificate, so trust working again moves straight on.
     expect(reduce(s, { type: "proxy", event: { kind: "trustWorking" } }).step).toBe("authy");
-    expect(reduce(at("verify"), { type: "restarted" }).step).toBe("verify");
+    expect(reduce(at("verify"), { type: "restarting" }).step).toBe("verify");
   });
 
   it("authyError is surfaced on the Authy step", () => {
     const s = reduce(at("authy"), { type: "proxy", event: { kind: "authyError", status: 400, path: "/x" } });
-    expect(troubleFor(s)).toBe("attestation");
+    expect(troubleFor(s)).toBe("authyError");
     expect(s.step).toBe("authy");
   });
 
@@ -240,6 +242,34 @@ describe("wizard machine", () => {
     expect(cleanupItems(reduce(at("certificate"), { type: "abandon" }))).toEqual(["proxyOff", "profileRemoved"]);
     expect(cleanupItems(reduce(at("authy"), { type: "abandon" }))).toContain("authySignedIn");
     expect(cleanupItems(reduce(at("unlock"), { type: "abandon" }))).toContain("authySignedIn");
+  });
+
+  it("events that arrive after a restart was asked for are kept", () => {
+    // The person clicks Restart; the new proxy's events can arrive before the shell answers.
+    let s = reduce(at("authy"), { type: "restarting" });
+    expect(s).toMatchObject({ step: "connect", restarts: 1, certificateInstalled: true });
+    s = reduce(s, { type: "proxy", event: { kind: "deviceConnected" } });
+    s = reduce(s, { type: "proxy", event: { kind: "trustWorking" } });
+    expect(s.step).toBe("authy");
+    s = reduce(s, { type: "proxy", event: { kind: "backupCaptured", count: 7 } });
+    expect(s).toMatchObject({ step: "unlock", captured: 7 });
+  });
+
+  it("a resumed cleanup also asks about a saved file, since the app no longer knows", () => {
+    const s = reduce(initialState(), {
+      type: "loaded", app: { step: "welcome", device: null, resumeCleanup: true, version: "1", releasesUrl: "" },
+    });
+    expect(cleanupItems(s)).toEqual(["proxyOff", "profileRemoved", "authySignedIn", "fileDeleted"]);
+  });
+
+  it("remembers how many accounts could not move after the summary is dropped", () => {
+    let s = run(at("unlock"), { type: "unlocked", summary: {
+      tokens: [{ id: "a", title: "A", username: null }], invalid: [{ name: "X", reason: "tooShort" }], native: [{ name: "Twitch" }],
+    } });
+    expect(s.cantMove).toBe(2);
+    s = run(s, { type: "moved" }, { type: "destinationDone" }, { type: "verified" });
+    expect(s.summary).toBeNull();
+    expect(s.cantMove).toBe(2);
   });
 
   it("with nothing to move, the destination step can be left", () => {

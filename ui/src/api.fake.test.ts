@@ -36,7 +36,7 @@ describe("api.fake", () => {
     const api = createFakeApi();
     const decisions = (await api.bwPropose()).map((p) => ({ tokenId: p.tokenId, decision: p.decision }));
     const first = await api.bwApply(decisions);
-    expect(first).toMatchObject({ attached: 5, created: 2, kept: ["Dropbox"], failed: null });
+    expect(first).toMatchObject({ attached: 5, created: 3, kept: [], failed: null });
     expect(await api.bwApply(decisions)).toMatchObject({ attached: 0, created: 0 });
   });
 
@@ -59,6 +59,22 @@ describe("api.fake", () => {
     await expect(api.startProxy("10.0.0.12")).rejects.toThrow();
     expect((await api.restartProxy("10.0.0.12")).ip).toBe("10.0.0.12");
     expect((await api.startProxy("192.168.4.109")).ip).toBe("192.168.4.109");
+  });
+
+  it("never proposes attaching to a login that already has a code, as the core never does", async () => {
+    const proposals = await createFakeApi().bwPropose();
+    for (const p of proposals) {
+      const d = p.decision;
+      if (d.kind === "attach") expect(p.candidates.find((c) => c.itemId === d.itemId)?.hasCode).toBe(false);
+    }
+    // The real has-code case: the login is listed, nothing is chosen, and it is a question.
+    const taken = proposals.find((p) => p.candidates.some((c) => c.hasCode))!;
+    expect(taken).toMatchObject({ confidence: "low", decision: { kind: "createNew" } });
+  });
+
+  it("gives a certificate fingerprint in the contract's shape", async () => {
+    const info = await createFakeApi().startProxy();
+    expect(info.certFingerprint).toMatch(/^([0-9A-F]{2}:){31}[0-9A-F]{2}$/);
   });
 
   it("reports the release page and the titles Google's codes cannot carry", async () => {

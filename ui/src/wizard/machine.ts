@@ -4,15 +4,15 @@
 // (names, never keys), and it drops that when cleanup begins.
 import type { AppState, Device, ProxyEvent, Step, UnlockSummary } from "../api";
 
-/** The four safety checks on the welcome screen. All must be ticked. */
-export const CHECK_IDS = ["device", "backups", "password", "multiDevice"] as const;
+/** The five safety checks on the welcome screen. All must be ticked. */
+export const CHECK_IDS = ["device", "backups", "password", "multiDevice", "sms"] as const;
 export type CheckId = (typeof CHECK_IDS)[number];
 
 /** Things the person does by hand on the phone (and Mac) during cleanup. */
 export type CleanupId = "proxyOff" | "profileRemoved" | "authySignedIn" | "fileDeleted";
 
 /** A problem the proxy has told us about, which the current screen should explain. */
-export type Trouble = "trust" | "methodBroken" | "attestation" | "deviceRefused";
+export type Trouble = "trust" | "methodBroken" | "authyError" | "deviceRefused";
 
 /** How many refused Authy connections, after trust was proven, mean the method is broken. */
 export const BROKEN_AFTER = 3;
@@ -33,8 +33,14 @@ export type WizardState = {
   deviceRefused: boolean;
   /** The wizard got as far as telling the person to delete Authy. */
   reachedAuthy: boolean;
-  /** Something has been moved: a QR walk finished, a file saved, or a Bitwarden apply done. */
+  /** Something has been moved: a QR code scanned and ticked, a file saved, or a Bitwarden apply done. */
   moved: boolean;
+  /** How many times the connection was restarted. The waiting screens say what not to redo. */
+  restarts: number;
+  /** Trust was proven at some point in this run, restarts included: the certificate is installed. */
+  certificateInstalled: boolean;
+  /** How many accounts could not be moved. Kept after the summary is dropped, for cleanup and Done. */
+  cantMove: number;
   authyError: { status: number; path: string } | null;
   /** Largest number of accounts captured so far. */
   captured: number | null;
@@ -55,7 +61,7 @@ export type WizardEvent =
   | { type: "start" }
   | { type: "proxy"; event: ProxyEvent }
   | { type: "unlocked"; summary: UnlockSummary }
-  | { type: "restarted" }
+  | { type: "restarting" }
   | { type: "fileExported" }
   | { type: "moved" }
   | { type: "destinationDone" }
@@ -70,13 +76,16 @@ export function initialState(): WizardState {
     step: "welcome",
     device: null,
     android: false,
-    checks: { device: false, backups: false, password: false, multiDevice: false },
+    checks: { device: false, backups: false, password: false, multiDevice: false, sms: false },
     trustProven: false,
     tlsRejected: false,
     rejectionsAfterTrust: 0,
     deviceRefused: false,
     reachedAuthy: false,
     moved: false,
+    restarts: 0,
+    certificateInstalled: false,
+    cantMove: 0,
     authyError: null,
     captured: null,
     summary: null,
@@ -97,7 +106,8 @@ export function cleanupItems(s: WizardState): CleanupId[] {
   // Once the person was told to delete Authy (or we cannot know, after a resume), Authy has
   // to be signed back in before they are done, or they are left without their fallback.
   if (s.reachedAuthy || s.resumed) items.push("authySignedIn");
-  if (s.exportedFile) items.push("fileDeleted");
+  // After a resume the app no longer knows whether a file was saved, so it asks either way.
+  if (s.exportedFile || s.resumed) items.push("fileDeleted");
   return items;
 }
 
@@ -118,7 +128,7 @@ export function troubleFor(s: WizardState): Trouble | null {
   if (s.step !== "authy") return null;
   // One refusal proves nothing. Only trust seen working, then refused again and again, does.
   if (s.trustProven && s.rejectionsAfterTrust >= BROKEN_AFTER) return "methodBroken";
-  if (s.authyError) return "attestation";
+  if (s.authyError) return "authyError";
   return null;
 }
 
@@ -132,7 +142,10 @@ function onProxy(s: WizardState, e: ProxyEvent): WizardState {
       return s.step === "connect" ? { ...s, step: "certificate" } : s;
     case "trustWorking":
       // A trusted connection implies the device is connected, so this also leaves `connect`.
-      return { ...s, step: "authy", reachedAuthy: true, trustProven: true, tlsRejected: false, rejectionsAfterTrust: 0 };
+      return {
+        ...s, step: "authy", reachedAuthy: true, trustProven: true, certificateInstalled: true,
+        tlsRejected: false, rejectionsAfterTrust: 0,
+      };
     case "tlsRejected":
       if (s.trustProven) return { ...s, rejectionsAfterTrust: s.rejectionsAfterTrust + 1 };
       // Before the certificate step every connection to Authy is refused; that is expected.
@@ -170,13 +183,17 @@ export function reduce(s: WizardState, ev: WizardEvent): WizardState {
     case "proxy":
       return onProxy(s, ev.event);
     case "unlocked":
-      return s.step === "unlock" ? { ...s, step: "destination", summary: ev.summary } : s;
-    case "restarted":
-      // The proxy started over: the capture is gone and the device must reconnect. The
-      // certificate on the phone is unchanged, so trust will be seen again by itself.
+      return s.step === "unlock"
+        ? { ...s, step: "destination", summary: ev.summary, cantMove: ev.summary.native.length + ev.summary.invalid.length }
+        : s;
+    case "restarting":
+      // Dispatched the moment the person asks for a restart, before the shell answers, so
+      // that events from the new proxy are applied to the reset state and not wiped by it.
+      // The capture is gone and the device must reconnect. The certificate on the phone is
+      // unchanged, so trust will be seen again by itself.
       return LISTENING.includes(s.step) ? {
         ...s, step: "connect", trustProven: false, tlsRejected: false, rejectionsAfterTrust: 0,
-        deviceRefused: false, authyError: null, captured: null,
+        deviceRefused: false, authyError: null, captured: null, restarts: s.restarts + 1,
       } : s;
     case "fileExported":
       return { ...s, exportedFile: true, moved: true };

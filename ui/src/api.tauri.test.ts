@@ -74,6 +74,15 @@ describe("api.tauri", () => {
     expect(invoke).toHaveBeenLastCalledWith("restart_proxy", { ip: null });
   });
 
+  it("hands back the newer contract fields untouched: the fingerprint and a refused two-step code", async () => {
+    const api = createTauriApi();
+    const fingerprint = Array.from({ length: 32 }, () => "AB").join(":");
+    invoke.mockResolvedValueOnce({ ip: "192.168.4.109", port: 8080, certFingerprint: fingerprint });
+    expect((await api.startProxy()).certFingerprint).toBe(fingerprint);
+    invoke.mockResolvedValueOnce({ kind: "badTwoFactorCode" });
+    expect(await api.bwLogin({ email: "a@b.c", password: "pw", region: { kind: "us" }, twoFactorCode: "000000" })).toEqual({ kind: "badTwoFactorCode" });
+  });
+
   it("a failed command rejects with an Error carrying the shell's message", async () => {
     const api = createTauriApi();
     invoke.mockRejectedValueOnce("a backup is already captured");
