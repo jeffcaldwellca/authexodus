@@ -2,20 +2,33 @@
 //
 // Each method calls the Rust command whose name is the method's name in snake_case, with
 // arguments keyed by the parameter names in `api.ts`. A failed command rejects its promise
-// with an `Error` carrying the shell's message, so callers handle it like any other failure.
+// with an `ApiError`: the shell's code, and its plain sentence as the message.
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 import type { Api, ProxyEvent } from "./api";
+import { ApiError, isErrorCode } from "./api.errors";
 
 export const PROXY_EVENT = "proxy-event";
 export const BW_PROGRESS_EVENT = "bw-progress";
 
-/** The shell rejects with a plain string; give callers a real `Error` either way. */
+/**
+ * The one place a rejection is read. The shell rejects with "<code>: <plain sentence>". A
+ * rejection with no code, or with one this UI does not know, is `internal` and keeps the raw
+ * text as its message.
+ */
+export function toApiError(err: unknown): ApiError {
+  if (err instanceof ApiError) return err;
+  const raw = err instanceof Error ? err.message : typeof err === "string" ? err : String(err);
+  const colon = raw.indexOf(":");
+  const code = colon > 0 ? raw.slice(0, colon) : "";
+  return isErrorCode(code) ? new ApiError(code, raw.slice(colon + 1).trimStart()) : new ApiError("internal", raw);
+}
+
 async function call<T>(command: string, args?: Record<string, unknown>): Promise<T> {
   try {
     return await invoke<T>(command, args);
   } catch (err) {
-    throw err instanceof Error ? err : new Error(String(err));
+    throw toApiError(err);
   }
 }
 
@@ -51,8 +64,10 @@ export function createTauriApi(): Api {
     exportFile: (dest) => call("export_file", { dest }),
     liveCodes: () => call("live_codes"),
     bwPrepare: () => call("bw_prepare"),
+    bwCancel: () => call("bw_cancel"),
     bwLogin: (login) => call("bw_login", { login }),
     bwPropose: () => call("bw_propose"),
+    bwLogins: () => call("bw_logins"),
     bwApply: (decisions) => call("bw_apply", { decisions }),
     onBwProgress: (cb) => subscribe<string>(BW_PROGRESS_EVENT, cb),
     cleanup: () => call("cleanup"),

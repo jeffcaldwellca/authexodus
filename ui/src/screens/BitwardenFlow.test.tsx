@@ -106,7 +106,12 @@ describe("bitwarden path", () => {
     const { user } = await toReview({ applyResults: [new Error("session expired")] });
     await user.selectOptions(screen.getByRole("combobox", { name: t.actionFor("Google") }), t.skip);
     await user.click(screen.getByRole("button", { name: t.apply }));
-    await screen.findByText(en.failures.bitwardenServer.detail("session expired"));
+    // Refused outright, with no code: the raw reason is shown, not a claim that it stopped part-way.
+    const alert = await screen.findByRole("alert");
+    expect(within(alert).getByText(t.applyRejected)).toBeInTheDocument();
+    expect(within(alert).getByText(en.problems.reason("session expired"))).toBeInTheDocument();
+    expect(screen.getByRole("heading", { level: 1, name: t.reportStoppedTitle })).toBeInTheDocument();
+    expect(screen.queryByText(en.failures.bitwardenServer.title)).not.toBeInTheDocument();
     expect(screen.getByRole("button", { name: t.runAgain })).toBeInTheDocument();
   });
 
@@ -129,6 +134,7 @@ describe("bitwarden path", () => {
     expect(screen.getByText(t.twoStepLimit)).toBeInTheDocument();
     expect(t.twoStepLimit).toMatch(/only codes from an authenticator app work here/);
     expect(t.twoStepLimit).toMatch(/Save a file for another app, then Bitwarden/);
+    expect(t.twoStepLimit).toMatch(/sign in with an API key instead/);
     expect(screen.getByText(t.loginLede)).toBeInTheDocument();
     expect(t.loginLede).toMatch(/does not keep it/);
   });
@@ -210,7 +216,10 @@ describe("bitwarden path", () => {
     api.bwLogin = async () => { throw new Error("bw: unexpected output"); };
     await user.click(screen.getByRole("button", { name: t.signIn }));
     await screen.findByText(t.loginFailed);
-    expect(t.loginFailed).toMatch(/Save a file for another app, then Bitwarden/);
+    // A rejection with no code: the shell's text is shown as the reason, never swallowed.
+    expect(screen.getByText(en.problems.reason("bw: unexpected output"))).toBeInTheDocument();
+    expect(screen.getByText(t.loginFailedAdvice)).toBeInTheDocument();
+    expect(t.loginFailedAdvice).toMatch(/Save a file for another app, then Bitwarden/);
     expect(screen.getByLabelText(t.password)).toHaveValue("");
     expect(passwordOnPage()).toBe(false);
   });

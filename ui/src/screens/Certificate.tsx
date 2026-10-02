@@ -3,6 +3,7 @@
 // A refused connection here is expected until the last step, so it only adds a calm reminder
 // under the guide; it never moves the picture the person is looking at.
 import type { Device } from "../api";
+import { DeviceSwitch } from "../components/DeviceSwitch";
 import { Callout, Guide, QrImage, Screen, Waiting, type GuideStep } from "../components/ui";
 import { DownloadPage, InstallProfile, ProfileDownloaded, TrustSettings } from "../device/scenes";
 import { ConnectionNotices } from "../failures/ConnectionNotices";
@@ -24,7 +25,7 @@ export function fingerprintLines(fingerprint: string): string[] {
   return lines;
 }
 
-export function Certificate({ state, dispatch, proxy, onRestart, restart }: ScreenProps) {
+export function Certificate({ api, state, dispatch, proxy, onRestart, restart, restartError }: ScreenProps) {
   const device: Device = state.device ?? "iphone";
   const d = deviceLabel(state.device);
   const help = { d, ip: proxy?.ip, port: proxy?.port };
@@ -66,7 +67,8 @@ export function Certificate({ state, dispatch, proxy, onRestart, restart }: Scre
         </>
       }
     >
-      <ConnectionNotices d={d} state={state} restart={restart} onRestart={() => onRestart()} />
+      <DeviceSwitch api={api} state={state} dispatch={dispatch} />
+      <ConnectionNotices d={d} state={state} restart={restart} restartError={restartError} onRestart={() => onRestart()} />
       {proxy && (
         <div className="fingerprint-box">
           <p className="values-caption">{t.fingerprintLabel}</p>

@@ -4,9 +4,12 @@
 // is showing.
 import { useEffect, useState } from "react";
 import type { LiveCode } from "../api";
+import { asApiError, type ApiError } from "../api.errors";
 import { Callout, Screen, Waiting } from "../components/ui";
+import { Problem } from "../failures/Problem";
 import { en } from "../strings/en";
-import type { ScreenProps } from "./types";
+import { cantMoveCount } from "../wizard/machine";
+import { deviceLabel, type ScreenProps } from "./types";
 
 const t = en.verify;
 
@@ -22,7 +25,9 @@ function grouped(code: string): string {
 
 export function Verify({ api, state, dispatch }: ScreenProps) {
   const [codes, setCodes] = useState<Map<string, LiveCode> | null>(null);
-  const [failed, setFailed] = useState(false);
+  const [failure, setFailure] = useState<ApiError | null>(null);
+  const failed = failure !== null;
+  const cantMove = cantMoveCount(state);
 
   useEffect(() => {
     let live = true;
@@ -32,14 +37,14 @@ export function Verify({ api, state, dispatch }: ScreenProps) {
         .then((list) => {
           if (!live) return;
           setCodes(new Map(list.map((c) => [c.id, c])));
-          setFailed(false);
+          setFailure(null);
           // `secondsLeft` is whole seconds, so in the last second poll quickly to catch the change.
           const soonest = Math.min(...list.map((c) => c.secondsLeft), Infinity);
           timer = setTimeout(refresh, soonest <= 1 ? REFRESH_NEAR_CHANGE_MS : REFRESH_MS);
         })
-        .catch(() => {
+        .catch((err: unknown) => {
           if (!live) return;
-          setFailed(true);
+          setFailure(asApiError(err));
           timer = setTimeout(refresh, REFRESH_MS);
         });
     };
@@ -60,7 +65,13 @@ export function Verify({ api, state, dispatch }: ScreenProps) {
         </>
       }
     >
-      {failed && <Callout tone="error" title={t.failed} alert />}
+      {failure && (
+        <Problem error={failure} d={deviceLabel(state.device)} title={t.failed}>
+          {failure.code === "not_unlocked" && (
+            <button type="button" className="secondary" onClick={() => dispatch({ type: "locked" })}>{en.common.unlockAgain}</button>
+          )}
+        </Problem>
+      )}
       {codes === null && !failed && <Waiting>{t.loading}</Waiting>}
       {codes !== null && (
         <ul className="codes" aria-label={t.listLabel}>
@@ -87,7 +98,7 @@ export function Verify({ api, state, dispatch }: ScreenProps) {
         </ul>
       )}
       <Callout tone="info"><p>{t.mismatch}</p></Callout>
-      {state.cantMove > 0 && <p className="quiet-text">{t.cantMove(state.cantMove)}</p>}
+      {cantMove > 0 && <p className="quiet-text">{t.cantMove(cantMove)}</p>}
     </Screen>
   );
 }

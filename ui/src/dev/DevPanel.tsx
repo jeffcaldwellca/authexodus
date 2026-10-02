@@ -1,8 +1,10 @@
 // Dev-only: stands in for the phone when the wizard runs against the fake in a plain browser.
 // It is never loaded inside Tauri.
 import { useState } from "react";
+import { ApiError } from "../api.errors";
 import { FAKE_PASSWORD, type FakeApi } from "../api.fake";
 import { dev as t } from "../strings/dev";
+import "./dev.css";
 
 export function DevPanel({ api }: { api: FakeApi }) {
   const [open, setOpen] = useState(true);
@@ -22,7 +24,11 @@ export function DevPanel({ api }: { api: FakeApi }) {
         <button type="button" onClick={() => api.emitProxyEvent({ kind: "trustWorking" })}>{t.trustWorking}</button>
         <button type="button" onClick={() => api.emitProxyEvent({ kind: "authyError", status: 400, path: "/json/users/new" })}>{t.authyError}</button>
         <button type="button" onClick={() => api.emitProxyEvent({ kind: "deviceRefused" })}>{t.deviceRefused}</button>
+        <button type="button" onClick={() => api.emitProxyEvent({ kind: "emptyBackup" })}>{t.emptyBackup}</button>
+        <button type="button" onClick={() => api.emitProxyEvent({ kind: "addressChanged" })}>{t.addressChanged}</button>
         <button type="button" onClick={() => api.emitProxyEvent({ kind: "backupCaptured", count: api.script.summary.tokens.length + 2 })}>{t.backupCaptured}</button>
+        <button type="button" onClick={() => { api.script.loginResults.push({ kind: "needsApiKey" }); }}>{t.bwNeedsKey}</button>
+        <button type="button" onClick={() => { (api.script.failures.bwApply ??= []).push(new ApiError("bw_session_expired", t.bwExpiredMessage)); }}>{t.bwExpire}</button>
         <button type="button" onClick={() => { api.script.applyResults.push({ attached: 2, created: 0, skipped: 0, kept: [], failed: t.bwFailMessage }); }}>{t.bwFail}</button>
       </div>
     </aside>

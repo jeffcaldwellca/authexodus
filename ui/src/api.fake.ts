@@ -3,8 +3,12 @@
 // codes are patterns that scan to nothing, and the "live codes" are arithmetic on the clock.
 import type {
   Api, AppState, ApplyReport, BwLogin, BwLoginResult, Decision, Destination, Device, LiveCode,
-  Proposal, ProxyEvent, ProxyInfo, TokenView, UnlockSummary,
+  Proposal, ProxyEvent, ProxyInfo, SessionSnapshot, Step, TokenView, UnlockSummary, VaultLoginView,
 } from "./api";
+import { ApiError } from "./api.errors";
+
+/** The commands of the contract: everything except the two subscriptions. */
+export type FakeMethod = Exclude<keyof Api, "onProxyEvent" | "onBwProgress">;
 
 /** Everything a test (or the dev build) can script. All fields have walkable defaults. */
 export type FakeScript = {
@@ -13,7 +17,11 @@ export type FakeScript = {
   summary: UnlockSummary;
   addresses: { ip: string; label: string }[];
   port: number;
+  /** What `ProxyInfo.certConstrained` says. */
+  certConstrained: boolean;
   proposals: Proposal[];
+  /** Every login in the vault, for `bwLogins`. When null, the logins the proposals mention. */
+  vault: VaultLoginView[] | null;
   /** Answers for successive `bwLogin` calls. When empty, login succeeds. */
   loginResults: BwLoginResult[];
   /** Answers for successive `bwApply` calls. When empty, the report is worked out from the decisions. */
@@ -22,13 +30,25 @@ export type FakeScript = {
   exportResults: ({ saved: string } | { cancelled: true })[];
   /** Titles the Google transfer codes cannot carry. */
   googleUnsupported: string[];
+  /** What `tokenQr` and `googleMigrationQrs` hand back instead of drawings, when set. */
+  qrSvg: string | null;
+  googlePages: string[] | null;
+  /**
+   * Rejections, per command, used up one per call in order: an `ApiError` as the shell would
+   * send it, or a bare string for a rejection with no code (which arrives as `internal`).
+   */
+  failures: Partial<Record<FakeMethod, (ApiError | string)[]>>;
   /** Makes `bwPrepare` fail with this message. */
   prepareError: string | null;
+  /** Progress lines `bwPrepare` reports while it works. */
+  prepareProgress: string[];
+  /** Calls named here do not answer until `release` or `bwCancel`. */
+  hold: Partial<Record<"bwPrepare" | "bwLogin", boolean>>;
   /** Makes the next `restartProxy` calls fail with these messages, in order. */
   restartErrors: string[];
   /** Runs inside `restartProxy` before it answers, e.g. to emit events from the "new proxy". */
   beforeRestartResolves: (() => void) | null;
-  /** Makes `liveCodes` fail with this message. */
+  /** Makes `liveCodes` fail with this message, every time, until cleared. */
   liveCodesError: string | null;
   /** Makes `cleanup` fail with this message, once. */
   cleanupError: string | null;
@@ -45,6 +65,8 @@ export type FakeApi = Api & {
   emitProxyEvent(e: ProxyEvent): void;
   /** Test hook: push a Bitwarden progress line to every subscriber. */
   emitBwProgress(line: string): void;
+  /** Test hook: let a held `bwPrepare` or `bwLogin` answer. */
+  release(method: "bwPrepare" | "bwLogin"): void;
   /** Every call made so far, in order. */
   calls: FakeCall[];
   /** The live script. Tests may change it between calls. */
@@ -101,12 +123,19 @@ function defaultScript(): FakeScript {
     },
     addresses: [{ ip: "192.168.4.109", label: "Wi-Fi" }, { ip: "10.0.0.12", label: "Ethernet" }],
     port: 8080,
+    certConstrained: true,
     proposals: PROPOSALS.map((p) => ({ ...p, candidates: p.candidates.map((c) => ({ ...c })) })),
+    vault: null,
     loginResults: [],
     applyResults: [],
     exportResults: [],
     googleUnsupported: [],
+    qrSvg: null,
+    googlePages: null,
+    failures: {},
     prepareError: null,
+    prepareProgress: ["Downloading Bitwarden's tool…", "Checking the download…", "Unpacking…"],
+    hold: {},
     restartErrors: [],
     beforeRestartResolves: null,
     liveCodesError: null,
@@ -152,35 +181,57 @@ export function fakeQrSvg(seed: string): string {
 }
 
 const FILE_NAMES: Record<Destination, string> = {
-  bitwarden: "authy-export-bitwarden.json",
-  onePassword: "authy-export-1password.csv",
-  twoFas: "authy-export.2fas",
-  aegis: "authy-export-aegis.json",
-  googleAuthenticator: "authy-export-google.txt",
-  protonAuthenticator: "authy-export-proton.json",
-  plainText: "authy-export-otpauth.txt",
+  bitwarden: "authy-bitwarden-import.csv",
+  onePassword: "authy-1password-import.csv",
+  twoFas: "authy-2fas-backup.2fas",
+  aegis: "authy-aegis-import.json",
+  googleAuthenticator: "authy-google.txt",
+  protonAuthenticator: "authy-proton-authenticator-import.json",
+  plainText: "authy-otpauth-uris.txt",
 };
 
+const ORDER: Step[] = ["welcome", "connect", "certificate", "authy", "unlock", "destination", "verify", "cleanup", "done"];
+const noSession = (): SessionSnapshot => ({ proxy: null, deviceConnected: false, trustWorking: false, captured: 0, summary: null });
+
 export function createFakeApi(initial: Partial<AppState> = {}, overrides: Partial<FakeScript> = {}): FakeApi {
+  // Like the shell, `resumeCleanup` is decided once, at launch: it says a marker was found
+  // then. Starting the proxy writes a marker for the next launch, and does not change this.
   const state: AppState = {
     step: "welcome", device: null, resumeCleanup: false, version: "0.0.0-fake",
-    releasesUrl: "https://example.com/authexodus/releases", ...initial,
+    releasesUrl: "https://example.com/authexodus/releases", session: noSession(), ...initial,
   };
+  const session = state.session;
   const script: FakeScript = { ...defaultScript(), ...overrides };
   const proxyListeners = new Set<(e: ProxyEvent) => void>();
   const bwListeners = new Set<(line: string) => void>();
   const calls: FakeCall[] = [];
-  let chosenIp: string | null = null;
-  let unlocked = false;
-  /** A backup has passed through the proxy, so the address can no longer change quietly. */
-  let captured = false;
+  let chosenIp: string | null = session.proxy?.ip ?? null;
+  let unlocked = session.summary !== null;
+  /** Signed in to the pretend Bitwarden. */
+  let signedIn = false;
   /** Vault items the fake Bitwarden has already been given a code for, so re-runs add nothing twice. */
   const applied = new Set<string>();
+  /** Calls waiting on `release` or `bwCancel`. */
+  const held = new Map<"bwPrepare" | "bwLogin", { resolve: () => void; reject: (e: ApiError) => void }>();
+  let cancels = 0;
 
   const pause = () => (script.delayMs > 0 ? new Promise<void>((r) => setTimeout(r, script.delayMs)) : Promise.resolve());
   const record = (method: keyof Api, ...args: unknown[]) => { calls.push({ method, args }); return pause(); };
   const emitBw = (line: string) => bwListeners.forEach((l) => l(line));
   const titleOf = (tokenId: string) => script.summary.tokens.find((t) => t.id === tokenId)?.title ?? tokenId;
+  /** The wizard only ever moves forward in the shell's eyes, except for a restart. */
+  const advance = (to: Step) => { if (ORDER.indexOf(to) > ORDER.indexOf(state.step)) state.step = to; };
+  /** Throws the next scripted rejection for `method`, if there is one. */
+  const failIfScripted = (method: FakeMethod) => {
+    const next = script.failures[method]?.shift();
+    if (next !== undefined) throw typeof next === "string" ? new ApiError("internal", next) : next;
+  };
+  const cancelled = () => new ApiError("bw_failed", "Cancelled.");
+  /** Waits for `release` when the call is held; rejects when `bwCancel` arrives first. */
+  const holdIfAsked = async (method: "bwPrepare" | "bwLogin") => {
+    if (!script.hold[method]) return;
+    await new Promise<void>((resolve, reject) => { held.set(method, { resolve, reject }); });
+  };
 
   function proxyInfo(): ProxyInfo {
     const ip = chosenIp ?? script.addresses[0]?.ip ?? "192.168.4.109";
@@ -192,22 +243,39 @@ export function createFakeApi(initial: Partial<AppState> = {}, overrides: Partia
       certQrSvg: fakeQrSvg(`cert:${ip}:${script.port}`),
       checkUrl: "https://authexodus-check.api.authy.com/",
       certFingerprint: FAKE_FINGERPRINT,
+      certConstrained: script.certConstrained,
     };
   }
 
+  function vault(): VaultLoginView[] {
+    if (script.vault) return script.vault.map((v) => ({ ...v }));
+    const seen = new Map<string, VaultLoginView>();
+    for (const p of script.proposals) for (const c of p.candidates) if (!seen.has(c.itemId)) seen.set(c.itemId, { ...c });
+    return [...seen.values()];
+  }
+
+  // As the shell counts: `skipped` is only what the person skipped; a code that is already in
+  // Bitwarden comes back in `kept`, one sentence each.
   function workOutReport(decisions: { tokenId: string; decision: Decision }[]): ApplyReport {
     const report: ApplyReport = { attached: 0, created: 0, skipped: 0, kept: [], failed: null };
+    const logins = vault();
     for (const { tokenId, decision } of decisions) {
       const title = titleOf(tokenId);
       if (decision.kind === "skip") { report.skipped++; continue; }
-      if (applied.has(tokenId)) continue;
+      if (applied.has(tokenId)) {
+        report.kept.push(`${title} is already in Bitwarden from an earlier run.`);
+        continue;
+      }
       if (decision.kind === "createNew") {
         report.created++;
         emitBw(`Created ${title}`);
       } else {
-        const proposal = script.proposals.find((p) => p.tokenId === tokenId);
-        const target = proposal?.candidates.find((c) => c.itemId === decision.itemId);
-        if (target?.hasCode) { report.kept.push(target.name); emitBw(`Kept ${target.name}`); continue; }
+        const target = logins.find((c) => c.itemId === decision.itemId);
+        if (target?.hasCode) {
+          report.kept.push(`${target.name} already has a code, so ${title} was not added to it.`);
+          emitBw(`Kept ${target.name}`);
+          continue;
+        }
         report.attached++;
         emitBw(`Attached ${title}`);
       }
@@ -216,57 +284,87 @@ export function createFakeApi(initial: Partial<AppState> = {}, overrides: Partia
     return report;
   }
 
+  const requireSession = () => {
+    if (!signedIn) throw new ApiError("bw_session_expired", "Bitwarden's session has ended. Sign in again.");
+  };
+
   return {
     calls,
     script,
-    async getState() { await record("getState"); return { ...state }; },
+    async getState() {
+      await record("getState");
+      failIfScripted("getState");
+      return structuredClone(state);
+    },
     async setDevice(device: Device) { await record("setDevice", device); state.device = device; },
     async startProxy(ip?: string) {
       await record("startProxy", ip);
-      if (captured && ip !== undefined && ip !== proxyInfo().ip) {
-        throw new Error("a backup is already captured; restart the proxy to change address");
+      failIfScripted("startProxy");
+      if (session.captured > 0 && ip !== undefined && ip !== proxyInfo().ip) {
+        throw new ApiError("capture_would_be_lost", "A backup is already captured. Restart the connection to change the address.");
+      }
+      if (ip !== undefined && !script.addresses.some((a) => a.ip === ip)) {
+        throw new ApiError("address_changed", "That address is no longer one of this computer's network addresses.");
       }
       if (ip !== undefined) chosenIp = ip;
-      // The resume marker exists from the moment the certificate is created: the first start.
-      state.resumeCleanup = true;
+      session.proxy = proxyInfo();
+      advance("connect");
       return proxyInfo();
     },
     async restartProxy(ip?: string) {
       await record("restartProxy", ip);
+      failIfScripted("restartProxy");
       const failure = script.restartErrors.shift();
-      if (failure !== undefined) throw new Error(failure);
+      if (failure !== undefined) throw new ApiError("internal", failure);
       if (ip !== undefined && !script.addresses.some((a) => a.ip === ip)) {
-        throw new Error("That address is not one of this computer's network addresses.");
+        throw new ApiError("address_changed", "That address is no longer one of this computer's network addresses.");
       }
       chosenIp = ip ?? null;
-      script.beforeRestartResolves?.();
-      captured = false;
+      // A start-over: the capture and the accepted device are forgotten, and so is the unlock.
+      Object.assign(session, noSession(), { proxy: proxyInfo() });
       unlocked = false;
-      state.resumeCleanup = true;
+      state.step = "connect";
+      script.beforeRestartResolves?.();
       return proxyInfo();
     },
     onProxyEvent(cb) { proxyListeners.add(cb); return () => { proxyListeners.delete(cb); }; },
     async unlock(password: string) {
       await record("unlock", password);
+      failIfScripted("unlock");
       if (password !== script.password) return { error: "wrongPassword" as const };
       unlocked = true;
+      session.summary = structuredClone(script.summary);
+      advance("destination");
       return structuredClone(script.summary);
     },
-    async tokenQr(id: string) { await record("tokenQr", id); return fakeQrSvg(`token:${id}`); },
+    async tokenQr(id: string) {
+      await record("tokenQr", id);
+      failIfScripted("tokenQr");
+      return script.qrSvg ?? fakeQrSvg(`token:${id}`);
+    },
     async googleMigrationQrs() {
       await record("googleMigrationQrs");
+      failIfScripted("googleMigrationQrs");
+      if (script.googlePages) return [...script.googlePages];
       const pages = Math.max(1, Math.ceil(script.summary.tokens.length / 10));
       return Array.from({ length: pages }, (_, i) => fakeQrSvg(`google:${i}`));
     },
-    async googleUnsupported() { await record("googleUnsupported"); return [...script.googleUnsupported]; },
+    async googleUnsupported() {
+      await record("googleUnsupported");
+      failIfScripted("googleUnsupported");
+      return [...script.googleUnsupported];
+    },
     async exportFile(dest: Destination) {
       await record("exportFile", dest);
+      failIfScripted("exportFile");
       return script.exportResults.shift() ?? { saved: `/Users/sam/Downloads/${FILE_NAMES[dest]}` };
     },
     async liveCodes(): Promise<LiveCode[]> {
       await record("liveCodes");
-      if (script.liveCodesError) throw new Error(script.liveCodesError);
+      failIfScripted("liveCodes");
+      if (script.liveCodesError) throw new ApiError("internal", script.liveCodesError);
       if (!unlocked) return [];
+      advance("verify");
       const seconds = Math.floor(script.now() / 1000);
       const window = Math.floor(seconds / 30);
       return script.summary.tokens.map((t) => ({
@@ -276,16 +374,55 @@ export function createFakeApi(initial: Partial<AppState> = {}, overrides: Partia
       }));
     },
     async bwPrepare() {
+      const mine = cancels;
       await record("bwPrepare");
-      if (script.prepareError) throw new Error(script.prepareError);
+      for (const line of script.prepareProgress) {
+        emitBw(line);
+        await pause();
+        if (cancels !== mine) throw cancelled();
+      }
+      await holdIfAsked("bwPrepare");
+      failIfScripted("bwPrepare");
+      if (script.prepareError) throw new ApiError("bw_download_failed", script.prepareError);
+    },
+    async bwCancel() {
+      await record("bwCancel");
+      cancels++;
+      for (const [method, waiting] of held) { held.delete(method); waiting.reject(cancelled()); }
     },
     async bwLogin(login: BwLogin): Promise<BwLoginResult> {
-      await record("bwLogin", login);
-      return script.loginResults.shift() ?? { kind: "ok" };
+      const mine = cancels;
+      // The record keeps what was sent, not the object the caller may go on to change.
+      await record("bwLogin", structuredClone(login));
+      await holdIfAsked("bwLogin");
+      if (cancels !== mine) throw cancelled();
+      failIfScripted("bwLogin");
+      const result = script.loginResults.shift() ?? { kind: "ok" as const };
+      if (result.kind === "ok") signedIn = true;
+      return result;
     },
-    async bwPropose(): Promise<Proposal[]> { await record("bwPropose"); return structuredClone(script.proposals); },
+    async bwPropose(): Promise<Proposal[]> {
+      await record("bwPropose");
+      failIfScripted("bwPropose");
+      requireSession();
+      return structuredClone(script.proposals);
+    },
+    async bwLogins(): Promise<VaultLoginView[]> {
+      await record("bwLogins");
+      failIfScripted("bwLogins");
+      requireSession();
+      return vault();
+    },
     async bwApply(decisions) {
       await record("bwApply", decisions);
+      try {
+        failIfScripted("bwApply");
+      } catch (err) {
+        // An expired session is exactly that: the next call needs a fresh sign-in.
+        if (err instanceof ApiError && err.code === "bw_session_expired") signedIn = false;
+        throw err;
+      }
+      requireSession();
       const scripted = script.applyResults.shift();
       if (scripted instanceof Error) throw scripted;
       return scripted ?? workOutReport(decisions);
@@ -293,18 +430,35 @@ export function createFakeApi(initial: Partial<AppState> = {}, overrides: Partia
     onBwProgress(cb) { bwListeners.add(cb); return () => { bwListeners.delete(cb); }; },
     async cleanup() {
       await record("cleanup");
+      failIfScripted("cleanup");
       if (script.cleanupError) {
         const message = script.cleanupError;
         script.cleanupError = null;
-        throw new Error(message);
+        throw new ApiError("cleanup_keychain_failed", message);
       }
       unlocked = false;
+      signedIn = false;
+      Object.assign(session, noSession());
+      advance("cleanup");
     },
-    async finish() { await record("finish"); state.resumeCleanup = false; },
+    async finish() {
+      await record("finish");
+      failIfScripted("finish");
+      state.resumeCleanup = false;
+      advance("done");
+    },
     emitProxyEvent(e) {
-      if (e.kind === "backupCaptured" && e.count > 0) captured = true;
+      // The shell's snapshot follows the same events the window is sent.
+      if (e.kind === "deviceConnected") { session.deviceConnected = true; advance("certificate"); }
+      if (e.kind === "trustWorking") { session.deviceConnected = true; session.trustWorking = true; advance("authy"); }
+      if (e.kind === "backupCaptured" && e.count > 0) { session.captured = Math.max(session.captured, e.count); advance("unlock"); }
       proxyListeners.forEach((l) => l(e));
     },
     emitBwProgress: emitBw,
+    release(method) {
+      const waiting = held.get(method);
+      held.delete(method);
+      waiting?.resolve();
+    },
   };
 }

@@ -48,7 +48,7 @@ describe("destination", () => {
     await user.click(screen.getByRole("button", { name: new RegExp(en.destination.options.file.title) }));
     expect(screen.getByText(en.destination.file.warning)).toBeInTheDocument();
     await user.click(screen.getByRole("button", { name: en.destination.file.save(en.destination.file.apps.aegis) }));
-    await screen.findByText(en.destination.file.saved("/Users/sam/Downloads/authy-export-aegis.json"));
+    await screen.findByText(en.destination.file.saved("/Users/sam/Downloads/authy-aegis-import.json"));
     expect(api.calls.find((c) => c.method === "exportFile")?.args).toEqual(["aegis"]);
 
     await user.click(screen.getByRole("button", { name: en.common.done }));
@@ -103,7 +103,7 @@ describe("verify", () => {
     if ("error" in summary) throw new Error("fake rejected its own password");
     api.calls.length = 0;
     const state = { ...initialState(), step: "verify" as const, summary };
-    render(<Verify api={api} state={state} dispatch={() => undefined} proxy={null} onRestart={() => undefined} restart="idle" />);
+    render(<Verify api={api} state={state} dispatch={() => undefined} proxy={null} onRestart={() => undefined} restart="idle" restartError={null} certConstrained={null} />);
     await act(async () => { await vi.advanceTimersByTimeAsync(0); });
     return api;
   }

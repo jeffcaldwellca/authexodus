@@ -1,8 +1,18 @@
-import type { UnlockSummary } from "../api";
+import type { AppState, ProxyInfo, SessionSnapshot, UnlockSummary } from "../api";
 import {
-  BROKEN_AFTER, CHECK_IDS, canFinish, canLeaveDestination, canStart, cleanupItems, initialState, reduce, troubleFor,
+  BROKEN_AFTER, CHECK_IDS, canFinish, canLeaveDestination, canStart, cantMoveCount, cleanupItems, initialState, reduce, troubleFor,
   type WizardEvent, type WizardState,
 } from "./machine";
+
+const PROXY: ProxyInfo = {
+  addresses: [{ ip: "192.168.4.109", label: "Wi-Fi" }], ip: "192.168.4.109", port: 8080, certUrl: "http://192.168.4.109:8080/",
+  certQrSvg: "<svg/>", checkUrl: "https://check/", certFingerprint: "AB", certConstrained: true,
+};
+const NO_SESSION: SessionSnapshot = { proxy: null, deviceConnected: false, trustWorking: false, captured: 0, summary: null };
+function app(over: Partial<AppState> = {}, session: Partial<SessionSnapshot> = {}): AppState {
+  return { step: "welcome", device: "ipad", resumeCleanup: false, version: "1.2.3", releasesUrl: "https://example.com/r",
+    session: { ...NO_SESSION, ...session }, ...over };
+}
 
 const summary: UnlockSummary = { tokens: [{ id: "t1", title: "GitHub", username: "sam" }], invalid: [], native: [] };
 
@@ -176,9 +186,7 @@ describe("wizard machine", () => {
   });
 
   it("resume_starts_at_cleanup", () => {
-    const s = reduce(initialState(), {
-      type: "loaded", app: { step: "welcome", device: "ipad", resumeCleanup: true, version: "1.2.3", releasesUrl: "https://example.com/r" },
-    });
+    const s = reduce(initialState(), { type: "loaded", app: app({ resumeCleanup: true }) });
     expect(s.step).toBe("cleanup");
     expect(s.resumed).toBe(true);
     expect(s.device).toBe("ipad");
@@ -187,9 +195,7 @@ describe("wizard machine", () => {
     // After a resume we cannot know whether Authy was deleted, so cleanup asks about it.
     expect(cleanupItems(s)).toContain("authySignedIn");
 
-    const fresh = reduce(initialState(), {
-      type: "loaded", app: { step: "welcome", device: null, resumeCleanup: false, version: "1.2.3", releasesUrl: "https://example.com/r" },
-    });
+    const fresh = reduce(initialState(), { type: "loaded", app: app({ device: null }) });
     expect(fresh.step).toBe("welcome");
     expect(fresh.resumed).toBe(false);
   });
@@ -237,8 +243,29 @@ describe("wizard machine", () => {
     expect(reduce(at("verify"), { type: "abandon" }).step).toBe("verify");
   });
 
+  it("the destination step can be abandoned too, without moving anything, and keeps the names that cannot move", () => {
+    const full: UnlockSummary = { tokens: summary.tokens, invalid: [{ name: "Old VPN", reason: "tooShort" }], native: [{ name: "Twitch" }] };
+    const s = run(at("unlock"), { type: "unlocked", summary: full }, { type: "abandon" });
+    expect(s).toMatchObject({ step: "cleanup", summary: null, moved: false, cantMove: { native: ["Twitch"], invalid: ["Old VPN"] } });
+  });
+
+  it("goes back from destination to unlock only while nothing has been moved", () => {
+    const back = reduce(at("destination"), { type: "backToUnlock" });
+    expect(back).toMatchObject({ step: "unlock", summary: null, captured: 3 });
+    const moved = run(at("destination"), { type: "moved" }, { type: "backToUnlock" });
+    expect(moved.step).toBe("destination");
+    expect(reduce(at("verify"), { type: "backToUnlock" }).step).toBe("verify");
+  });
+
+  it("codes that are no longer unlocked send the person back to unlock", () => {
+    expect(reduce(at("destination"), { type: "locked" })).toMatchObject({ step: "unlock", summary: null });
+    expect(reduce(at("verify"), { type: "locked" })).toMatchObject({ step: "unlock", summary: null });
+    expect(reduce(at("authy"), { type: "locked" }).step).toBe("authy");
+  });
+
   it("cleanup asks about Authy only once the person was told to delete it", () => {
-    expect(cleanupItems(reduce(at("connect"), { type: "abandon" }))).toEqual(["proxyOff", "profileRemoved"]);
+    // No device ever connected: no certificate can have been installed, so that tick is not asked for.
+    expect(cleanupItems(reduce(at("connect"), { type: "abandon" }))).toEqual(["proxyOff"]);
     expect(cleanupItems(reduce(at("certificate"), { type: "abandon" }))).toEqual(["proxyOff", "profileRemoved"]);
     expect(cleanupItems(reduce(at("authy"), { type: "abandon" }))).toContain("authySignedIn");
     expect(cleanupItems(reduce(at("unlock"), { type: "abandon" }))).toContain("authySignedIn");
@@ -256,9 +283,7 @@ describe("wizard machine", () => {
   });
 
   it("a resumed cleanup also asks about a saved file, since the app no longer knows", () => {
-    const s = reduce(initialState(), {
-      type: "loaded", app: { step: "welcome", device: null, resumeCleanup: true, version: "1", releasesUrl: "" },
-    });
+    const s = reduce(initialState(), { type: "loaded", app: app({ device: null, resumeCleanup: true }) });
     expect(cleanupItems(s)).toEqual(["proxyOff", "profileRemoved", "authySignedIn", "fileDeleted"]);
   });
 
@@ -266,10 +291,14 @@ describe("wizard machine", () => {
     let s = run(at("unlock"), { type: "unlocked", summary: {
       tokens: [{ id: "a", title: "A", username: null }], invalid: [{ name: "X", reason: "tooShort" }], native: [{ name: "Twitch" }],
     } });
-    expect(s.cantMove).toBe(2);
+    expect(cantMoveCount(s)).toBe(2);
     s = run(s, { type: "moved" }, { type: "destinationDone" }, { type: "verified" });
     expect(s.summary).toBeNull();
-    expect(s.cantMove).toBe(2);
+    // Names only, never keys: enough to tell the person at the end which accounts to set up again.
+    expect(s.cantMove).toEqual({ native: ["Twitch"], invalid: ["X"] });
+    expect(cantMoveCount(s)).toBe(2);
+    expect(reduce(run(s, ...(["proxyOff", "profileRemoved", "authySignedIn"] as const).map((id): WizardEvent => ({ type: "setCleanup", id, value: true }))), { type: "finish" }).cantMove)
+      .toEqual({ native: ["Twitch"], invalid: ["X"] });
   });
 
   it("with nothing to move, the destination step can be left", () => {
@@ -281,5 +310,119 @@ describe("wizard machine", () => {
   it("drops the unlock summary when cleanup begins", () => {
     expect(at("verify").summary).not.toBeNull();
     expect(at("cleanup").summary).toBeNull();
+  });
+
+  describe("after a window reload, the wizard is rebuilt from what the shell knows", () => {
+    const full: UnlockSummary = { tokens: summary.tokens, invalid: [{ name: "Old VPN", reason: "notBase32" }], native: [{ name: "Twitch" }] };
+    const load = (session: Partial<SessionSnapshot>, over: Partial<AppState> = {}) =>
+      reduce(initialState(), { type: "loaded", app: app(over, { proxy: PROXY, ...session }) });
+
+    it("a running proxy and nothing else is the connect step, with the device kept", () => {
+      expect(load({})).toMatchObject({ step: "connect", device: "ipad", recovered: true, resumed: false, reachedCertificate: false });
+    });
+
+    it("a connected device is the certificate step", () => {
+      expect(load({ deviceConnected: true })).toMatchObject({ step: "certificate", reachedCertificate: true, trustProven: false, reachedAuthy: false });
+    });
+
+    it("trust seen working is the Authy step", () => {
+      expect(load({ deviceConnected: true, trustWorking: true }))
+        .toMatchObject({ step: "authy", trustProven: true, certificateInstalled: true, reachedAuthy: true, reachedCertificate: true });
+    });
+
+    it("a captured backup is the unlock step, with its count", () => {
+      expect(load({ deviceConnected: true, trustWorking: true, captured: 12 })).toMatchObject({ step: "unlock", captured: 12, reachedAuthy: true });
+    });
+
+    it("a capture holding only accounts that cannot move counts none, and is still the unlock step", () => {
+      // The shell's count is of movable accounts; its step says a backup is waiting.
+      expect(load({ deviceConnected: true, trustWorking: true, captured: 0 }, { step: "unlock" })).toMatchObject({ step: "unlock", captured: 0 });
+      expect(load({ deviceConnected: true, trustWorking: true, captured: 0 }, { step: "authy" }).step).toBe("authy");
+    });
+
+    it("an unlocked backup is the destination step, with the names and the summary", () => {
+      const s = load({ deviceConnected: true, trustWorking: true, captured: 3, summary: full });
+      expect(s).toMatchObject({ step: "destination", summary: full, cantMove: { native: ["Twitch"], invalid: ["Old VPN"] }, moved: false });
+      // The app cannot know whether a file was saved before the reload, so cleanup will ask.
+      expect(cleanupItems(reduce(s, { type: "abandon" }))).toEqual(["proxyOff", "profileRemoved", "authySignedIn", "fileDeleted"]);
+    });
+
+    it("a running proxy wins over the resume flag: a reload must never start the cleanup by itself", () => {
+      expect(load({ deviceConnected: true }, { resumeCleanup: true }).step).toBe("certificate");
+    });
+
+    it("a reload during cleanup stays on cleanup and asks about everything", () => {
+      const s = reduce(initialState(), { type: "loaded", app: app({ step: "cleanup" }) });
+      expect(s).toMatchObject({ step: "cleanup", resumed: false, recovered: true });
+      expect(cleanupItems(s)).toEqual(["proxyOff", "profileRemoved", "authySignedIn", "fileDeleted"]);
+    });
+
+    it("with no proxy and nothing to resume, it is a fresh start whatever step the shell last saw", () => {
+      expect(reduce(initialState(), { type: "loaded", app: app({ step: "done" }) }).step).toBe("welcome");
+      expect(reduce(initialState(), { type: "loaded", app: app({ step: "connect" }) })).toMatchObject({ step: "welcome", recovered: false });
+    });
+  });
+
+  it("the unlock step keeps counting: a later, larger capture updates the number", () => {
+    let s = at("unlock");
+    expect(s.captured).toBe(3);
+    s = reduce(s, { type: "proxy", event: { kind: "backupCaptured", count: 9 } });
+    expect(s).toMatchObject({ step: "unlock", captured: 9 });
+    s = reduce(s, { type: "proxy", event: { kind: "backupCaptured", count: 2 } });
+    expect(s.captured).toBe(9);
+    // Nothing else the proxy says moves the unlock step.
+    expect(reduce(s, { type: "proxy", event: { kind: "trustWorking" } })).toBe(s);
+  });
+
+  it("capture again: a restart from the unlock step goes back to connect and forgets the capture", () => {
+    expect(reduce(at("unlock"), { type: "restarting" })).toMatchObject({ step: "connect", captured: null, restarts: 1, reachedAuthy: true });
+  });
+
+  it("an empty backup is remembered on the waiting steps until a real one or a restart", () => {
+    let s = reduce(at("authy"), { type: "proxy", event: { kind: "emptyBackup" } });
+    expect(s).toMatchObject({ step: "authy", emptyBackup: true });
+    expect(troubleFor(s)).toBe("emptyBackup");
+    expect(reduce(s, { type: "restarting" }).emptyBackup).toBe(false);
+    s = reduce(s, { type: "proxy", event: { kind: "backupCaptured", count: 2 } });
+    expect(s).toMatchObject({ step: "unlock", emptyBackup: false });
+    expect(reduce(at("destination"), { type: "proxy", event: { kind: "emptyBackup" } }).emptyBackup).toBe(false);
+  });
+
+  it("a changed network address is flagged on the waiting steps and cleared by a restart", () => {
+    for (const step of ["connect", "certificate", "authy"] as const) {
+      const s = reduce(at(step), { type: "proxy", event: { kind: "addressChanged" } });
+      expect(s).toMatchObject({ step, addressChanged: true });
+      expect(reduce(s, { type: "restarting" })).toMatchObject({ step: "connect", addressChanged: false });
+    }
+    // Once the backup is captured the phone's connection no longer matters.
+    expect(reduce(at("unlock"), { type: "proxy", event: { kind: "addressChanged" } }).addressChanged).toBe(false);
+  });
+
+  it("the device can still be changed on connect and certificate, and not once Authy is to be deleted", () => {
+    expect(reduce(at("connect"), { type: "chooseDevice", device: "ipad" }).device).toBe("ipad");
+    expect(reduce(at("certificate"), { type: "chooseDevice", device: "ipad" }).device).toBe("ipad");
+    expect(reduce(at("certificate"), { type: "chooseDevice", device: "android" })).toMatchObject({ device: "iphone", android: false });
+    expect(reduce(at("authy"), { type: "chooseDevice", device: "ipad" }).device).toBe("iphone");
+    expect(reduce(at("destination"), { type: "chooseDevice", device: "ipad" }).device).toBe("iphone");
+  });
+
+  it("the certificate tick is asked for only when the certificate step was reached", () => {
+    expect(cleanupItems(reduce(at("connect"), { type: "abandon" }))).not.toContain("profileRemoved");
+    expect(cleanupItems(reduce(at("certificate"), { type: "abandon" }))).toContain("profileRemoved");
+    // Trust seen working after a restart skips the certificate screen; the certificate is still there.
+    const s = run(at("authy"), { type: "restarting" }, { type: "abandon" });
+    expect(cleanupItems(s)).toContain("profileRemoved");
+  });
+
+  it("start again after Done is a fresh run that keeps only the device, the version and the address", () => {
+    let s = at("cleanup");
+    for (const id of cleanupItems(s)) s = reduce(s, { type: "setCleanup", id, value: true });
+    s = reduce(s, { type: "finish" });
+    expect(s.step).toBe("done");
+    const fresh = reduce({ ...s, version: "1.2.3", releasesUrl: "https://example.com/r" }, { type: "startOver" });
+    expect(fresh).toEqual({ ...initialState(), device: "iphone", version: "1.2.3", releasesUrl: "https://example.com/r" });
+    expect(canStart(fresh)).toBe(false);
+    // Only from Done: anywhere else it would throw away a run that still needs cleaning up.
+    expect(reduce(at("authy"), { type: "startOver" }).step).toBe("authy");
   });
 });
