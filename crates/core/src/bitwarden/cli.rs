@@ -13,6 +13,15 @@
 //! The binary: `ensure_cli` extracts it afresh from the hash-checked zip into a folder only
 //! this user can open and records its SHA-256; the client checks the file against that hash at
 //! the start of every sign-in (not before every one of the many runs that follow it).
+//!
+//! Not yet portable: this module is written for macOS (it also works on other Unix systems).
+//! It compiles on Windows, where a sign-in answers [`BwError::UnsupportedPlatform`] before
+//! the tool is run. To port it:
+//! * [`INHERITED_ENV`] is `HOME`, `TMPDIR` and the locale; Windows needs `USERPROFILE`,
+//!   `APPDATA`, `LOCALAPPDATA`, `SystemRoot` and `TEMP` instead;
+//! * [`CHILD_PATH`] is the Unix system folders; Windows needs `%SystemRoot%\System32`;
+//! * the data folder is made owner-only with a Unix mode (`cfg(unix)`); Windows needs an ACL;
+//! * the tests' stand-in for `bw` is a shell script (`tests/fixtures/bitwarden/fake_bw.sh`).
 
 use std::collections::BTreeSet;
 use std::path::PathBuf;
@@ -24,11 +33,11 @@ use async_trait::async_trait;
 use serde_json::{json, Value};
 use tokio::io::AsyncWriteExt;
 use tokio::process::Command;
-use zeroize::Zeroizing;
+use zeroize::{Zeroize, Zeroizing};
 
 use super::{
-    check_login_input, is_vault_id, BwClient, BwError, CodeMark, LoginOutcome, Region, SetTotp,
-    VaultLogin, IMPORT_FOLDER,
+    check_login_input, check_region, is_api_key, is_vault_id, BwClient, BwError, CodeMark,
+    LoginOutcome, Region, SetTotp, VaultLogin, IMPORT_FOLDER,
 };
 
 // ---- Text of `bw` failures we react to. All matched case-insensitively as substrings of stderr.
@@ -44,9 +53,10 @@ const BAD_CREDENTIALS: &[&str] = &[
 // The next four are VERIFIED the same way, in `LoginCommand.run` of CLI 2026.9.1 (read, not
 // run). What each means depends on whether a code was sent: see `classify_login_failure`.
 /// `badRequest("Code is required.")`. Without `--code`: the account needs a two-step code. It
-/// is also what a non-interactive login ends with when Bitwarden wants the code it emails to a
-/// new device, and that is the only way to get it when `--code` WAS given (with a code, the
-/// two-step branch never asks for one).
+/// is also, word for word, what a non-interactive login ends with when Bitwarden wants the
+/// code it emails to a new device (the `requiresDeviceVerification` branch; re-read in the
+/// 2026.9.1 release itself), and that is the only way to get it when `--code` WAS given (with
+/// a code, the two-step branch never asks for one).
 const CODE_REQUIRED: &[&str] = &["code is required"];
 /// `error("Login failed. No provider selected.")`: the account has several two-step methods and
 /// none was chosen (no `--method`), or the one chosen with `--method 0` is not among them.
@@ -72,12 +82,12 @@ const WRONG_TWO_FACTOR_CODE: &[&str] = &[
     "invalid two-step",
 ];
 
-/// Shown when Bitwarden wants a code it sent by email. (Our wording; the condition it reports
-/// is VERIFIED against CLI 2026.9.1, see [`CODE_REQUIRED`].)
-pub const EMAIL_CODE_UNSUPPORTED: &str = "Bitwarden wants a verification code that it sends by email (it does this for a new device, or when email is the account's two-step method). This app can only sign in with a code from an authenticator app. Save a Bitwarden import file instead and import it in Bitwarden yourself.";
-/// Shown when the account has no authenticator-app two-step method. (Our wording; conditions
-/// VERIFIED against CLI 2026.9.1, see [`NO_PROVIDER_SELECTED`] and [`NO_PROVIDERS`].)
-pub const METHOD_UNSUPPORTED: &str = "This Bitwarden account uses a two-step method this app cannot do (an emailed code or a hardware security key). This app can only sign in with a code from an authenticator app. Save a Bitwarden import file instead and import it in Bitwarden yourself.";
+// VERIFIED in the program text of CLI 2026.9.1 (the downloaded release, read, not run against
+// an account), in `LoginCommand.run`: a personal API key that Bitwarden refuses (the identity
+// server answers `invalid_client`) is reported as "client_id or client_secret is incorrect.
+// Try again."; a key whose id does not start with `user` as "Invalid API Key; Organization API
+// Key currently not supported".
+const BAD_API_KEY: &[&str] = &["client_id or client_secret is incorrect", "invalid api key"];
 // ASSUMED (typical Node/HTTP failure wording; the CLI passes these through): the server or the
 // network to it failed. Worth running again. Phrases only: a bare "500" or "network" can appear in
 // an unrelated message (an item named "Network 500"), so status codes are matched with their
@@ -115,6 +125,10 @@ const INHERITED_ENV: &[&str] = &["HOME", "TMPDIR", "LANG", "LC_ALL", "LC_CTYPE"]
 const CHILD_PATH: &str = "/usr/bin:/bin:/usr/sbin:/sbin";
 
 const PASSWORD_ENV: &str = "AUTHEXODUS_BW_PASSWORD";
+/// The two variables `bw login --apikey` reads the personal API key from. They are set for
+/// that one run of the child and for no other.
+const CLIENT_ID_ENV: &str = "BW_CLIENTID";
+const CLIENT_SECRET_ENV: &str = "BW_CLIENTSECRET";
 const RUN_TIMEOUT: Duration = Duration::from_secs(180);
 
 pub struct CliClient {
@@ -131,12 +145,17 @@ pub struct CliClient {
 /// `NO_PROXY`, `NODE_EXTRA_CA_CERTS`, `NODE_TLS_REJECT_UNAUTHORIZED`, `NODE_OPTIONS`,
 /// `SSL_CERT_FILE`, `DYLD_*`, `LD_*` and any `BW_*` or `BITWARDENCLI_*` setting of the person's
 /// shell never reach it.
+///
+/// `secrets` are the variables one particular run needs and no other run gets: the master
+/// password (under [`PASSWORD_ENV`]) or the API key ([`CLIENT_ID_ENV`], [`CLIENT_SECRET_ENV`]).
+/// Only those three names are let through.
 fn child_environment(
     parent: impl Fn(&str) -> Option<std::ffi::OsString>,
     data_dir: &std::path::Path,
     session: Option<&str>,
-    password: Option<&str>,
+    secrets: &[(&str, &str)],
 ) -> Vec<(String, std::ffi::OsString)> {
+    const SECRET_NAMES: &[&str] = &[PASSWORD_ENV, CLIENT_ID_ENV, CLIENT_SECRET_ENV];
     let mut env: Vec<(String, std::ffi::OsString)> = INHERITED_ENV
         .iter()
         .filter_map(|name| Some(((*name).to_owned(), parent(name)?)))
@@ -147,10 +166,23 @@ fn child_environment(
     if let Some(session) = session {
         env.push(("BW_SESSION".into(), session.into()));
     }
-    if let Some(password) = password {
-        env.push((PASSWORD_ENV.into(), password.into()));
+    for (name, value) in secrets {
+        if SECRET_NAMES.contains(name) {
+            env.push(((*name).to_owned(), (*value).into()));
+        }
     }
     env
+}
+
+/// Overwrite the copies of the session key, the password and the API key that were made to
+/// build a child's environment. (The copy inside `std::process::Command` itself cannot be
+/// reached; it is freed, not overwritten, when the command is dropped.)
+fn wipe_environment(env: Vec<(String, std::ffi::OsString)>) {
+    for (_, value) in env {
+        if let Ok(mut text) = value.into_string() {
+            text.zeroize();
+        }
+    }
 }
 
 impl CliClient {
@@ -184,22 +216,24 @@ impl CliClient {
     }
 
     /// Spawn `bw` and wait. Returns (succeeded, stdout, stderr); only failing to run at all is an `Err`.
+    /// `secrets` are handed to this one child in its environment (see [`child_environment`]).
     async fn exec(
         &self,
         args: &[&str],
         stdin: Option<&str>,
-        password: Option<&str>,
+        secrets: &[(&str, &str)],
     ) -> Result<(bool, String, String), BwError> {
+        let environment = child_environment(
+            |name| std::env::var_os(name),
+            &self.data_dir,
+            self.session.as_ref().map(|s| s.as_str()),
+            secrets,
+        );
         let mut cmd = Command::new(&self.binary);
         cmd.args(args)
             .arg("--nointeraction")
             .env_clear()
-            .envs(child_environment(
-                |name| std::env::var_os(name),
-                &self.data_dir,
-                self.session.as_ref().map(|s| s.as_str()),
-                password,
-            ))
+            .envs(environment.iter().map(|(name, value)| (name, value)))
             .stdin(if stdin.is_some() {
                 Stdio::piped()
             } else {
@@ -208,8 +242,10 @@ impl CliClient {
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             .kill_on_drop(true);
-        let mut child = cmd
-            .spawn()
+        let spawned = cmd.spawn();
+        wipe_environment(environment);
+        drop(cmd);
+        let mut child = spawned
             .map_err(|e| BwError::Cli(format!("could not start the Bitwarden tool: {e}")))?;
         if let Some(input) = stdin {
             let mut pipe = child.stdin.take().expect("stdin was piped");
@@ -231,13 +267,8 @@ impl CliClient {
     }
 
     /// Run `bw`. Returns stdout on success; classifies stderr on failure.
-    async fn run(
-        &self,
-        args: &[&str],
-        stdin: Option<&str>,
-        password: Option<&str>,
-    ) -> Result<String, BwError> {
-        let (ok, stdout, stderr) = self.exec(args, stdin, password).await?;
+    async fn run(&self, args: &[&str], stdin: Option<&str>) -> Result<String, BwError> {
+        let (ok, stdout, stderr) = self.exec(args, stdin, &[]).await?;
         if ok {
             Ok(stdout)
         } else {
@@ -245,8 +276,67 @@ impl CliClient {
         }
     }
 
+    /// Run the tool with `args` through the very path every other call takes (the cleared
+    /// environment, `--nointeraction`), feeding it `stdin`, and hand back what it printed.
+    /// For the test that proves the real program starts at all; the app does not call it.
+    #[doc(hidden)]
+    pub async fn probe(&self, args: &[&str], stdin: Option<&str>) -> Result<String, BwError> {
+        self.run(args, stdin).await
+    }
+
+    /// What both kinds of sign-in begin with: the program is still the verified one, the
+    /// private data folder exists, nobody is signed in, and the tool points at `region`.
+    async fn prepare_sign_in(&mut self, region: &Region) -> Result<(), BwError> {
+        if cfg!(not(unix)) {
+            return Err(BwError::UnsupportedPlatform);
+        }
+        self.verify_binary().await?;
+        tokio::fs::create_dir_all(&self.data_dir)
+            .await
+            .map_err(|e| {
+                BwError::Cli(format!("could not prepare the Bitwarden data folder: {e}"))
+            })?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let _ =
+                std::fs::set_permissions(&self.data_dir, std::fs::Permissions::from_mode(0o700));
+        }
+        self.session = None;
+        // `bw config server` refuses while logged in (a repeat attempt, e.g. with a two-step
+        // code); log out first and ignore "not logged in".
+        let _ = self.run(&["logout"], None).await;
+        self.run(&["config", "server", &region.server_url()], None)
+            .await?;
+        Ok(())
+    }
+
+    /// `bw unlock --passwordenv ... --raw`: the session key, kept in memory.
+    async fn unlock(&mut self, password: &str) -> Result<(), BwError> {
+        let passwordenv = format!("--passwordenv={PASSWORD_ENV}");
+        let (ok, stdout, stderr) = self
+            .exec(
+                &["unlock", passwordenv.as_str(), "--raw"],
+                None,
+                &[(PASSWORD_ENV, password)],
+            )
+            .await?;
+        let key = Zeroizing::new(stdout);
+        if !ok {
+            return Err(classify_failure(&stderr));
+        }
+        let key = key.trim();
+        if key.is_empty() {
+            return Err(BwError::Cli(
+                "Bitwarden did not return a session key".into(),
+            ));
+        }
+        self.session = Some(Zeroizing::new(key.to_string()));
+        Ok(())
+    }
+
     async fn run_json(&self, args: &[&str]) -> Result<Value, BwError> {
-        let out = self.run(args, None, None).await?;
+        let out = self.run(args, None).await?;
         serde_json::from_str(out.trim())
             .map_err(|_| BwError::Cli(format!("unexpected output from `bw {}`", args.join(" "))))
     }
@@ -272,9 +362,7 @@ impl CliClient {
             Some(id) => Some(id),
             None if create => {
                 let encoded = self.encode(&json!({ "name": IMPORT_FOLDER })).await?;
-                let made = self
-                    .run(&["create", "folder"], Some(&encoded), None)
-                    .await?;
+                let made = self.run(&["create", "folder"], Some(&encoded)).await?;
                 let v: Value = serde_json::from_str(made.trim())
                     .map_err(|_| BwError::Cli("unexpected output creating the folder".into()))?;
                 let id = v["id"].as_str().filter(|id| is_vault_id(id));
@@ -291,9 +379,7 @@ impl CliClient {
     }
 
     async fn encode(&self, value: &Value) -> Result<String, BwError> {
-        let out = self
-            .run(&["encode"], Some(&value.to_string()), None)
-            .await?;
+        let out = self.run(&["encode"], Some(&value.to_string())).await?;
         Ok(out.trim().to_string())
     }
 }
@@ -337,12 +423,18 @@ fn has_server_status(lower: &str) -> bool {
 /// |---|---|---|
 /// | wrong master password | `BadCredentials` | `BadCredentials` |
 /// | the server's "token is invalid" (ASSUMED) | `BadTwoFactorCode` | `BadTwoFactorCode` |
-/// | "Code is required." | `NeedsTwoFactor` | emailed code wanted: unsupported |
-/// | "No provider selected." | `NeedsTwoFactor` (several methods) | no authenticator app: unsupported |
-/// | "No providers available" | unsupported | unsupported |
+/// | "Code is required." | `NeedsTwoFactor` | emailed code wanted: `NeedsApiKey` |
+/// | "No provider selected." | `NeedsTwoFactor` (several methods) | no authenticator app: `NeedsApiKey` |
+/// | "No providers available" | `NeedsApiKey` | `NeedsApiKey` |
 /// | "Login failed." alone | (other error) | `BadTwoFactorCode` (asked again) |
 ///
-/// `NeedsTwoFactor` is never returned when a code was sent.
+/// `NeedsTwoFactor` is never returned when a code was sent. `NeedsApiKey` means a password
+/// sign-in cannot get further from this app: Bitwarden wants a code it sends by email (to a
+/// device it has not seen, which this app's private data folder always is, or because email
+/// is the account's two-step method), or a method the tool cannot do (a security key, Duo).
+/// An account with no two-step login at all therefore goes: "Code is required." with no code
+/// sent (`NeedsTwoFactor`: the tool's wording does not say which code), and the same again
+/// once any code is tried (`NeedsApiKey`).
 fn classify_login_failure(stderr: &str, code_sent: bool) -> Result<LoginOutcome, BwError> {
     let lower = stderr.to_lowercase();
     let any = |needles: &[&str]| needles.iter().any(|n| lower.contains(n));
@@ -351,19 +443,13 @@ fn classify_login_failure(stderr: &str, code_sent: bool) -> Result<LoginOutcome,
     } else if any(WRONG_TWO_FACTOR_CODE) {
         Ok(LoginOutcome::BadTwoFactorCode)
     } else if any(NO_PROVIDERS) {
-        Err(BwError::Unsupported(METHOD_UNSUPPORTED.into()))
-    } else if any(CODE_REQUIRED) {
-        if code_sent {
-            Err(BwError::Unsupported(EMAIL_CODE_UNSUPPORTED.into()))
+        Ok(LoginOutcome::NeedsApiKey)
+    } else if any(CODE_REQUIRED) || any(NO_PROVIDER_SELECTED) {
+        Ok(if code_sent {
+            LoginOutcome::NeedsApiKey
         } else {
-            Ok(LoginOutcome::NeedsTwoFactor)
-        }
-    } else if any(NO_PROVIDER_SELECTED) {
-        if code_sent {
-            Err(BwError::Unsupported(METHOD_UNSUPPORTED.into()))
-        } else {
-            Ok(LoginOutcome::NeedsTwoFactor)
-        }
+            LoginOutcome::NeedsTwoFactor
+        })
     } else if code_sent && lower.trim() == LOGIN_FAILED_BARE {
         Ok(LoginOutcome::BadTwoFactorCode)
     } else {
@@ -441,24 +527,7 @@ impl BwClient for CliClient {
         two_factor: Option<&str>,
     ) -> Result<LoginOutcome, BwError> {
         check_login_input(email, region)?;
-        self.verify_binary().await?;
-        tokio::fs::create_dir_all(&self.data_dir)
-            .await
-            .map_err(|e| {
-                BwError::Cli(format!("could not prepare the Bitwarden data folder: {e}"))
-            })?;
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            let _ =
-                std::fs::set_permissions(&self.data_dir, std::fs::Permissions::from_mode(0o700));
-        }
-        self.session = None;
-        // `bw config server` refuses while logged in (a repeat attempt, e.g. with a two-step
-        // code); log out first and ignore "not logged in".
-        let _ = self.run(&["logout"], None, None).await;
-        self.run(&["config", "server", &region.server_url()], None, None)
-            .await?;
+        self.prepare_sign_in(region).await?;
 
         let passwordenv = format!("--passwordenv={PASSWORD_ENV}");
         let mut args = vec!["login", email, passwordenv.as_str(), "--raw"];
@@ -471,29 +540,80 @@ impl BwClient for CliClient {
         if let Some(code) = two_factor {
             args.extend(["--method", "0", "--code", code]);
         }
-        let (ok, _stdout, stderr) = self.exec(&args, None, Some(password)).await?;
+        let (ok, stdout, stderr) = self.exec(&args, None, &[(PASSWORD_ENV, password)]).await?;
+        // `--raw` prints a session key; the one from `unlock` below is the one that is used.
+        drop(Zeroizing::new(stdout));
         if !ok {
             return classify_login_failure(&stderr, two_factor.is_some());
         }
-
-        let unlock_args = ["unlock", passwordenv.as_str(), "--raw"];
-        let key = self.run(&unlock_args, None, Some(password)).await?;
-        let key = key.trim();
-        if key.is_empty() {
-            return Err(BwError::Cli(
-                "Bitwarden did not return a session key".into(),
-            ));
-        }
-        self.session = Some(Zeroizing::new(key.to_string()));
+        self.unlock(password).await?;
         Ok(LoginOutcome::Ok)
     }
 
+    /// `bw login --apikey`, then `bw unlock`.
+    ///
+    /// About the real tool. VERIFIED means read in the program text of the downloaded
+    /// 2026.9.1 release; none of it has been run against an account.
+    /// * VERIFIED: `login` has the option `--apikey` ("Log in with an Api Key."). With it the
+    ///   tool reads the key from the environment variables `BW_CLIENTID` and
+    ///   `BW_CLIENTSECRET`, and prompts for one only when it is missing and it may interact
+    ///   (it may not: `BW_NOINTERACTION` is `true`).
+    /// * VERIFIED: an API-key login that succeeds prints "You are logged in!" and leaves the
+    ///   vault locked ("To unlock your vault, use the `unlock` command"), so the master
+    ///   password is still needed. `unlock` takes `--passwordenv` and, with `--raw`, prints
+    ///   the session key.
+    /// * VERIFIED: the wording of a refused key (see [`BAD_API_KEY`]).
+    /// * ASSUMED: what `unlock` says to a wrong master password. The tool passes on the
+    ///   message of an error raised inside Bitwarden's own library, which could not be read.
+    ///   So a refusal by `unlock` that is neither a server failure nor an ended session is
+    ///   taken to be a wrong master password.
+    async fn login_with_api_key(
+        &mut self,
+        client_id: &str,
+        client_secret: &str,
+        password: &str,
+        region: &Region,
+    ) -> Result<LoginOutcome, BwError> {
+        check_region(region)?;
+        let (client_id, client_secret) = (client_id.trim(), client_secret.trim());
+        if !is_api_key(client_id, client_secret) {
+            return Ok(LoginOutcome::BadCredentials);
+        }
+        self.prepare_sign_in(region).await?;
+
+        // The key reaches the tool in the environment of this one child and of no other.
+        let (ok, stdout, stderr) = self
+            .exec(
+                &["login", "--apikey"],
+                None,
+                &[
+                    (CLIENT_ID_ENV, client_id),
+                    (CLIENT_SECRET_ENV, client_secret),
+                ],
+            )
+            .await?;
+        drop(Zeroizing::new(stdout));
+        if !ok {
+            let lower = stderr.to_lowercase();
+            if BAD_API_KEY.iter().any(|phrase| lower.contains(phrase)) {
+                return Ok(LoginOutcome::BadCredentials);
+            }
+            return Err(classify_failure(&stderr));
+        }
+        match self.unlock(password).await {
+            Ok(()) => Ok(LoginOutcome::Ok),
+            // Signed in, but the master password does not open the vault (see ASSUMED above).
+            Err(BwError::Cli(_)) => Ok(LoginOutcome::BadCredentials),
+            Err(other) => Err(other),
+        }
+    }
+
     async fn sync(&self) -> Result<(), BwError> {
-        self.run(&["sync"], None, None).await.map(|_| ())
+        self.run(&["sync"], None).await.map(|_| ())
     }
 
     async fn list_logins(&self) -> Result<Vec<VaultLogin>, BwError> {
-        parse_login_items(&self.run(&["list", "items"], None, None).await?)
+        parse_login_items(&self.run(&["list", "items"], None).await?)
     }
 
     async fn import_folder_titles(&self) -> Result<Vec<String>, BwError> {
@@ -534,8 +654,7 @@ impl BwClient for CliClient {
         }
         item["login"]["totp"] = Value::String(otpauth.to_string());
         let encoded = self.encode(&item).await?;
-        self.run(&["edit", "item", item_id], Some(&encoded), None)
-            .await?;
+        self.run(&["edit", "item", item_id], Some(&encoded)).await?;
         Ok(SetTotp::Attached)
     }
 
@@ -557,13 +676,13 @@ impl BwClient for CliClient {
             "login": { "username": username, "totp": otpauth },
         });
         let encoded = self.encode(&item).await?;
-        self.run(&["create", "item"], Some(&encoded), None)
+        self.run(&["create", "item"], Some(&encoded))
             .await
             .map(|_| ())
     }
 
     async fn logout_and_wipe(&mut self) -> Result<(), BwError> {
-        let _ = self.run(&["logout"], None, None).await;
+        let _ = self.run(&["logout"], None).await;
         self.session = None;
         *self.folder_id.lock().unwrap() = None;
         match tokio::fs::remove_dir_all(&self.data_dir).await {

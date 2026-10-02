@@ -6,9 +6,12 @@
 //! been handed to the child process, and nothing prints a password, session key or token secret.
 
 use std::fmt;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
 
 use async_trait::async_trait;
 use sha2::{Digest, Sha256};
+use tokio::sync::Notify;
 
 pub mod apply;
 pub mod cli;
@@ -17,8 +20,48 @@ pub mod matcher;
 
 pub use apply::{apply, ApplyReport};
 pub use cli::CliClient;
-pub use download::{ensure_cli, CliBinary};
+pub use download::{ensure_cli, ensure_cli_reporting, CliBinary, PrepareStage};
 pub use matcher::{propose, Confidence, Decision, Proposal};
+
+/// A signal to stop work that is under way (a download, an unpacking). Clones share the one
+/// signal; once given it stays given.
+#[derive(Clone, Default)]
+pub struct Cancel(Arc<CancelState>);
+
+#[derive(Default)]
+struct CancelState {
+    cancelled: AtomicBool,
+    notify: Notify,
+}
+
+impl Cancel {
+    pub fn new() -> Cancel {
+        Cancel::default()
+    }
+
+    pub fn cancel(&self) {
+        self.0.cancelled.store(true, Ordering::SeqCst);
+        self.0.notify.notify_waiters();
+    }
+
+    pub fn is_cancelled(&self) -> bool {
+        self.0.cancelled.load(Ordering::SeqCst)
+    }
+
+    /// Resolves once [`Cancel::cancel`] has been called (at once, if it already was).
+    pub async fn cancelled(&self) {
+        loop {
+            let notified = self.0.notify.notified();
+            tokio::pin!(notified);
+            // Registered before the flag is read, so a signal between the two is not missed.
+            notified.as_mut().enable();
+            if self.is_cancelled() {
+                return;
+            }
+            notified.await;
+        }
+    }
+}
 
 /// Name of the vault folder that new logins are created in.
 pub const IMPORT_FOLDER: &str = "Authy import";
@@ -112,12 +155,6 @@ impl Region {
     }
 }
 
-/// Shown when the address of a self-hosted server is not usable.
-pub const BAD_SERVER_URL: &str =
-    "The server address must start with https:// and name a server, for example https://vault.example.com.";
-/// Shown when the email address is not usable.
-pub const BAD_EMAIL: &str = "That does not look like an email address.";
-
 /// Refuse a sign-in whose email or server address must not reach the Bitwarden tool: the
 /// email is a command-line argument, and the server is where the master password's hash is
 /// sent. Checked here as well as on the screen, so that nothing depends on the screen.
@@ -127,6 +164,21 @@ pub const BAD_EMAIL: &str = "That does not look like an email address.";
 /// * An email must contain `@` with something on both sides, must not start with `-` (it
 ///   would be read as an option), and must hold no spaces or control characters.
 pub fn check_login_input(email: &str, region: &Region) -> Result<(), BwError> {
+    check_region(region)?;
+    let usable = !email.starts_with('-')
+        && email.len() <= 320
+        && !email.chars().any(|c| c.is_whitespace() || c.is_control())
+        && email
+            .split_once('@')
+            .is_some_and(|(local, domain)| !local.is_empty() && !domain.is_empty());
+    if !usable {
+        return Err(BwError::BadEmail);
+    }
+    Ok(())
+}
+
+/// The server-address half of [`check_login_input`], for a sign-in that sends no email.
+pub fn check_region(region: &Region) -> Result<(), BwError> {
     if let Region::SelfHosted(url) = region {
         let usable = url::Url::parse(url.trim()).is_ok_and(|parsed| {
             parsed.scheme() == "https"
@@ -135,19 +187,19 @@ pub fn check_login_input(email: &str, region: &Region) -> Result<(), BwError> {
                 && parsed.password().is_none()
         });
         if !usable {
-            return Err(BwError::Input(BAD_SERVER_URL.into()));
+            return Err(BwError::BadServerUrl);
         }
     }
-    let usable = !email.starts_with('-')
-        && email.len() <= 320
-        && !email.chars().any(|c| c.is_whitespace() || c.is_control())
-        && email
-            .split_once('@')
-            .is_some_and(|(local, domain)| !local.is_empty() && !domain.is_empty());
-    if !usable {
-        return Err(BwError::Input(BAD_EMAIL.into()));
-    }
     Ok(())
+}
+
+/// Is this shaped like a personal API key? The client id is `user.` and a UUID; the secret is
+/// a run of letters and digits. Both travel in the child's environment, never in its
+/// arguments, so this is only to turn a mistyped key away before the tool is run.
+pub fn is_api_key(client_id: &str, client_secret: &str) -> bool {
+    client_id.strip_prefix("user.").is_some_and(is_vault_id)
+        && (8..=128).contains(&client_secret.len())
+        && client_secret.bytes().all(|b| b.is_ascii_alphanumeric())
 }
 
 /// Is this shaped like the ids Bitwarden gives vault items and folders (a UUID:
@@ -170,6 +222,10 @@ pub enum LoginOutcome {
     BadCredentials,
     /// A two-step code was given and Bitwarden did not accept it.
     BadTwoFactorCode,
+    /// A password sign-in cannot get any further: Bitwarden wants a code it sent by email (it
+    /// does that for a device it has not seen), or the account's only two-step methods are
+    /// ones the tool cannot do. Signing in with a personal API key gets past both.
+    NeedsApiKey,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -194,13 +250,19 @@ pub enum BwError {
     Download(String),
     #[error("the downloaded Bitwarden CLI does not match the expected checksum")]
     ChecksumMismatch,
-    /// What was typed cannot be used. The message is for the person, as it is.
-    #[error("{0}")]
-    Input(String),
-    /// The account signs in in a way this app cannot do. The message is for the person, as
-    /// it is.
-    #[error("{0}")]
-    Unsupported(String),
+    /// The email address typed cannot be handed to the tool.
+    #[error("the email address is not usable")]
+    BadEmail,
+    /// The server address typed is not an `https` address of a server.
+    #[error("the server address is not usable")]
+    BadServerUrl,
+    /// The work was stopped on request ([`Cancel`]).
+    #[error("stopped before it finished")]
+    Cancelled,
+    /// This build cannot download or run the Bitwarden tool on this system (see the
+    /// "Not yet portable" notes in `download.rs` and `cli.rs`).
+    #[error("the Bitwarden tool is not available for this system in this version of the app")]
+    UnsupportedPlatform,
 }
 
 #[async_trait]
@@ -211,6 +273,15 @@ pub trait BwClient: Send + Sync {
         password: &str,
         region: &Region,
         two_factor: Option<&str>,
+    ) -> Result<LoginOutcome, BwError>;
+    /// Sign in with a personal API key (which Bitwarden does not challenge with an emailed
+    /// code or a two-step method), then unlock the vault with the master password.
+    async fn login_with_api_key(
+        &mut self,
+        client_id: &str,
+        client_secret: &str,
+        password: &str,
+        region: &Region,
     ) -> Result<LoginOutcome, BwError>;
     async fn sync(&self) -> Result<(), BwError>;
     async fn list_logins(&self) -> Result<Vec<VaultLogin>, BwError>;

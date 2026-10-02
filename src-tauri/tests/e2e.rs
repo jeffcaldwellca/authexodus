@@ -8,7 +8,8 @@
 //!   way a phone does, trusts it and nothing else, and asks Authy for its tokens;
 //! * an in-memory key store and a temporary directory.
 //!
-//! * a stand-in Bitwarden client, so the Bitwarden stages run without the real tool.
+//! * a stand-in Bitwarden client, so the Bitwarden stages run without the real tool;
+//! * a stand-in for the list of this computer's addresses, so that it can "move networks".
 //!
 //! The app's own log subscriber (at its most talkative) records the whole run, and the log is
 //! then searched for every secret, name, host and address that went through the app.
@@ -27,13 +28,13 @@ use async_trait::async_trait;
 use authexodus_core::bitwarden::{
     BwClient, BwError, CodeMark, LoginOutcome, Region, SetTotp, VaultLogin,
 };
-use authexodus_core::ca::{KeyStore, MemoryKeyStore};
+use authexodus_core::ca::MemoryKeyStore;
 use authexodus_core::proxy::{TestUpstream, AUTHY_HOST};
 use authexodus_core::totp;
 use authexodus_lib::commands::finish_export;
 use authexodus_lib::dto::{
-    BwLoginInput, BwLoginResult, DecisionDto, DecisionEntry, DestinationDto, ExportOutcome,
-    ProxyEventDto, Step,
+    BwLoginInput, BwLoginResult, DecisionDto, DecisionEntry, DestinationDto, ErrorCode,
+    ExportOutcome, ProxyEventDto, Step,
 };
 use authexodus_lib::logging;
 use authexodus_lib::network::{Candidate, Network};
@@ -74,6 +75,12 @@ const BW_EMAIL: &str = "planted-person@example.test";
 const BW_PASSWORD: &str = "planted master password";
 const BW_SERVER: &str = "planted-vault.example.test";
 const BW_CODE: &str = "135790";
+/// A two-step code after which the stand-in Bitwarden asks for the code it "emailed".
+const BW_CODE_THEN_EMAIL: &str = "246802";
+const BW_CLIENT_ID: &str = "user.99999999-0000-4000-8000-00000000abcd";
+const BW_CLIENT_SECRET: &str = "plantedApiKeySecret0000";
+const DOWNLOAD_PATH: &str = "planted-download-path";
+const DOWNLOAD_ASSET: &str = "planted-asset.zip";
 const VAULT_LOGIN_NAME: &str = "Planted Vault Login";
 
 // ---------------------------------------------------------------------------------------------
@@ -264,7 +271,10 @@ async fn stand_in_authy(tokens: Vec<u8>) -> StandIn {
                 let head = String::from_utf8_lossy(&head).into_owned();
                 let target = head.split_whitespace().nth(1).unwrap_or("/");
                 let path = target.split('?').next().unwrap_or("/");
-                let body: &[u8] = if path.ends_with("/authenticator_tokens") {
+                let body: &[u8] = if path.ends_with("/users/0/authenticator_tokens") {
+                    // An account whose backups are off: no accounts at all.
+                    br#"{"message":"success","authenticator_tokens":[],"success":true}"#
+                } else if path.ends_with("/authenticator_tokens") {
                     &tokens
                 } else if path.ends_with("/apps") {
                     APPS_BODY.as_bytes()
@@ -545,8 +555,23 @@ impl BwClient for StandInBitwarden {
         Ok(match code {
             None => LoginOutcome::NeedsTwoFactor,
             Some("000000") => LoginOutcome::BadTwoFactorCode,
+            Some(BW_CODE_THEN_EMAIL) => LoginOutcome::NeedsApiKey,
             Some(_) => LoginOutcome::Ok,
         })
+    }
+    async fn login_with_api_key(
+        &mut self,
+        client_id: &str,
+        client_secret: &str,
+        password: &str,
+        region: &Region,
+    ) -> Result<LoginOutcome, BwError> {
+        assert_eq!(
+            (client_id, client_secret, password),
+            (BW_CLIENT_ID, BW_CLIENT_SECRET, BW_PASSWORD)
+        );
+        assert_eq!(region.server_url(), format!("https://{BW_SERVER}"));
+        Ok(LoginOutcome::Ok)
     }
     async fn sync(&self) -> Result<(), BwError> {
         let mut fail = self.fail_sync_once.lock().unwrap();
@@ -587,6 +612,16 @@ impl BwClient for StandInBitwarden {
     }
 }
 
+fn bw_login_with_api_key() -> BwLoginInput {
+    serde_json::from_value(serde_json::json!({
+        "email": BW_EMAIL,
+        "password": BW_PASSWORD,
+        "region": { "kind": "selfHosted", "url": format!("https://{BW_SERVER}") },
+        "apiKey": { "clientId": BW_CLIENT_ID, "clientSecret": BW_CLIENT_SECRET },
+    }))
+    .unwrap()
+}
+
 fn bw_login(code: Option<&str>) -> BwLoginInput {
     serde_json::from_value(serde_json::json!({
         "email": BW_EMAIL,
@@ -612,6 +647,15 @@ async fn the_whole_flow_with_a_simulated_phone() {
     let authy = stand_in_authy(expected_body.clone()).await;
     let upstream = TestUpstream::new(authy.addr, authy.root_der.clone());
     session.tune_proxy(0, Some(upstream.clone()));
+    // This computer's addresses, as the session reads them while the proxy runs.
+    let own_addresses = Arc::new(Mutex::new(vec![IpAddr::V4(Ipv4Addr::LOCALHOST)]));
+    {
+        let own = Arc::clone(&own_addresses);
+        session.tune_address_watch(
+            Duration::from_millis(25),
+            Arc::new(move || own.lock().unwrap().clone()),
+        );
+    }
     let net = Network {
         candidates: vec![
             Candidate {
@@ -627,10 +671,11 @@ async fn the_whole_flow_with_a_simulated_phone() {
     };
 
     // ---- Welcome: a fresh launch.
-    let state = session.get_state();
+    let state = session.get_state(&net);
     assert_eq!(state.step, Step::Welcome);
     assert!(!state.resume_cleanup);
     assert_eq!(state.releases_url, RELEASES_URL);
+    assert_eq!(state.session.proxy, None);
     assert_eq!(store.load().unwrap(), None);
 
     // ---- Connect: the proxy starts. (Loopback is never a default, so it is named.)
@@ -651,7 +696,15 @@ async fn the_whole_flow_with_a_simulated_phone() {
         data_dir.join("session.json").exists(),
         "and the marker says so"
     );
-    assert_eq!(session.get_state().step, Step::Connect);
+    assert!(info.cert_constrained);
+    let state = session.get_state(&net);
+    assert_eq!(state.step, Step::Connect);
+    assert_eq!(
+        state.session.proxy.as_ref(),
+        Some(&info),
+        "a reloaded window can have the running proxy described again"
+    );
+    assert!(!state.session.device_connected && !state.session.trust_working);
     // Asking again changes nothing.
     let again = session
         .start_proxy(Some("127.0.0.1"), &net, emit.clone())
@@ -667,9 +720,28 @@ async fn the_whole_flow_with_a_simulated_phone() {
         heard.until(|e| *e == ProxyEventDto::DeviceConnected).await,
         [ProxyEventDto::DeviceConnected]
     );
-    assert_eq!(session.get_state().step, Step::Certificate);
+    let state = session.get_state(&net);
+    assert_eq!(state.step, Step::Certificate);
+    assert!(state.session.device_connected && !state.session.trust_working);
 
-    // ---- Authy: the phone signs in; the backup passes through the proxy.
+    // ---- Authy: the phone signs in. Its first request is answered with no accounts at all
+    // (as for an account whose backups are off), which the UI is told as its own notice.
+    let (head, _) = phone.authy_get("/json/users/0/authenticator_tokens").await;
+    assert!(head.starts_with("HTTP/1.1 200"), "{head}");
+    assert_eq!(
+        heard.until(|e| *e == ProxyEventDto::EmptyBackup).await,
+        [ProxyEventDto::TrustWorking, ProxyEventDto::EmptyBackup]
+    );
+    let state = session.get_state(&net);
+    assert_eq!(state.step, Step::Authy);
+    assert!(state.session.trust_working);
+    assert_eq!(state.session.captured, 0);
+    assert_eq!(
+        session.unlock(password(PASSWORD)).await.unwrap_err().code(),
+        ErrorCode::NoBackup
+    );
+
+    // Then the backup passes through the proxy.
     let (head, body) = phone
         .authy_get(&format!(
             "/json/users/424242/authenticator_tokens?apps=7&api_key={PLANTED_QUERY}"
@@ -684,14 +756,14 @@ async fn the_whole_flow_with_a_simulated_phone() {
         heard
             .until(|e| matches!(e, ProxyEventDto::BackupCaptured { .. }))
             .await,
-        [
-            ProxyEventDto::TrustWorking,
-            ProxyEventDto::BackupCaptured {
-                count: ACCOUNTS.len()
-            }
-        ]
+        [ProxyEventDto::BackupCaptured {
+            count: ACCOUNTS.len()
+        }]
     );
-    assert_eq!(session.get_state().step, Step::Unlock);
+    let state = session.get_state(&net);
+    assert_eq!(state.step, Step::Unlock);
+    assert_eq!(state.session.captured, ACCOUNTS.len());
+    assert_eq!(state.session.summary, None);
     let (head, _) = phone.authy_get("/json/users/424242/devices/99/apps").await;
     assert!(head.starts_with("HTTP/1.1 200"), "{head}");
     // The native apps add no tokens, so the count is unchanged if this is reported at all.
@@ -751,7 +823,11 @@ async fn the_whole_flow_with_a_simulated_phone() {
     let refused = session
         .start_proxy(Some("0.0.0.0"), &net, emit.clone())
         .await;
-    assert!(refused.is_err(), "the capture is not silently discarded");
+    assert_eq!(
+        refused.unwrap_err().code(),
+        ErrorCode::CaptureWouldBeLost,
+        "the capture is not silently discarded"
+    );
     // ...and is still idempotent for the address it is on.
     let same = session
         .start_proxy(Some("127.0.0.1"), &net, emit.clone())
@@ -795,7 +871,13 @@ async fn the_whole_flow_with_a_simulated_phone() {
             "the summary carries no secret"
         );
     }
-    assert_eq!(session.get_state().step, Step::Destination);
+    let state = session.get_state(&net);
+    assert_eq!(state.step, Step::Destination);
+    assert_eq!(
+        serde_json::to_value(&state.session.summary).unwrap(),
+        summary,
+        "a reloaded window gets the same summary again, without the password"
+    );
     let titles: Vec<String> = summary["tokens"]
         .as_array()
         .unwrap()
@@ -859,8 +941,28 @@ async fn the_whole_flow_with_a_simulated_phone() {
         "the app data folder and the export: no temporary file is left"
     );
 
-    // ---- Bitwarden, through the stand-in: a code is asked for, a wrong one is refused, the
-    // right one signs in; a failed listing, then proposals and an apply.
+    // ---- Bitwarden. First the tool cannot be had (nothing listens where it is asked for):
+    // the person is told so by a code and a sentence, and where it was asked for is not
+    // logged. Stopping when nothing is under way is harmless.
+    session.tune_bw_download(
+        &format!("http://127.0.0.1:1/{DOWNLOAD_PATH}"),
+        DOWNLOAD_ASSET,
+        "00",
+    );
+    let lines = Arc::new(Mutex::new(Vec::<String>::new()));
+    let sink = Arc::clone(&lines);
+    let no_tool = session
+        .bw_prepare(Arc::new(move |line| sink.lock().unwrap().push(line)))
+        .await
+        .unwrap_err();
+    assert_eq!(no_tool.code(), ErrorCode::BwDownloadFailed);
+    assert!(no_tool.to_string().starts_with("bw_download_failed: "));
+    assert!(!no_tool.to_string().contains(DOWNLOAD_PATH));
+    assert!(lines.lock().unwrap().is_empty(), "nothing was downloaded");
+    session.bw_cancel().await;
+
+    // Then, through the stand-in: a code is asked for, a wrong one is refused, the right one
+    // signs in; a failed listing, then proposals and an apply.
     let bitwarden = StandInBitwarden::default();
     let asked = session
         .bw_login(Box::new(bitwarden.clone()), bw_login(None))
@@ -872,13 +974,36 @@ async fn the_whole_flow_with_a_simulated_phone() {
         .await
         .unwrap();
     assert_eq!(refused, BwLoginResult::BadTwoFactorCode);
+    // Bitwarden wants a code it sent by email: the way through is an API key.
+    let emailed = session
+        .bw_login(
+            Box::new(bitwarden.clone()),
+            bw_login(Some(BW_CODE_THEN_EMAIL)),
+        )
+        .await
+        .unwrap();
+    assert_eq!(emailed, BwLoginResult::NeedsApiKey);
+    let by_key = session
+        .bw_login(Box::new(bitwarden.clone()), bw_login_with_api_key())
+        .await
+        .unwrap();
+    assert_eq!(by_key, BwLoginResult::Ok);
+    // The whole vault, for attaching by hand.
+    let logins = session.bw_logins().await.unwrap();
+    assert_eq!(logins.len(), 1);
+    assert_eq!(logins[0].name, VAULT_LOGIN_NAME);
+    assert!(logins[0].has_code);
+    // And the ordinary way, with a code from an authenticator app.
     let signed_in = session
         .bw_login(Box::new(bitwarden.clone()), bw_login(Some(BW_CODE)))
         .await
         .unwrap();
     assert_eq!(signed_in, BwLoginResult::Ok);
     *bitwarden.fail_sync_once.lock().unwrap() = true;
-    assert!(session.bw_propose().await.is_err());
+    assert_eq!(
+        session.bw_propose().await.unwrap_err().code(),
+        ErrorCode::BwVaultReadFailed
+    );
     let proposals = session.bw_propose().await.unwrap();
     assert_eq!(proposals.len(), usable().count());
     let decisions: Vec<DecisionEntry> = proposals
@@ -907,13 +1032,42 @@ async fn the_whole_flow_with_a_simulated_phone() {
         assert_eq!(u64::from(code.seconds_left), 30 - instant % 30);
     }
     assert_eq!(session.live_codes().unwrap().len(), codes.len());
-    assert_eq!(session.get_state().step, Step::Verify);
+
+    // ---- The computer moves to another network: the address the proxy is on is gone.
+    let (emit, mut heard) = events();
+    drop(emit);
+    let _ = heard.drain().await;
+    let elsewhere = Network {
+        candidates: vec![],
+        own: vec![IpAddr::V4(Ipv4Addr::new(10, 20, 30, 40))],
+    };
+    *own_addresses.lock().unwrap() = elsewhere.own.clone();
+    // (The event goes to whoever started this run of the proxy.)
+    let (still_emit, _) = events();
+    let stale = session
+        .start_proxy(None, &elsewhere, still_emit)
+        .await
+        .unwrap_err();
+    assert_eq!(stale.code(), ErrorCode::AddressChanged);
+    assert!(
+        session.live_codes().is_ok(),
+        "what was unlocked is not lost by the address changing"
+    );
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    *own_addresses.lock().unwrap() = vec![IpAddr::V4(Ipv4Addr::LOCALHOST)];
 
     // ---- Start over: the phone came back under a new address.
     let (emit, mut heard) = events();
     let restarted = session.restart_proxy(None, &net, emit).await.unwrap();
     assert_eq!(restarted.ip, "127.0.0.1");
-    assert_eq!(session.get_state().step, Step::Connect);
+    let state = session.get_state(&net);
+    assert_eq!(state.step, Step::Connect);
+    assert!(
+        !state.session.device_connected && !state.session.trust_working,
+        "a fresh proxy has seen no device yet"
+    );
+    assert_eq!(state.session.captured, 0);
+    assert_eq!(state.session.summary, None);
     assert!(
         session.live_codes().is_err(),
         "what was unlocked is discarded"
@@ -973,12 +1127,12 @@ async fn the_whole_flow_with_a_simulated_phone() {
             .is_err(),
         "nothing is listening any more"
     );
-    assert_eq!(session.get_state().step, Step::Cleanup);
+    assert_eq!(session.get_state(&net).step, Step::Cleanup);
     // Until the person has ticked everything off, a new launch comes back to cleanup.
     assert!(data_dir.join("session.json").exists());
     assert!(
         Session::new(store.clone(), data_dir.clone())
-            .get_state()
+            .get_state(&net)
             .resume_cleanup
     );
 
@@ -988,10 +1142,15 @@ async fn the_whole_flow_with_a_simulated_phone() {
         !data_dir.join("session.json").exists(),
         "the marker is cleared"
     );
-    assert_eq!(session.get_state().step, Step::Done);
+    assert_eq!(session.get_state(&net).step, Step::Done);
+    assert_eq!(
+        std::fs::read_dir(&data_dir).unwrap().count(),
+        0,
+        "nothing of the app's own making is left in its data folder"
+    );
     let next = Session::new(store.clone(), data_dir.clone());
-    assert!(!next.get_state().resume_cleanup);
-    assert_eq!(next.get_state().step, Step::Welcome);
+    assert!(!next.get_state(&net).resume_cleanup);
+    assert_eq!(next.get_state(&net).step, Step::Welcome);
     assert_eq!(store.load().unwrap(), None);
 
     // ---- The log: every stage is there, and nothing that went through the app is.
@@ -1006,6 +1165,9 @@ async fn the_whole_flow_with_a_simulated_phone() {
         "proxy event kind=deviceConnected forwarded=true",
         &format!("device accepted device={PHONE} host=authy"),
         "proxy event kind=trustWorking forwarded=true",
+        "Authy answered with no accounts",
+        "proxy event kind=emptyBackup forwarded=true",
+        "this computer no longer has the address the proxy is listening on",
         "intercepted request method=GET path=/json/users/:id/authenticator_tokens status=200",
         &format!("backup captured tokens={} native=0", ACCOUNTS.len()),
         &format!("proxy event kind=backupCaptured count={}", ACCOUNTS.len()),
@@ -1015,7 +1177,12 @@ async fn the_whole_flow_with_a_simulated_phone() {
         "unlock succeeded tokens=4 invalid=1 native=1",
         "export cancelled destination=Bitwarden",
         "export written destination=Bitwarden",
-        "bitwarden: signing in region=selfHosted with_code=false",
+        "bitwarden: preparing the tool",
+        "bitwarden: failed stage=prepare kind=download",
+        "bitwarden: signing in region=selfHosted with_code=false by_key=false",
+        "bitwarden: signing in region=selfHosted with_code=false by_key=true",
+        "bitwarden: sign-in answered outcome=NeedsApiKey",
+        "bitwarden: logins listed logins=1",
         "bitwarden: sign-in answered outcome=NeedsTwoFactor",
         "bitwarden: sign-in answered outcome=BadTwoFactorCode",
         "bitwarden: sign-in answered outcome=Ok",
@@ -1025,6 +1192,7 @@ async fn the_whole_flow_with_a_simulated_phone() {
         "starting over: the capture and anything unlocked are discarded",
         "cleanup: proxy stopped",
         "cleanup: certificate key removed",
+        "cleanup: Bitwarden tool removed",
         "cleanup: finished complete=true",
         "finished: the resume marker is cleared",
     ] {
@@ -1046,6 +1214,13 @@ async fn the_whole_flow_with_a_simulated_phone() {
         BW_PASSWORD.into(),
         BW_SERVER.into(),
         BW_CODE.into(),
+        BW_CODE_THEN_EMAIL.into(),
+        BW_CLIENT_ID.into(),
+        "99999999-0000".into(),
+        BW_CLIENT_SECRET.into(),
+        "10.20.30.40".into(),
+        DOWNLOAD_PATH.into(),
+        DOWNLOAD_ASSET.into(),
         VAULT_LOGIN_NAME.into(),
         "otpauth".into(),
         "secret=".into(),
@@ -1065,6 +1240,13 @@ async fn the_whole_flow_with_a_simulated_phone() {
     for code in &codes {
         forbidden.push(format!(" {} ", code.code));
         forbidden.push(format!("={}", code.code));
+    }
+    // On a Mac the computer is kept awake while the proxy runs, and that is in the log.
+    if cfg!(target_os = "macos") {
+        assert!(
+            log.contains("the computer is being kept awake while the connection runs"),
+            "{log}"
+        );
     }
     for planted in &forbidden {
         assert!(

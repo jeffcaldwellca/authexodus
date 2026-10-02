@@ -11,9 +11,11 @@
 //!   `on` prefix and the `Event` suffix: `onProxyEvent` -> `proxy-event`,
 //!   `onBwProgress` -> `bw-progress` (see [`EVENTS`]).
 //! * Payloads and results serialise to the TypeScript shapes exactly (see `dto.rs`).
-//! * A failed command rejects with a plain-language string that never contains a password or a
-//!   secret. No command logs its arguments; `unlock` and `bwLogin` carry passwords, which are
-//!   held in `Zeroizing` so they are wiped from memory when the command is done.
+//! * A failed command rejects with one string, `"<code>: <sentence>"`: a code from the fixed
+//!   list in `errors.rs` for the screen's logic, and a plain sentence for the person. The
+//!   sentences are fixed text, so none can hold a password, a secret, a path or a name. No
+//!   command logs its arguments; `unlock` and `bwLogin` carry passwords, which are held in
+//!   `Zeroizing` so they are wiped from memory when the command is done.
 //!
 //! The command list is written once, in `commands!`, which also builds the Tauri handler, so
 //! `commands_match_api_contract` compares the real registered list against `api.ts`. It also
@@ -42,7 +44,7 @@ pub const EVENT_BW_PROGRESS: &str = "bw-progress";
 
 #[tauri::command]
 pub fn get_state(session: State<'_, Session>) -> AppState {
-    session.get_state()
+    session.get_state(&network::system())
 }
 
 #[tauri::command]
@@ -116,7 +118,7 @@ pub fn finish_export(
     };
     write_owner_only(&path, &file.bytes).map_err(|e| {
         tracing::warn!(destination = ?dest, kind = ?e.kind(), "export could not be written");
-        CmdError::new(format!("could not save the file: {e}"))
+        CmdError(Reject::FileNotSaved)
     })?;
     tracing::info!(destination = ?dest, bytes = file.bytes.len(), "export written");
     Ok(ExportOutcome::Saved {
@@ -147,14 +149,12 @@ pub async fn export_file(
     dialog.save_file(move |picked| {
         let _ = tx.send(picked);
     });
-    let picked = rx
-        .await
-        .map_err(|_| CmdError::new("the save dialog closed unexpectedly"))?;
+    let picked = rx.await.map_err(|_| CmdError(Reject::SaveDialogClosed))?;
     let chosen = match picked {
         None => None,
         Some(p) => Some(
             p.into_path()
-                .map_err(|_| CmdError::new("that location cannot be saved to"))?,
+                .map_err(|_| CmdError(Reject::UnsavableLocation))?,
         ),
     };
     finish_export(dest, &file, chosen)
@@ -165,9 +165,23 @@ pub fn live_codes(session: State<'_, Session>) -> Result<Vec<LiveCode>, CmdError
     session.live_codes()
 }
 
+fn progress_emitter(app: AppHandle) -> EmitProgress {
+    Arc::new(move |line| {
+        let _ = app.emit(EVENT_BW_PROGRESS, line);
+    })
+}
+
+/// Progress lines arrive on `bw-progress` while this runs (see `progress.rs`).
 #[tauri::command]
-pub async fn bw_prepare(session: State<'_, Session>) -> Result<(), CmdError> {
-    session.bw_prepare().await
+pub async fn bw_prepare(app: AppHandle, session: State<'_, Session>) -> Result<(), CmdError> {
+    session.bw_prepare(progress_emitter(app)).await
+}
+
+/// Stop a download or a sign-in that is under way. Never fails: see [`Session::bw_cancel`].
+#[tauri::command]
+pub async fn bw_cancel(session: State<'_, Session>) -> Result<(), CmdError> {
+    session.bw_cancel().await;
+    Ok(())
 }
 
 #[tauri::command]
@@ -185,15 +199,17 @@ pub async fn bw_propose(session: State<'_, Session>) -> Result<Vec<ProposalDto>,
 }
 
 #[tauri::command]
+pub async fn bw_logins(session: State<'_, Session>) -> Result<Vec<VaultLoginView>, CmdError> {
+    session.bw_logins().await
+}
+
+#[tauri::command]
 pub async fn bw_apply(
     app: AppHandle,
     session: State<'_, Session>,
     decisions: Vec<DecisionEntry>,
 ) -> Result<ApplyReportDto, CmdError> {
-    let progress: EmitProgress = Arc::new(move |line| {
-        let _ = app.emit(EVENT_BW_PROGRESS, line);
-    });
-    session.bw_apply(decisions, progress).await
+    session.bw_apply(decisions, progress_emitter(app)).await
 }
 
 #[tauri::command]
@@ -231,8 +247,10 @@ commands!(
     export_file,
     live_codes,
     bw_prepare,
+    bw_cancel,
     bw_login,
     bw_propose,
+    bw_logins,
     bw_apply,
     cleanup,
     finish,
@@ -386,7 +404,7 @@ mod tests {
     fn commands_match_api_contract() {
         let api = api_methods();
         let methods: Vec<String> = api.iter().map(|(name, _)| name.clone()).collect();
-        assert!(methods.len() >= 18, "parsed too few methods: {methods:?}");
+        assert!(methods.len() >= 20, "parsed too few methods: {methods:?}");
 
         let (event_methods, command_methods): (Vec<_>, Vec<_>) =
             methods.iter().partition(|m| m.starts_with("on"));
@@ -469,6 +487,9 @@ mod tests {
         assert_eq!(of("start_proxy"), ["ip"]);
         assert_eq!(of("bw_apply"), ["decisions"]);
         assert_eq!(of("export_file"), ["dest"]);
+        assert_eq!(of("bw_prepare"), Vec::<String>::new());
+        assert_eq!(of("bw_cancel"), Vec::<String>::new());
+        assert_eq!(of("bw_logins"), Vec::<String>::new());
     }
 
     #[test]
@@ -503,21 +524,6 @@ mod tests {
 
     #[test]
     fn app_state_and_proxy_info_serialise_camel_case() {
-        let s = AppState {
-            step: Step::Welcome,
-            device: Some(Device::Iphone),
-            resume_cleanup: false,
-            version: "0.1.0".into(),
-            releases_url: "https://example.com/releases".into(),
-        };
-        assert_eq!(
-            serde_json::to_string(&s).unwrap(),
-            r#"{"step":"welcome","device":"iphone","resumeCleanup":false,"version":"0.1.0","releasesUrl":"https://example.com/releases"}"#
-        );
-        let none = AppState { device: None, ..s };
-        assert!(serde_json::to_string(&none)
-            .unwrap()
-            .contains(r#""device":null"#));
         let info = ProxyInfo {
             addresses: vec![AddressView {
                 ip: "1.2.3.4".into(),
@@ -529,19 +535,74 @@ mod tests {
             cert_qr_svg: "<svg/>".into(),
             check_url: "https://c/".into(),
             cert_fingerprint: "AB:CD".into(),
+            cert_constrained: true,
         };
+        let s = AppState {
+            step: Step::Welcome,
+            device: Some(Device::Iphone),
+            resume_cleanup: false,
+            version: "0.1.0".into(),
+            releases_url: "https://example.com/releases".into(),
+            session: SessionSnapshot {
+                proxy: None,
+                device_connected: false,
+                trust_working: false,
+                captured: 0,
+                summary: None,
+            },
+        };
+        assert_eq!(
+            serde_json::to_string(&s).unwrap(),
+            r#"{"step":"welcome","device":"iphone","resumeCleanup":false,"version":"0.1.0","releasesUrl":"https://example.com/releases","session":{"proxy":null,"deviceConnected":false,"trustWorking":false,"captured":0,"summary":null}}"#
+        );
+        let none = AppState {
+            device: None,
+            ..s.clone()
+        };
+        assert!(serde_json::to_string(&none)
+            .unwrap()
+            .contains(r#""device":null"#));
+        let running = AppState {
+            session: SessionSnapshot {
+                proxy: Some(info.clone()),
+                device_connected: true,
+                trust_working: true,
+                captured: 3,
+                summary: Some(UnlockSummary {
+                    tokens: vec![],
+                    invalid: vec![],
+                    native: vec![NativeView {
+                        name: "Synthetic Native".into(),
+                    }],
+                }),
+            },
+            ..s
+        };
+        let v = serde_json::to_value(&running).unwrap();
+        assert_eq!(v["session"]["proxy"]["certConstrained"], true);
+        assert_eq!(v["session"]["deviceConnected"], true);
+        assert_eq!(v["session"]["trustWorking"], true);
+        assert_eq!(v["session"]["captured"], 3);
+        assert_eq!(
+            v["session"]["summary"],
+            serde_json::json!({ "tokens": [], "invalid": [], "native": [{ "name": "Synthetic Native" }] })
+        );
         let v = serde_json::to_value(&info).unwrap();
-        for k in [
-            "addresses",
-            "ip",
-            "port",
-            "certUrl",
-            "certQrSvg",
-            "checkUrl",
-            "certFingerprint",
-        ] {
-            assert!(v.get(k).is_some(), "missing {k}");
-        }
+        let keys: Vec<&str> = v.as_object().unwrap().keys().map(String::as_str).collect();
+        assert_eq!(
+            keys,
+            [
+                "addresses",
+                "certConstrained",
+                "certFingerprint",
+                "certQrSvg",
+                "certUrl",
+                "checkUrl",
+                "ip",
+                "port"
+            ],
+            "exactly the fields of `ProxyInfo` in api.ts"
+        );
         let code = serde_json::to_value(LiveCode {
             id: "1".into(),
             code: "123456".into(),
@@ -552,6 +613,29 @@ mod tests {
         assert_eq!(
             serde_json::to_string(&Step::Certificate).unwrap(),
             r#""certificate""#
+        );
+        let login = serde_json::to_value(VaultLoginView {
+            item_id: "x".into(),
+            name: "Example".into(),
+            username: None,
+            has_code: true,
+        })
+        .unwrap();
+        assert_eq!(
+            login,
+            serde_json::json!({ "itemId": "x", "name": "Example", "username": null, "hasCode": true })
+        );
+        assert_eq!(
+            serde_json::to_string(&BwLoginResult::NeedsApiKey).unwrap(),
+            r#"{"kind":"needsApiKey"}"#
+        );
+        assert_eq!(
+            serde_json::to_string(&ProxyEventDto::EmptyBackup).unwrap(),
+            r#"{"kind":"emptyBackup"}"#
+        );
+        assert_eq!(
+            serde_json::to_string(&ProxyEventDto::AddressChanged).unwrap(),
+            r#"{"kind":"addressChanged"}"#
         );
     }
 

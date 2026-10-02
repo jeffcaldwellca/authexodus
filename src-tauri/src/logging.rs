@@ -77,15 +77,18 @@ pub fn bw_error_kind(error: &BwError) -> &'static str {
         BwError::Cli(_) => "cli",
         BwError::Download(_) => "download",
         BwError::ChecksumMismatch => "checksumMismatch",
-        BwError::Input(_) => "input",
-        BwError::Unsupported(_) => "unsupported",
+        BwError::BadEmail => "badEmail",
+        BwError::BadServerUrl => "badServerUrl",
+        BwError::Cancelled => "cancelled",
+        BwError::UnsupportedPlatform => "unsupportedPlatform",
     }
 }
 
 /// A message from the Bitwarden tool made fit for the log. The tool's text can carry what the
 /// person typed or what a server chose to say, so: one line, at most 200 characters, and every
-/// word that holds an `@` (an email address), a `://` (an address), a `/` or `\` (a path), or
-/// is long enough to be a key or an id (20 characters or more, or 6 or more digits) becomes
+/// word that holds an `@` (an email address), a `://` (an address), a `/` or `\` (a path), a
+/// dot between two letters or digits (a server or file name, however short), or is long
+/// enough to be a key or an id (20 characters or more, or 6 or more digits) becomes
 /// `[removed]`. Quoted text, which is how the tool repeats names back, is removed whole.
 pub fn sanitised(message: &str) -> String {
     const LIMIT: usize = 200;
@@ -99,6 +102,7 @@ pub fn sanitised(message: &str) -> String {
             || word.contains("://")
             || word.contains('/')
             || word.contains('\\')
+            || has_inner_dot(word)
             || word.chars().count() >= 20
             || word.chars().filter(char::is_ascii_digit).count() >= 6;
         if quotes % 2 == 1 {
@@ -118,6 +122,15 @@ pub fn sanitised(message: &str) -> String {
         out = out.chars().take(LIMIT).collect::<String>() + "...";
     }
     out
+}
+
+/// Is there a dot with a letter or a digit on both sides of it (`vault.example.test`,
+/// `data.json`)? A full stop at the end of a sentence is not one.
+fn has_inner_dot(word: &str) -> bool {
+    let chars: Vec<char> = word.chars().collect();
+    chars
+        .windows(3)
+        .any(|w| w[1] == '.' && w[0].is_alphanumeric() && w[2].is_alphanumeric())
 }
 
 /// Let the process hold more open files than the 256 a Mac app starts with: every proxied
@@ -191,6 +204,15 @@ mod tests {
             sanitised("session 4Nk9aVeryLongSessionKeyValue0000== refused, id 123456 /Users/sam/x"),
             "session [removed] refused, id [removed]"
         );
+        // A bare server name is short enough to pass every other rule.
+        assert_eq!(
+            sanitised("getaddrinfo ENOTFOUND vault.example.test"),
+            "getaddrinfo ENOTFOUND [removed]"
+        );
+        assert_eq!(
+            sanitised("could not read data.json. Try again."),
+            "could not read [removed] Try again."
+        );
         let long = sanitised(&"word ".repeat(100));
         assert_eq!(long.chars().count(), 203);
         assert!(long.ends_with("..."));
@@ -250,10 +272,8 @@ mod tests {
     fn every_bitwarden_error_has_a_kind() {
         assert_eq!(bw_error_kind(&BwError::SessionExpired), "sessionExpired");
         assert_eq!(bw_error_kind(&BwError::Cli("x".into())), "cli");
-        assert_eq!(
-            bw_error_kind(&BwError::Unsupported("x".into())),
-            "unsupported"
-        );
+        assert_eq!(bw_error_kind(&BwError::Cancelled), "cancelled");
+        assert_eq!(bw_error_kind(&BwError::BadEmail), "badEmail");
     }
 
     #[cfg(unix)]

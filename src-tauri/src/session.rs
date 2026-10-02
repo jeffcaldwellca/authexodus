@@ -8,15 +8,21 @@
 //! and their failures, with counts and kinds only. Never a password, a key, a one-time code,
 //! a token or login name, an email address, a file path, or anything about the device's
 //! traffic beyond what the proxy itself logs.
+//!
+//! What a refused command tells the person is in `crate::errors`, as fixed sentences. The
+//! detail of a failure (what the key store or the Bitwarden tool said) goes to the log only.
 
+use std::collections::HashSet;
 use std::net::{IpAddr, Ipv4Addr};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-use authexodus_core::backup::{self, BackupError};
-use authexodus_core::bitwarden::{self, BwClient, CliBinary, CliClient, LoginOutcome};
+use authexodus_core::backup;
+use authexodus_core::bitwarden::{
+    self, BwClient, BwError, Cancel, CliBinary, CliClient, CodeMark, LoginOutcome, PrepareStage,
+};
 use authexodus_core::ca::{Authority, KeyStore};
 use authexodus_core::export::{self, ExportFile};
 use authexodus_core::proxy::{self, ProxyConfig, ProxyEvent, ProxyHandle, TestUpstream};
@@ -27,10 +33,12 @@ use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
 use zeroize::Zeroizing;
 
+use crate::awake::{KeepAwake, KeepAwakeCommand};
 use crate::dto::*;
-use crate::keychain::KEYCHAIN_SERVICE;
+use crate::errors::{bw_reject, BwStage};
 use crate::logging::{bw_error_kind, sanitised};
 use crate::network::{self, Candidate, Network};
+use crate::progress;
 
 /// Whether the certificate authority carries the name constraint (it may only issue for
 /// `authy.com`), unless [`UNCONSTRAINED_ENV`] says otherwise for one launch.
@@ -50,11 +58,16 @@ pub fn ca_constrained(env_value: Option<&str>) -> bool {
 pub const PREFERRED_PORT: u16 = 8080;
 /// The UI gets at most one `tlsRejected` in this window.
 pub const TLS_DEBOUNCE: Duration = Duration::from_secs(2);
+/// How often, while the proxy runs, this computer's addresses are read to see that the one
+/// the proxy is on is still among them.
+pub const ADDRESS_WATCH_EVERY: Duration = Duration::from_secs(5);
 /// Where new versions are published. There is no auto-update: the app shows this address.
 pub const RELEASES_URL: &str = "https://github.com/jeffcaldwellca/authexodus/releases";
 
 pub type EmitProxy = Arc<dyn Fn(ProxyEventDto) + Send + Sync>;
 pub type EmitProgress = Arc<dyn Fn(String) + Send + Sync>;
+/// Every address this computer has right now.
+pub type AddressSource = Arc<dyn Fn() -> Vec<IpAddr> + Send + Sync>;
 
 fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
     m.lock().unwrap_or_else(PoisonError::into_inner)
@@ -76,7 +89,9 @@ impl Paths {
     pub fn marker(&self) -> PathBuf {
         self.dir.join("session.json")
     }
-    /// Where the downloaded, verified `bw` binary lives. Kept between runs.
+    /// Where the downloaded, verified `bw` program lives (the zip, 42 to 44 MB, and the
+    /// program unpacked from it, about 130 MB). Removed at cleanup, when the app closes and
+    /// when it next starts: it is downloaded again by a run that wants it.
     pub fn bw_cli(&self) -> PathBuf {
         self.dir.join("bw-cli")
     }
@@ -100,7 +115,10 @@ fn write_marker(paths: &Paths) -> Result<(), CmdError> {
                 serde_json::to_vec(&Marker { ca_created: true }).unwrap_or_default(),
             )
         })
-        .map_err(|e| CmdError::new(format!("could not write the session marker: {e}")))
+        .map_err(|e| {
+            tracing::error!(kind = ?e.kind(), "the session marker could not be written");
+            CmdError(Reject::MarkerNotWritten)
+        })
 }
 
 fn marker_exists(paths: &Paths) -> bool {
@@ -114,9 +132,18 @@ fn remove_marker(paths: &Paths) -> Result<(), CmdError> {
     match std::fs::remove_file(paths.marker()) {
         Ok(()) => Ok(()),
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
-        Err(e) => Err(CmdError::new(format!(
-            "could not remove the session marker: {e}"
-        ))),
+        Err(e) => {
+            tracing::error!(kind = ?e.kind(), "the session marker could not be removed");
+            Err(CmdError(Reject::CleanupMarkerNotRemoved))
+        }
+    }
+}
+
+/// Remove a folder of this app's own. One that is not there is already removed.
+fn remove_dir(path: &Path) -> std::io::Result<()> {
+    match std::fs::remove_dir_all(path) {
+        Err(e) if e.kind() != std::io::ErrorKind::NotFound => Err(e),
+        _ => Ok(()),
     }
 }
 
@@ -145,27 +172,53 @@ impl Bridge {
     }
 }
 
-fn step_for(event: &ProxyEventDto) -> Option<Step> {
-    match event {
-        ProxyEventDto::DeviceConnected => Some(Step::Certificate),
-        ProxyEventDto::TrustWorking => Some(Step::Authy),
-        ProxyEventDto::BackupCaptured { .. } => Some(Step::Unlock),
-        ProxyEventDto::TlsRejected
-        | ProxyEventDto::AuthyError { .. }
-        | ProxyEventDto::DeviceRefused => None,
+/// A task that is stopped when this is dropped, so that it cannot outlive what it serves.
+struct AbortOnDrop(JoinHandle<()>);
+
+impl Drop for AbortOnDrop {
+    fn drop(&mut self) {
+        self.0.abort();
     }
 }
 
-struct UiState {
-    step: Step,
-    device: Option<Device>,
+/// What has happened on one run of the proxy. A restarted proxy starts again from nothing.
+#[derive(Default)]
+struct RunFacts {
+    device_connected: AtomicBool,
+    trust_working: AtomicBool,
 }
 
-/// Only ever moves the wizard forward: a late event cannot pull it back.
-fn advance(ui: &Mutex<UiState>, to: Step) {
-    let mut ui = lock(ui);
-    if to > ui.step {
-        ui.step = to;
+impl RunFacts {
+    fn note(&self, event: &ProxyEvent) {
+        match event {
+            ProxyEvent::DeviceConnected => self.device_connected.store(true, Ordering::SeqCst),
+            ProxyEvent::TrustWorking => self.trust_working.store(true, Ordering::SeqCst),
+            _ => {}
+        }
+    }
+}
+
+/// Is `ip` an address this computer still has? (An unspecified address means "every
+/// address", which it always has.)
+fn still_ours(ip: Ipv4Addr, own: &[IpAddr]) -> bool {
+    ip.is_unspecified() || own.contains(&IpAddr::V4(ip))
+}
+
+/// While the proxy runs on `ip`: read this computer's addresses every `every`, and tell the
+/// UI, once each time it happens, that `ip` is no longer among them. (A computer that moves
+/// to another Wi-Fi keeps its listener, bound to an address nothing can reach any more.)
+async fn watch_address(ip: Ipv4Addr, every: Duration, addresses: AddressSource, emit: EmitProxy) {
+    let mut gone = false;
+    loop {
+        tokio::time::sleep(every).await;
+        let now_gone = !still_ours(ip, &addresses());
+        if now_gone && !gone {
+            tracing::warn!("this computer no longer has the address the proxy is listening on");
+            emit(ProxyEventDto::AddressChanged);
+        } else if gone && !now_gone {
+            tracing::info!("this computer has the proxy's address again");
+        }
+        gone = now_gone;
     }
 }
 
@@ -174,15 +227,28 @@ fn advance(ui: &Mutex<UiState>, to: Step) {
 struct ProxyRun {
     ip: Ipv4Addr,
     handle: ProxyHandle,
-    bridge: JoinHandle<()>,
+    facts: Arc<RunFacts>,
     /// The fingerprint of the certificate this run serves.
     fingerprint: String,
+    // The three below end with the run, however it ends (stopped, or simply dropped).
+    _bridge: AbortOnDrop,
+    _watch: AbortOnDrop,
+    _awake: Option<KeepAwake>,
 }
 
 impl ProxyRun {
     async fn stop(self) {
-        self.bridge.abort();
-        self.handle.shutdown().await;
+        let ProxyRun {
+            handle,
+            _bridge,
+            _watch,
+            _awake,
+            ..
+        } = self;
+        drop((_bridge, _watch));
+        handle.shutdown().await;
+        // Last: the computer may sleep again once nothing is listening.
+        drop(_awake);
     }
 
     /// Has anything of the backup arrived on this run?
@@ -192,10 +258,39 @@ impl ProxyRun {
     }
 }
 
-/// Test seams for the proxy; production keeps the defaults.
-struct ProxyTuning {
+/// Where a test has the Bitwarden tool downloaded from, instead of the pinned release.
+#[derive(Clone)]
+struct BwDownload {
+    base_url: String,
+    asset: String,
+    sha256: String,
+}
+
+/// Test seams; production keeps the defaults.
+struct Tuning {
     port: u16,
     upstream: Option<TestUpstream>,
+    keep_awake: Option<KeepAwakeCommand>,
+    addresses: AddressSource,
+    watch_every: Duration,
+    bw_download: Option<BwDownload>,
+}
+
+/// One login of the vault as it was last read: what the person may attach to.
+struct VaultEntry {
+    view: VaultLoginView,
+    /// Which code it holds, if it holds one that could be read.
+    code: Option<CodeMark>,
+}
+
+fn vault_entries(vault: &[bitwarden::VaultLogin]) -> Vec<VaultEntry> {
+    vault
+        .iter()
+        .map(|login| VaultEntry {
+            view: VaultLoginView::from(login),
+            code: login.code,
+        })
+        .collect()
 }
 
 pub struct Session {
@@ -207,23 +302,36 @@ pub struct Session {
     /// Set when a cleanup has run to the end without a failure and nothing has been created
     /// since: there is then nothing left for [`Session::finish`] to remove.
     cleaned: AtomicBool,
-    ui: Arc<Mutex<UiState>>,
+    /// A cleanup has been run (whether or not all of it worked) and nothing was started since.
+    cleanup_run: AtomicBool,
+    /// [`Session::finish`] succeeded and nothing was started since.
+    finished: AtomicBool,
+    device: Mutex<Option<Device>>,
     authority: Mutex<Option<Arc<Authority>>>,
     proxy: tokio::sync::Mutex<Option<ProxyRun>>,
     /// The address the proxy last ran on: where a start-over goes when none is named.
     last_ip: Mutex<Option<Ipv4Addr>>,
-    tuning: Mutex<ProxyTuning>,
+    tuning: Mutex<Tuning>,
     /// Counts the times the session's secrets were thrown away (start-over, cleanup, exit).
     /// Slow work that began before such a moment must not put anything back afterwards: an
     /// unlock or a Bitwarden sign-in notes the count when it starts and gives up if it moved.
     discards: AtomicU64,
     unlocked: Mutex<Option<Arc<Unlocked>>>,
     bw_binary: Mutex<Option<CliBinary>>,
-    /// Held for the whole of a sign-in, so two never run against the one data folder.
-    bw_signing_in: tokio::sync::Mutex<()>,
+    /// Held for the whole of a download or a sign-in, so that only one of them runs at a
+    /// time (two would share one download folder, or one data folder).
+    bw_op: tokio::sync::Mutex<()>,
+    /// The way to stop the download or sign-in that is under way, if one is.
+    bw_stop: Mutex<Option<Cancel>>,
     bw: tokio::sync::Mutex<Option<Box<dyn BwClient>>>,
-    /// The last proposals shown to the person: what `bw_apply` may attach to.
+    /// Which account the proposals and the vault below were read from: the server and the
+    /// email address, nothing secret. They are kept across a new sign-in to the same account
+    /// (a session that ended), and dropped when another account signs in.
+    bw_account: Mutex<Option<String>>,
+    /// The last proposals shown to the person.
     proposals: Mutex<Option<Vec<ProposalDto>>>,
+    /// The vault's logins as last read: what `bw_apply` may attach to.
+    vault: Mutex<Option<Vec<VaultEntry>>>,
 }
 
 /// The address asked for, if one was.
@@ -232,32 +340,24 @@ fn parse_ip(requested: Option<&str>) -> Result<Option<Ipv4Addr>, CmdError> {
         Some(s) => s
             .parse()
             .map(Some)
-            .map_err(|_| CmdError::new("That is not a valid network address.")),
+            .map_err(|_| CmdError(Reject::AddressInvalid)),
         None => Ok(None),
     }
 }
-
-/// Shown when no address was asked for and this computer has no private (home or office)
-/// network address to default to.
-pub const NO_LAN_ADDRESS: &str = "This computer is not on a home or office Wi-Fi network. Connect it to the same Wi-Fi as the iPhone or iPad and try again.";
-/// Shown when the address asked for is a public one.
-pub const PUBLIC_ADDRESS: &str = "That address is reachable from the internet, so the connection cannot be opened on it. Use this computer's address on your home or office Wi-Fi.";
-/// Shown when the address asked for is not one of this computer's.
-pub const NOT_OUR_ADDRESS: &str = "That address is not one of this computer's network addresses.";
 
 /// The address to listen on. One that was asked for must be one of this computer's and must
 /// not be a public address; with none asked for, only a private (RFC 1918) address is ever
 /// chosen, and with none of those there is no default at all.
 fn choose_ip(requested: Option<Ipv4Addr>, candidates: &[Candidate]) -> Result<Ipv4Addr, CmdError> {
     match requested {
-        Some(ip) if network::is_public(ip) => Err(CmdError::new(PUBLIC_ADDRESS)),
+        Some(ip) if network::is_public(ip) => Err(CmdError(Reject::AddressPublic)),
         Some(ip) if candidates.iter().any(|c| c.ip == ip) => Ok(ip),
-        Some(_) => Err(CmdError::new(NOT_OUR_ADDRESS)),
-        None => network::default_ip(candidates).ok_or_else(|| CmdError::new(NO_LAN_ADDRESS)),
+        Some(_) => Err(CmdError(Reject::AddressNotOurs)),
+        None => network::default_ip(candidates).ok_or(CmdError(Reject::NoPrivateAddress)),
     }
 }
 
-fn proxy_info(run: &ProxyRun, candidates: &[Candidate]) -> ProxyInfo {
+fn proxy_info(run: &ProxyRun, candidates: &[Candidate], constrained: bool) -> ProxyInfo {
     let (ip, port) = (run.ip, run.handle.port());
     let cert_url = format!("http://{ip}:{port}/");
     ProxyInfo {
@@ -274,6 +374,7 @@ fn proxy_info(run: &ProxyRun, candidates: &[Candidate]) -> ProxyInfo {
         cert_url,
         check_url: format!("https://{}/", proxy::CHECK_HOST),
         cert_fingerprint: run.fingerprint.clone(),
+        cert_constrained: constrained,
     }
 }
 
@@ -286,6 +387,7 @@ fn event_kind(event: &ProxyEvent) -> &'static str {
         ProxyEvent::BackupCaptured { .. } => "backupCaptured",
         ProxyEvent::AuthyError { .. } => "authyError",
         ProxyEvent::DeviceRefused => "deviceRefused",
+        ProxyEvent::EmptyBackup => "emptyBackup",
     }
 }
 
@@ -306,8 +408,8 @@ fn log_event(event: &ProxyEvent, forwarded: bool) {
 
 /// Seconds left in the current period and the code for every token, both worked out from the
 /// one instant `unix_time`, so the count is always the time left on the very code beside it:
-/// `secondsLeft` runs from the period (30) down to 1 and a new code starts at the top. A
-/// token whose code cannot be made is left out rather than shown wrong.
+/// `secondsLeft` runs from the period (30) down to 1 and a new code starts at the top.
+/// (Unlocking only lets through tokens a code can be made for, so none is left out here.)
 pub fn live_codes(unlocked: &Unlocked, unix_time: u64) -> Vec<LiveCode> {
     unlocked
         .tokens
@@ -415,44 +517,55 @@ where
 
 // ---------------------------------------------------------------------------------------------
 
-/// Is every decision one the person could have been offered? Every token must be one of the
-/// unlocked ones, and a login may only be attached to a token it was proposed for, and only
-/// when it had no code of its own. One bad entry refuses the whole list: nothing is applied.
+/// May these decisions be applied? Every token must be one of the unlocked ones. A login may
+/// be attached to when it is in the vault as it was last read and holds no code (or holds
+/// this very token's code already: an earlier run put it there, and the apply will find it
+/// done), and no login may be chosen for two tokens. One bad entry refuses the whole list:
+/// nothing is applied.
 fn check_decisions(
     decisions: &[DecisionEntry],
     unlocked: &Unlocked,
-    proposals: Option<&[ProposalDto]>,
+    vault: Option<&[VaultEntry]>,
 ) -> Result<(), CmdError> {
+    let mut chosen: HashSet<&str> = HashSet::new();
     for entry in decisions {
-        if !unlocked.tokens.iter().any(|t| t.id == entry.token_id) {
-            return Err(CmdError::new(
-                "One of the accounts to move is not in the unlocked backup. Nothing was changed.",
-            ));
-        }
+        let Some(token) = unlocked.tokens.iter().find(|t| t.id == entry.token_id) else {
+            return Err(CmdError(Reject::DecisionUnknownAccount));
+        };
         let DecisionDto::Attach { item_id } = &entry.decision else {
             continue;
         };
-        let offered = proposals
+        let Some(login) = vault
             .into_iter()
             .flatten()
-            .filter(|p| p.token_id == entry.token_id)
-            .flat_map(|p| &p.candidates)
-            .any(|c| &c.item_id == item_id && !c.has_code);
-        if !offered {
-            return Err(CmdError::new(
-                "One of the chosen Bitwarden logins was not among the matches offered for that account, or already has a code. Nothing was changed.",
-            ));
+            .find(|login| &login.view.item_id == item_id)
+        else {
+            return Err(CmdError(Reject::DecisionUnknownLogin));
+        };
+        let holds_this_code =
+            login.code.is_some() && login.code == CodeMark::of_secret(token.secret.expose());
+        if login.view.has_code && !holds_this_code {
+            return Err(CmdError(Reject::DecisionLoginHasCode));
+        }
+        if !chosen.insert(item_id.as_str()) {
+            return Err(CmdError(Reject::DecisionLoginTwice));
         }
     }
     Ok(())
+}
+
+/// Which account a sign-in is for: the server and the email address as typed, in lower case.
+fn account_key(region: &bitwarden::Region, email: &str) -> String {
+    format!("{}\n{}", region.server_url(), email.to_lowercase())
 }
 
 impl Session {
     /// A session over `store`, keeping its files in `dir`. Reads the resume marker: a marker
     /// left by an earlier launch means the certificate may still be installed on a device.
     ///
-    /// Bitwarden data left by an earlier launch is removed here: the key to it lived in that
-    /// launch's memory, so it is of no use, and a launch that crashed never wiped it.
+    /// What Bitwarden left from an earlier launch is removed here: its data (the key to it
+    /// lived in that launch's memory, so it is of no use, and a launch that crashed never
+    /// wiped it) and the downloaded tool itself.
     ///
     /// The certificate authority is constrained unless [`UNCONSTRAINED_ENV`] is set to `1`.
     pub fn new(store: Arc<dyn KeyStore>, dir: PathBuf) -> Session {
@@ -465,7 +578,8 @@ impl Session {
     pub fn with_ca_mode(store: Arc<dyn KeyStore>, dir: PathBuf, constrained: bool) -> Session {
         let paths = Paths::new(dir);
         let resume = marker_exists(&paths);
-        let _ = std::fs::remove_dir_all(paths.bw_data());
+        let _ = remove_dir(&paths.bw_data());
+        let _ = remove_dir(&paths.bw_cli());
         if constrained {
             tracing::info!(resume_cleanup = resume, constrained, "session ready");
         } else {
@@ -484,23 +598,29 @@ impl Session {
             paths,
             resume_cleanup: AtomicBool::new(resume),
             cleaned: AtomicBool::new(false),
-            ui: Arc::new(Mutex::new(UiState {
-                step: if resume { Step::Cleanup } else { Step::Welcome },
-                device: None,
-            })),
+            cleanup_run: AtomicBool::new(false),
+            finished: AtomicBool::new(false),
+            device: Mutex::new(None),
             authority: Mutex::new(None),
             proxy: tokio::sync::Mutex::new(None),
             last_ip: Mutex::new(None),
-            tuning: Mutex::new(ProxyTuning {
+            tuning: Mutex::new(Tuning {
                 port: PREFERRED_PORT,
                 upstream: None,
+                keep_awake: KeepAwakeCommand::system(),
+                addresses: Arc::new(|| network::own_addresses(&network::system_ifaces())),
+                watch_every: ADDRESS_WATCH_EVERY,
+                bw_download: None,
             }),
             discards: AtomicU64::new(0),
             unlocked: Mutex::new(None),
             bw_binary: Mutex::new(None),
-            bw_signing_in: tokio::sync::Mutex::new(()),
+            bw_op: tokio::sync::Mutex::new(()),
+            bw_stop: Mutex::new(None),
             bw: tokio::sync::Mutex::new(None),
+            bw_account: Mutex::new(None),
             proposals: Mutex::new(None),
+            vault: Mutex::new(None),
         }
     }
 
@@ -509,22 +629,108 @@ impl Session {
     /// `test-upstream` feature, which only test builds switch on.
     #[doc(hidden)]
     pub fn tune_proxy(&self, port: u16, upstream: Option<TestUpstream>) {
-        *lock(&self.tuning) = ProxyTuning { port, upstream };
+        let mut tuning = lock(&self.tuning);
+        tuning.port = port;
+        tuning.upstream = upstream;
     }
 
-    pub fn get_state(&self) -> AppState {
-        let ui = lock(&self.ui);
+    /// For tests: how often this computer's addresses are read while the proxy runs, and
+    /// where they are read from. The app never calls this.
+    #[doc(hidden)]
+    pub fn tune_address_watch(&self, every: Duration, addresses: AddressSource) {
+        let mut tuning = lock(&self.tuning);
+        tuning.watch_every = every;
+        tuning.addresses = addresses;
+    }
+
+    /// For tests: the program run to keep the computer awake. The app never calls this.
+    #[doc(hidden)]
+    pub fn tune_keep_awake(&self, command: Option<KeepAwakeCommand>) {
+        lock(&self.tuning).keep_awake = command;
+    }
+
+    /// For tests: where the Bitwarden tool is downloaded from, and the hash to expect. The
+    /// app never calls this: it only ever downloads the pinned release.
+    #[doc(hidden)]
+    pub fn tune_bw_download(&self, base_url: &str, asset: &str, sha256: &str) {
+        lock(&self.tuning).bw_download = Some(BwDownload {
+            base_url: base_url.to_owned(),
+            asset: asset.to_owned(),
+            sha256: sha256.to_owned(),
+        });
+    }
+
+    /// What the shell knows, for the UI to start from or to recover with after its window
+    /// was reloaded.
+    ///
+    /// `step` is not tracked; it is read off the same facts the snapshot carries, as the
+    /// furthest step they establish:
+    ///
+    /// | fact | step |
+    /// |---|---|
+    /// | `finish` succeeded | `done` |
+    /// | a cleanup was run, or an earlier launch left one due | `cleanup` |
+    /// | a backup is unlocked | `destination` |
+    /// | the proxy holds a captured backup | `unlock` |
+    /// | a device trusted the certificate on this proxy run | `authy` |
+    /// | a device used this proxy run | `certificate` |
+    /// | the proxy is running | `connect` |
+    /// | none of these | `welcome` |
+    ///
+    /// It is never `verify`: whether the person is choosing a destination or checking the
+    /// codes is the screen's own business, and nothing here could tell.
+    ///
+    /// While the proxy is being started or stopped (which can wait on a system prompt), this
+    /// does not wait for it: the snapshot then says there is no proxy, and `start_proxy`
+    /// gives the answer when it is there.
+    pub fn get_state(&self, net: &Network) -> AppState {
+        let mut session = SessionSnapshot {
+            proxy: None,
+            device_connected: false,
+            trust_working: false,
+            captured: 0,
+            summary: lock(&self.unlocked).as_deref().map(UnlockSummary::from),
+        };
+        let mut has_capture = false;
+        if let Ok(slot) = self.proxy.try_lock() {
+            if let Some(run) = slot.as_ref() {
+                session.proxy = Some(proxy_info(run, &net.candidates, self.constrained));
+                session.device_connected = run.facts.device_connected.load(Ordering::SeqCst);
+                session.trust_working = run.facts.trust_working.load(Ordering::SeqCst);
+                session.captured = run.handle.backup().tokens.len();
+                has_capture = run.has_capture();
+            }
+        }
+        let resume_cleanup = self.resume_cleanup.load(Ordering::SeqCst);
+        let step = if self.finished.load(Ordering::SeqCst) {
+            Step::Done
+        } else if resume_cleanup || self.cleanup_run.load(Ordering::SeqCst) {
+            Step::Cleanup
+        } else if session.summary.is_some() {
+            Step::Destination
+        } else if has_capture {
+            Step::Unlock
+        } else if session.trust_working {
+            Step::Authy
+        } else if session.device_connected {
+            Step::Certificate
+        } else if session.proxy.is_some() {
+            Step::Connect
+        } else {
+            Step::Welcome
+        };
         AppState {
-            step: ui.step,
-            device: ui.device,
-            resume_cleanup: self.resume_cleanup.load(Ordering::SeqCst),
+            step,
+            device: *lock(&self.device),
+            resume_cleanup,
             version: env!("CARGO_PKG_VERSION").to_string(),
             releases_url: RELEASES_URL.to_string(),
+            session,
         }
     }
 
     pub fn set_device(&self, device: Device) {
-        lock(&self.ui).device = Some(device);
+        *lock(&self.device) = Some(device);
     }
 
     /// Whether this launch's certificate authority carries the name constraint.
@@ -539,9 +745,9 @@ impl Session {
     /// has nothing to remove), never a key the next launch does not know about. If the key
     /// cannot be created, the marker written here is taken away again.
     ///
-    /// The key store is never read: whatever it holds is deleted and a new key is stored (see
-    /// [`Authority::create_fresh`]). The store may block on a system prompt, so it is called
-    /// on the blocking pool.
+    /// The key store is never read (it cannot be): whatever it holds is deleted and a new key
+    /// is stored (see [`Authority::create_fresh`]). The store may block on a system prompt,
+    /// so it is called on the blocking pool.
     async fn ensure_ca(&self) -> Result<Arc<Authority>, CmdError> {
         if let Some(ca) = lock(&self.authority).as_ref() {
             return Ok(Arc::clone(ca));
@@ -561,8 +767,9 @@ impl Session {
                 if !had_marker {
                     let _ = remove_marker(&self.paths);
                 }
+                // The reason is the key store's own wording: for the log, not the screen.
                 tracing::error!(error = %reason, "the certificate authority could not be created");
-                return Err(CmdError::new(certificate_not_created(&reason)));
+                return Err(CmdError(Reject::KeychainFailed));
             }
         };
         if ca.is_constrained() {
@@ -585,7 +792,10 @@ impl Session {
     /// Make sure the proxy is running, on `requested` if an address is given.
     ///
     /// * Running already and no address given, or the address it is on: nothing changes; the
-    ///   running proxy is described again.
+    ///   running proxy is described again. Unless this computer no longer has that address
+    ///   (it moved to another network): the proxy is then listening where nothing can reach
+    ///   it, and describing it again would be a lie, so that is an error which says so. The
+    ///   way out is [`Session::restart_proxy`].
     /// * Running on another address and nothing captured yet: it moves to the new address.
     /// * Running on another address with a backup captured (or unlocked): an error. Moving
     ///   would throw the backup away, and that only happens through [`Session::restart_proxy`].
@@ -599,7 +809,13 @@ impl Session {
         let mut slot = self.proxy.lock().await;
         if let Some(run) = slot.as_ref() {
             if requested.is_none_or(|ip| ip == run.ip) {
-                return Ok(proxy_info(run, &net.candidates));
+                let here =
+                    net.candidates.iter().any(|c| c.ip == run.ip) || still_ours(run.ip, &net.own);
+                if !here {
+                    tracing::warn!("asked for the proxy, whose address this computer has lost");
+                    return Err(CmdError(Reject::AddressChanged));
+                }
+                return Ok(proxy_info(run, &net.candidates, self.constrained));
             }
         }
         let ip = choose_ip(requested, &net.candidates).inspect_err(
@@ -607,17 +823,14 @@ impl Session {
         )?;
         if let Some(run) = slot.as_ref() {
             if run.has_capture() || lock(&self.unlocked).is_some() {
-                return Err(CmdError::new(
-                    "A backup has already been captured on the current address. Changing the address means starting over.",
-                ));
+                return Err(CmdError(Reject::CaptureWouldBeLost));
             }
         }
         if let Some(old) = slot.take() {
             old.stop().await;
         }
         let run = self.launch(ip, net, emit).await?;
-        advance(&self.ui, Step::Connect);
-        let info = proxy_info(&run, &net.candidates);
+        let info = proxy_info(&run, &net.candidates, self.constrained);
         *slot = Some(run);
         Ok(info)
     }
@@ -653,16 +866,8 @@ impl Session {
         if let Some(old) = slot.take() {
             old.stop().await;
         }
-        {
-            // The one place the wizard goes back: the person asked to.
-            let mut ui = lock(&self.ui);
-            if ui.step > Step::Connect && ui.step < Step::Cleanup {
-                ui.step = Step::Connect;
-            }
-        }
         let run = self.launch(ip, net, emit).await?;
-        advance(&self.ui, Step::Connect);
-        let info = proxy_info(&run, &net.candidates);
+        let info = proxy_info(&run, &net.candidates, self.constrained);
         *slot = Some(run);
         Ok(info)
     }
@@ -672,7 +877,14 @@ impl Session {
     fn discard_secrets(&self) {
         self.discards.fetch_add(1, Ordering::SeqCst);
         lock(&self.unlocked).take();
+        self.forget_vault();
+    }
+
+    /// Forget what was read from a Bitwarden vault and what was proposed from it.
+    fn forget_vault(&self) {
         lock(&self.proposals).take();
+        lock(&self.vault).take();
+        lock(&self.bw_account).take();
     }
 
     async fn launch(
@@ -683,9 +895,15 @@ impl Session {
     ) -> Result<ProxyRun, CmdError> {
         let ca = self.ensure_ca().await?;
         let fingerprint = ca.fingerprint();
-        let (port, upstream) = {
+        let (port, upstream, keep_awake, addresses, watch_every) = {
             let t = lock(&self.tuning);
-            (t.port, t.upstream.clone())
+            (
+                t.port,
+                t.upstream.clone(),
+                t.keep_awake.clone(),
+                Arc::clone(&t.addresses),
+                t.watch_every,
+            )
         };
         let (tx, mut rx) = mpsc::unbounded_channel();
         let handle = proxy::start(
@@ -700,38 +918,61 @@ impl Session {
         .await
         .map_err(|e| {
             tracing::error!(address = %ip, error = %e, "the proxy could not start");
-            CmdError::new(format!("could not start listening: {e}"))
+            CmdError(Reject::ListenFailed)
         })?;
         // Every address this computer has, so that none of them can be reached through the
         // proxy on a device's behalf.
         handle.add_local_addresses(net.own.iter().copied());
         *lock(&self.last_ip) = Some(ip);
+        // Something is running again: whatever a cleanup or a finish said before is over.
+        self.cleanup_run.store(false, Ordering::SeqCst);
+        self.finished.store(false, Ordering::SeqCst);
         tracing::info!(
             address = %ip,
             port = handle.port(),
             constrained = self.constrained,
             "proxy started"
         );
-        let ui = Arc::clone(&self.ui);
-        let bridge = tokio::spawn(async move {
-            let mut bridge = Bridge::default();
-            while let Some(event) = rx.recv().await {
-                let dto = bridge.map(&event, Instant::now());
-                log_event(&event, dto.is_some());
-                if let Some(dto) = dto {
-                    if let Some(step) = step_for(&dto) {
-                        advance(&ui, step);
+        let facts = Arc::new(RunFacts::default());
+        let bridge = {
+            let (facts, emit) = (Arc::clone(&facts), Arc::clone(&emit));
+            tokio::spawn(async move {
+                let mut bridge = Bridge::default();
+                while let Some(event) = rx.recv().await {
+                    facts.note(&event);
+                    let dto = bridge.map(&event, Instant::now());
+                    log_event(&event, dto.is_some());
+                    if let Some(dto) = dto {
+                        emit(dto);
                     }
-                    emit(dto);
                 }
-            }
-        });
+            })
+        };
+        let watch = tokio::spawn(watch_address(ip, watch_every, addresses, emit));
         Ok(ProxyRun {
             ip,
             handle,
-            bridge,
+            facts,
             fingerprint,
+            _bridge: AbortOnDrop(bridge),
+            _watch: AbortOnDrop(watch),
+            _awake: KeepAwake::start(keep_awake.as_ref()),
         })
+    }
+
+    /// Keep `unlocked` in memory, unless the session was started over or cleaned up since
+    /// `discards` was read.
+    fn keep_unlocked(&self, unlocked: Unlocked, discards: u64) -> Result<(), CmdError> {
+        {
+            let mut slot = lock(&self.unlocked);
+            if self.discards.load(Ordering::SeqCst) != discards {
+                return Err(CmdError(Reject::UnlockOvertaken));
+            }
+            *slot = Some(Arc::new(unlocked));
+        }
+        // Proposals were made from the tokens that were unlocked before.
+        self.forget_vault();
+        Ok(())
     }
 
     /// Decrypt `backup` with `password` and keep the result in memory.
@@ -739,14 +980,33 @@ impl Session {
     /// The key derivation (100,000 rounds for every token in a real backup) runs on the
     /// blocking pool, so the rest of the app keeps answering meanwhile. The password is wiped
     /// when the work is done.
+    ///
+    /// A backup that holds only Authy-native tokens has nothing to decrypt: whatever the
+    /// password, the answer is a summary with no tokens and the native ones by name, so the
+    /// person gets to the screen that says what to do about them.
     pub async fn unlock_backup(
         &self,
         backup: CapturedBackup,
         password: Zeroizing<String>,
     ) -> Result<UnlockResult, CmdError> {
+        let discards = self.discards.load(Ordering::SeqCst);
         if backup.tokens.is_empty() {
-            tracing::info!("unlock asked for before any backup was captured");
-            return Err(CmdError::new("The backup has not arrived from Authy yet."));
+            if backup.native_apps.is_empty() {
+                tracing::info!("unlock asked for before any backup was captured");
+                return Err(CmdError(Reject::BackupNotArrived));
+            }
+            tracing::info!(
+                native = backup.native_apps.len(),
+                "unlock: only Authy-native tokens were captured; nothing to decrypt"
+            );
+            let unlocked = Unlocked {
+                tokens: Vec::new(),
+                invalid: Vec::new(),
+                native: backup.native_apps,
+            };
+            let summary = UnlockSummary::from(&unlocked);
+            self.keep_unlocked(unlocked, discards)?;
+            return Ok(UnlockResult::Summary(summary));
         }
         tracing::info!(
             tokens = backup.tokens.len(),
@@ -754,12 +1014,11 @@ impl Session {
             "unlock attempted"
         );
         let started = Instant::now();
-        let discards = self.discards.load(Ordering::SeqCst);
         let outcome = tokio::task::spawn_blocking(move || backup::unlock(&backup, &password))
             .await
             .map_err(|_| {
                 tracing::error!("unlock failed: the work stopped unexpectedly");
-                CmdError::new("Unlocking the backup stopped unexpectedly.")
+                CmdError(Reject::UnlockStopped)
             })?;
         let took_ms = started.elapsed().as_millis() as u64;
         match outcome {
@@ -772,28 +1031,14 @@ impl Session {
                     "unlock succeeded"
                 );
                 let summary = UnlockSummary::from(&unlocked);
-                {
-                    let mut slot = lock(&self.unlocked);
-                    if self.discards.load(Ordering::SeqCst) != discards {
-                        return Err(CmdError::new(
-                            "The session was started over while the backup was being unlocked.",
-                        ));
-                    }
-                    *slot = Some(Arc::new(unlocked));
-                }
-                lock(&self.proposals).take();
-                advance(&self.ui, Step::Destination);
+                self.keep_unlocked(unlocked, discards)?;
                 Ok(UnlockResult::Summary(summary))
             }
-            Err(BackupError::WrongPassword) => {
+            Err(backup::WrongPassword) => {
                 tracing::info!(took_ms, "unlock failed: wrong password");
                 Ok(UnlockResult::Error {
                     error: UnlockErrorKind::WrongPassword,
                 })
-            }
-            Err(BackupError::Malformed(_)) => {
-                tracing::warn!(took_ms, "unlock failed: the backup could not be read");
-                Err(CmdError::new("The backup Authy sent could not be read."))
             }
         }
     }
@@ -801,7 +1046,7 @@ impl Session {
     pub async fn unlock(&self, password: Zeroizing<String>) -> Result<UnlockResult, CmdError> {
         let backup = match self.proxy.lock().await.as_ref() {
             Some(run) => run.handle.backup(),
-            None => return Err(CmdError::new("The connection is not running.")),
+            None => return Err(CmdError(Reject::ConnectionNotRunning)),
         };
         self.unlock_backup(backup, password).await
     }
@@ -809,21 +1054,37 @@ impl Session {
     fn unlocked(&self) -> Result<Arc<Unlocked>, CmdError> {
         lock(&self.unlocked)
             .clone()
-            .ok_or_else(|| CmdError::new("The backup is not unlocked."))
+            .ok_or(CmdError(Reject::NotUnlocked))
     }
 
+    /// The QR code for one token. An error, never an empty picture, when none can be drawn.
     pub fn token_qr(&self, id: &str) -> Result<String, CmdError> {
         let u = self.unlocked()?;
         let token = u
             .tokens
             .iter()
             .find(|t| t.id == id)
-            .ok_or_else(|| CmdError::new("No such token."))?;
-        Ok(export::qr_svg(&export::otpauth_uri(token)))
+            .ok_or(CmdError(Reject::NoSuchAccount))?;
+        let svg = export::qr_svg(&export::otpauth_uri(token));
+        if svg.is_empty() {
+            tracing::warn!("a QR code could not be drawn for a token");
+            return Err(CmdError(Reject::QrNotDrawn));
+        }
+        Ok(svg)
     }
 
+    /// The Google Authenticator transfer codes. An error, never an empty list or an empty
+    /// picture, when there is nothing to show: no token fits one, or one could not be drawn.
     pub fn google_migration_qrs(&self) -> Result<Vec<String>, CmdError> {
-        Ok(export::google_migration_qrs(&self.unlocked()?.tokens))
+        let codes = export::google_migration_qrs(&self.unlocked()?.tokens);
+        if codes.is_empty() {
+            return Err(CmdError(Reject::NoGoogleCodes));
+        }
+        if codes.iter().any(String::is_empty) {
+            tracing::warn!("a Google Authenticator transfer code could not be drawn");
+            return Err(CmdError(Reject::GoogleQrNotDrawn));
+        }
+        Ok(codes)
     }
 
     /// Titles of the tokens the Google Authenticator QR codes cannot carry.
@@ -833,16 +1094,13 @@ impl Session {
 
     /// The file for `dest`, ready to be written where the person chooses.
     pub fn prepare_export(&self, dest: DestinationDto) -> Result<ExportFile, CmdError> {
-        export::export(&self.unlocked()?.tokens, dest.into())
-            .map_err(|e| CmdError::new(e.to_string()))
+        export::export(&self.unlocked()?.tokens, dest.into()).map_err(|e| match e {
+            export::ExportError::NoFileForDestination => CmdError(Reject::NoFileForDestination),
+        })
     }
 
-    /// The codes at `unix_time`. Asking for them is what the Verify screen does, so the
-    /// tracked step moves there.
     pub fn live_codes_at(&self, unix_time: u64) -> Result<Vec<LiveCode>, CmdError> {
-        let unlocked = self.unlocked()?;
-        advance(&self.ui, Step::Verify);
-        Ok(live_codes(&unlocked, unix_time))
+        Ok(live_codes(&*self.unlocked()?, unix_time))
     }
 
     pub fn live_codes(&self) -> Result<Vec<LiveCode>, CmdError> {
@@ -854,15 +1112,66 @@ impl Session {
 
     // ---- Bitwarden ----
 
-    /// Download (or reuse) and verify the Bitwarden tool. The program is extracted afresh
-    /// from the verified download every time, and its hash is kept for [`new_cli_client`].
+    /// A fresh stop signal for the download or sign-in that is about to run.
+    fn begin_bw_op(&self) -> Cancel {
+        let cancel = Cancel::new();
+        *lock(&self.bw_stop) = Some(cancel.clone());
+        cancel
+    }
+
+    /// Stop the download or the sign-in that is under way, and wait until it has stopped and
+    /// taken its leavings with it: a download removes its partly written file; a sign-in has
+    /// its child process killed and its data folder wiped, and no client is kept. With
+    /// nothing under way this does nothing, so it may be called at any time and any number
+    /// of times.
+    pub async fn bw_cancel(&self) {
+        let Some(cancel) = lock(&self.bw_stop).clone() else {
+            return;
+        };
+        tracing::info!("bitwarden: asked to stop what is under way");
+        cancel.cancel();
+        // The work holds this for as long as it runs; having it means the work is over.
+        drop(self.bw_op.lock().await);
+    }
+
+    /// Download (or reuse) and verify the Bitwarden tool, telling `progress` how far it is
+    /// (see `crate::progress` for the lines). The program is extracted afresh from the
+    /// verified download every time, and its hash is kept for [`new_cli_client`].
     ///
     /// [`new_cli_client`]: Session::new_cli_client
-    pub async fn bw_prepare(&self) -> Result<(), CmdError> {
+    pub async fn bw_prepare(&self, progress: EmitProgress) -> Result<(), CmdError> {
+        let _one_at_a_time = self.bw_op.lock().await;
+        let cancel = self.begin_bw_op();
+        let discards = self.discards.load(Ordering::SeqCst);
         tracing::info!("bitwarden: preparing the tool");
-        let binary = bitwarden::ensure_cli(&self.paths.bw_cli())
-            .await
-            .inspect_err(|e| log_bw_failure("prepare", e))?;
+        let dir = self.paths.bw_cli();
+        let source = lock(&self.tuning).bw_download.clone();
+        let report = |stage: PrepareStage| progress(progress::line(stage));
+        let prepared = match source {
+            None => bitwarden::ensure_cli_reporting(&dir, &report, &cancel).await,
+            Some(from) => {
+                bitwarden::download::ensure_cli_within(
+                    &dir,
+                    &from.base_url,
+                    &from.asset,
+                    &from.sha256,
+                    bitwarden::download::MAX_DOWNLOAD_BYTES,
+                    &report,
+                    &cancel,
+                )
+                .await
+            }
+        };
+        lock(&self.bw_stop).take();
+        let binary = prepared.map_err(|e| {
+            log_bw_failure("prepare", &e);
+            CmdError(bw_reject(BwStage::Prepare, &e))
+        })?;
+        if self.discards.load(Ordering::SeqCst) != discards {
+            // Cleaned up (or the app is closing) meanwhile: the tool is not wanted any more.
+            let _ = remove_dir(&dir);
+            return Err(CmdError(Reject::BwStopped));
+        }
         *lock(&self.bw_binary) = Some(binary);
         tracing::info!("bitwarden: the tool is ready");
         Ok(())
@@ -873,7 +1182,7 @@ impl Session {
     pub fn new_cli_client(&self) -> Result<CliClient, CmdError> {
         let binary = lock(&self.bw_binary)
             .clone()
-            .ok_or_else(|| CmdError::new("The Bitwarden tool has not been prepared yet."))?;
+            .ok_or(CmdError(Reject::BwNotPrepared))?;
         Ok(CliClient::new(binary.path, self.paths.bw_data()).expecting_sha256(binary.sha256))
     }
 
@@ -881,22 +1190,30 @@ impl Session {
         match tokio::fs::remove_dir_all(self.paths.bw_data()).await {
             Ok(()) => Ok(()),
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
-            Err(e) => Err(CmdError::new(format!(
-                "could not remove the Bitwarden data folder: {e}"
-            ))),
+            Err(e) => {
+                tracing::error!(kind = ?e.kind(), "the Bitwarden data folder could not be removed");
+                Err(CmdError(Reject::CleanupBwDataNotRemoved))
+            }
         }
     }
 
     /// Sign in with `client`. It is kept for the match and apply steps only on success; on any
     /// other outcome it is wiped so nothing is left in the Bitwarden data folder.
     ///
+    /// With an API key in `input`, the sign-in is by that key and the password only unlocks
+    /// the vault; otherwise it is by email and password, with the two-step code if one came.
+    ///
     /// One sign-in runs at a time. A client kept from an earlier sign-in is signed out and
     /// wiped first. If the session is cleaned up (or started over, or the app is closing)
-    /// while this sign-in is under way, its result is thrown away and wiped as well.
+    /// while this sign-in is under way, its result is thrown away and wiped as well; so it is
+    /// when the person stops it ([`Session::bw_cancel`]).
+    ///
+    /// What was proposed and read from the vault before is kept when this is the same
+    /// account signing in again (a session that ended half-way through an apply): the person
+    /// does not have to review everything again. For another account it is dropped.
     ///
     /// The email and the server address are checked here before anything is done with them
-    /// (see [`bitwarden::check_login_input`]); what the screen checked does not count. An
-    /// account that signs in in a way this app cannot do is an error whose message says so.
+    /// (see [`bitwarden::check_login_input`]); what the screen checked does not count.
     pub async fn bw_login(
         &self,
         mut client: Box<dyn BwClient>,
@@ -914,74 +1231,118 @@ impl Session {
             bitwarden::Region::Eu => "eu",
             bitwarden::Region::SelfHosted(_) => "selfHosted",
         };
-        bitwarden::check_login_input(email, &region)
-            .inspect_err(|e| log_bw_failure("sign-in", e))?;
+        let checked = match &input.api_key {
+            // The email is not sent anywhere in an API-key sign-in.
+            Some(_) => bitwarden::check_region(&region),
+            None => bitwarden::check_login_input(email, &region),
+        };
+        checked.map_err(|e| {
+            log_bw_failure("sign-in", &e);
+            CmdError(bw_reject(BwStage::SignIn, &e))
+        })?;
         tracing::info!(
             region = %region_kind,
             with_code = code.is_some(),
+            by_key = input.api_key.is_some(),
             "bitwarden: signing in"
         );
-        let _one_at_a_time = self.bw_signing_in.lock().await;
+        let _one_at_a_time = self.bw_op.lock().await;
+        let cancel = self.begin_bw_op();
         let discards = self.discards.load(Ordering::SeqCst);
         let previous = self.bw.lock().await.take();
         if let Some(mut previous) = previous {
             let _ = previous.logout_and_wipe().await;
         }
-        lock(&self.proposals).take();
+        {
+            let account = account_key(&region, email);
+            let mut known = lock(&self.bw_account);
+            if known.as_deref() != Some(account.as_str()) {
+                lock(&self.proposals).take();
+                lock(&self.vault).take();
+                *known = Some(account);
+            }
+        }
 
-        let outcome = client.login(email, &input.password, &region, code).await;
+        let outcome = {
+            let attempt = async {
+                match &input.api_key {
+                    Some(key) => {
+                        client
+                            .login_with_api_key(
+                                &key.client_id,
+                                &key.client_secret,
+                                &input.password,
+                                &region,
+                            )
+                            .await
+                    }
+                    None => client.login(email, &input.password, &region, code).await,
+                }
+            };
+            tokio::select! {
+                biased;
+                () = cancel.cancelled() => None,
+                outcome = attempt => Some(outcome),
+            }
+            // Stopped: the attempt is dropped here, which kills the tool if it is running.
+        };
+        lock(&self.bw_stop).take();
+        let Some(outcome) = outcome else {
+            tracing::info!("bitwarden: the sign-in was stopped");
+            let _ = client.logout_and_wipe().await;
+            let _ = self.wipe_bw_data().await;
+            return Err(CmdError(Reject::BwStopped));
+        };
         match &outcome {
             Ok(outcome) => tracing::info!(outcome = ?outcome, "bitwarden: sign-in answered"),
             Err(e) => log_bw_failure("sign-in", e),
         }
-        match outcome {
+        let answer = match outcome {
             Ok(LoginOutcome::Ok) => {
                 let mut slot = self.bw.lock().await;
                 if self.discards.load(Ordering::SeqCst) != discards {
                     drop(slot);
                     let _ = client.logout_and_wipe().await;
                     let _ = self.wipe_bw_data().await;
-                    return Err(CmdError::new(
-                        "The session was cleaned up while signing in to Bitwarden.",
-                    ));
+                    return Err(CmdError(Reject::BwOvertaken));
                 }
                 *slot = Some(client);
-                Ok(BwLoginResult::Ok)
+                return Ok(BwLoginResult::Ok);
             }
-            Ok(other) => {
-                let _ = client.logout_and_wipe().await;
-                Ok(match other {
-                    // "Needs a code" is only ever the answer when none was sent.
-                    LoginOutcome::NeedsTwoFactor if code.is_none() => BwLoginResult::NeedsTwoFactor,
-                    LoginOutcome::NeedsTwoFactor | LoginOutcome::BadTwoFactorCode => {
-                        BwLoginResult::BadTwoFactorCode
-                    }
-                    LoginOutcome::BadCredentials | LoginOutcome::Ok => {
-                        BwLoginResult::BadCredentials
-                    }
-                })
+            // "Needs a code" is only ever the answer when none was sent.
+            Ok(LoginOutcome::NeedsTwoFactor) if code.is_none() => BwLoginResult::NeedsTwoFactor,
+            Ok(LoginOutcome::NeedsTwoFactor | LoginOutcome::BadTwoFactorCode) => {
+                BwLoginResult::BadTwoFactorCode
             }
+            Ok(LoginOutcome::BadCredentials) => BwLoginResult::BadCredentials,
+            Ok(LoginOutcome::NeedsApiKey) => BwLoginResult::NeedsApiKey,
             Err(e) => {
                 let _ = client.logout_and_wipe().await;
-                Err(e.into())
+                return Err(CmdError(bw_reject(BwStage::SignIn, &e)));
             }
-        }
+        };
+        let _ = client.logout_and_wipe().await;
+        Ok(answer)
+    }
+
+    /// The refusal for a failure while reading the vault, logged.
+    fn read_failed(stage: &str, error: &BwError) -> CmdError {
+        log_bw_failure(stage, error);
+        CmdError(bw_reject(BwStage::Read, error))
     }
 
     pub async fn bw_propose(&self) -> Result<Vec<ProposalDto>, CmdError> {
         let u = self.unlocked()?;
         let guard = self.bw.lock().await;
-        let client = guard
-            .as_deref()
-            .ok_or_else(|| CmdError::new("You are not signed in to Bitwarden."))?;
+        let client = guard.as_deref().ok_or(CmdError(Reject::BwNotSignedIn))?;
         client
             .sync()
             .await
-            .inspect_err(|e| log_bw_failure("sync", e))?;
+            .map_err(|e| Session::read_failed("sync", &e))?;
         let vault = client
             .list_logins()
             .await
-            .inspect_err(|e| log_bw_failure("list", e))?;
+            .map_err(|e| Session::read_failed("list", &e))?;
         let proposals = join_proposals(&bitwarden::propose(&u.tokens, &vault), &vault);
         tracing::info!(
             tokens = u.tokens.len(),
@@ -996,12 +1357,35 @@ impl Session {
                 .count(),
             "bitwarden: matches proposed"
         );
+        *lock(&self.vault) = Some(vault_entries(&vault));
         *lock(&self.proposals) = Some(proposals.clone());
         Ok(proposals)
     }
 
-    /// Apply the person's decisions. They are checked against the last proposals first (see
-    /// [`check_decisions`]); if any does not hold, nothing at all is applied.
+    /// Every login in the vault, for attaching by hand: name, username and whether it holds
+    /// a code already; never a password or a code. What is read here is also what
+    /// [`Session::bw_apply`] checks the person's choices against.
+    pub async fn bw_logins(&self) -> Result<Vec<VaultLoginView>, CmdError> {
+        let guard = self.bw.lock().await;
+        let client = guard.as_deref().ok_or(CmdError(Reject::BwNotSignedIn))?;
+        let vault = client
+            .list_logins()
+            .await
+            .map_err(|e| Session::read_failed("list", &e))?;
+        tracing::info!(logins = vault.len(), "bitwarden: logins listed");
+        let entries = vault_entries(&vault);
+        let views = entries.iter().map(|entry| entry.view.clone()).collect();
+        *lock(&self.vault) = Some(entries);
+        Ok(views)
+    }
+
+    /// Apply the person's decisions. They are checked first (see [`check_decisions`]); if any
+    /// does not hold, nothing at all is applied.
+    ///
+    /// A session that has ended (before the run, or part-way through it) is an error of its
+    /// own, `bw_session_expired`, so that the person can be sent to sign in again. Whatever
+    /// was done stays done, the decisions' context is kept across that sign-in, and running
+    /// the same decisions again finishes the rest.
     pub async fn bw_apply(
         &self,
         decisions: Vec<DecisionEntry>,
@@ -1009,11 +1393,9 @@ impl Session {
     ) -> Result<ApplyReportDto, CmdError> {
         let u = self.unlocked()?;
         let guard = self.bw.lock().await;
-        let client = guard
-            .as_deref()
-            .ok_or_else(|| CmdError::new("You are not signed in to Bitwarden."))?;
-        check_decisions(&decisions, &u, lock(&self.proposals).as_deref())
-            .inspect_err(|_| tracing::warn!("bitwarden: the decisions were refused"))?;
+        let client = guard.as_deref().ok_or(CmdError(Reject::BwNotSignedIn))?;
+        check_decisions(&decisions, &u, lock(&self.vault).as_deref())
+            .inspect_err(|e| tracing::warn!(error = %e, "bitwarden: the decisions were refused"))?;
         let decisions: Vec<(String, bitwarden::Decision)> = decisions
             .into_iter()
             .map(|d| (d.token_id, d.decision.into()))
@@ -1037,17 +1419,21 @@ impl Session {
                 "bitwarden: apply stopped early"
             ),
         }
+        if report.error == Some(BwError::SessionExpired) {
+            return Err(CmdError(Reject::BwSessionExpired));
+        }
         Ok(report.into())
     }
 
     // ---- end of the session ----
 
-    /// Stop the proxy, destroy the certificate key, wipe the Bitwarden data, drop the secrets.
+    /// Stop the proxy, destroy the certificate key, wipe the Bitwarden data, remove the
+    /// downloaded Bitwarden tool, drop the secrets.
     ///
     /// Idempotent, and complete on a fresh launch that has nothing but the marker and a key in
     /// the store (the resume-after-quit path). Every step is tried even when an earlier one
     /// fails; the first failure is reported. A key left by an earlier launch is deleted, and
-    /// that is all that is ever done with it: it is not read.
+    /// that is all that is ever done with it: it cannot be read.
     pub async fn cleanup(&self) -> Result<(), CmdError> {
         let mut first_error: Option<CmdError> = None;
         let mut note = |e: CmdError| {
@@ -1057,6 +1443,9 @@ impl Session {
 
         // First, so that an unlock or a sign-in still under way gives up when it finishes.
         self.discard_secrets();
+        self.cleanup_run.store(true, Ordering::SeqCst);
+        // A download or a sign-in under way is stopped, not waited out.
+        self.bw_cancel().await;
         let running = self.proxy.lock().await.take();
         if let Some(run) = running {
             run.stop().await;
@@ -1073,8 +1462,9 @@ impl Session {
         match destroyed {
             Ok(()) => tracing::info!("cleanup: certificate key removed"),
             Err(reason) => {
+                // The key store's own wording: for the log, not the screen.
                 tracing::error!(error = %reason, "cleanup: the certificate key could not be removed");
-                note(CmdError::new(key_not_removed(&reason)));
+                note(CmdError(Reject::CleanupKeychainFailed));
             }
         }
         let client = self.bw.lock().await.take();
@@ -1083,19 +1473,26 @@ impl Session {
                 Ok(()) => tracing::info!("cleanup: signed out of Bitwarden"),
                 Err(e) => {
                     log_bw_failure("sign-out", &e);
-                    note(e.into());
+                    note(CmdError(bw_reject(BwStage::SignOut, &e)));
                 }
             }
         }
         // A previous launch may have left Bitwarden data with no client to wipe it.
         match self.wipe_bw_data().await {
             Ok(()) => tracing::info!("cleanup: Bitwarden data removed"),
-            Err(e) => {
-                tracing::error!(error = %e, "cleanup: the Bitwarden data could not be removed");
-                note(e);
-            }
+            Err(e) => note(e),
         }
-        advance(&self.ui, Step::Cleanup);
+        // The downloaded tool: of no use once this run is over, and not the person's to keep.
+        lock(&self.bw_binary).take();
+        let tool = self.paths.bw_cli();
+        match tokio::task::spawn_blocking(move || remove_dir(&tool)).await {
+            Ok(Ok(())) => tracing::info!("cleanup: Bitwarden tool removed"),
+            Ok(Err(e)) => {
+                tracing::error!(kind = ?e.kind(), "cleanup: the Bitwarden tool could not be removed");
+                note(CmdError(Reject::CleanupBwToolNotRemoved));
+            }
+            Err(_) => note(CmdError(Reject::CleanupBwToolNotRemoved)),
+        }
         tracing::info!(complete = first_error.is_none(), "cleanup: finished");
         if first_error.is_none() && lock(&self.authority).is_none() {
             self.cleaned.store(true, Ordering::SeqCst);
@@ -1103,60 +1500,46 @@ impl Session {
         first_error.map_or(Ok(()), Err)
     }
 
-    /// The app is closing before the person reached cleanup. Stop the proxy and remove what
-    /// Bitwarden left on disk; keep the certificate key and the marker, so the next launch
+    /// The app is closing before the person reached cleanup. Stop the proxy (and with it the
+    /// helper that keeps the computer awake) and remove what Bitwarden left on disk, the
+    /// downloaded tool included; keep the certificate key and the marker, so the next launch
     /// opens on cleanup and finishes the job. Never waits: whatever is busy is skipped, and
     /// the process ending takes care of what is in memory.
     pub fn on_exit(&self) {
-        tracing::info!("the app is closing: stopping the proxy and removing Bitwarden data");
+        tracing::info!("the app is closing: stopping the proxy and removing Bitwarden files");
         self.discard_secrets();
+        if let Some(cancel) = lock(&self.bw_stop).as_ref() {
+            cancel.cancel();
+        }
         if let Ok(mut slot) = self.proxy.try_lock() {
-            if let Some(run) = slot.take() {
-                run.bridge.abort();
-                drop(run.handle); // dropping the handle stops the proxy
-            }
+            // Dropping the run stops the proxy, its tasks and the keep-awake helper.
+            slot.take();
         }
         if let Ok(mut slot) = self.bw.try_lock() {
             slot.take();
         }
-        let _ = std::fs::remove_dir_all(self.paths.bw_data());
+        lock(&self.bw_binary).take();
+        let _ = remove_dir(&self.paths.bw_data());
+        let _ = remove_dir(&self.paths.bw_cli());
     }
 
     /// Clear the resume marker. Unless a cleanup has already run to the end, one is run first
-    /// (it deletes the key without ever reading it); the marker stays when that fails, so the
-    /// next launch offers cleanup again.
+    /// (it deletes the key without ever reading it). When that fails, this fails with the
+    /// same error and the marker stays, so the next launch offers cleanup again: in
+    /// particular, while the certificate key is still in the keychain this never succeeds,
+    /// whatever the person ticked (`cleanup_keychain_failed`).
     pub async fn finish(&self) -> Result<(), CmdError> {
         if !self.cleaned.load(Ordering::SeqCst) {
-            self.cleanup().await?;
+            self.cleanup().await.inspect_err(
+                |e| tracing::warn!(error = %e, "finish refused: the cleanup is not complete"),
+            )?;
         }
         remove_marker(&self.paths)?;
         tracing::info!("finished: the resume marker is cleared");
         self.resume_cleanup.store(false, Ordering::SeqCst);
-        advance(&self.ui, Step::Done);
+        self.finished.store(true, Ordering::SeqCst);
         Ok(())
     }
-}
-
-/// What the person is told when the certificate key could not be removed: the reason, and
-/// how to remove it by hand so that cleanup can finish.
-pub fn key_not_removed(reason: &str) -> String {
-    let reason = reason.trim().trim_end_matches('.');
-    format!(
-        "The certificate key could not be removed from this computer's keychain ({reason}). \
-         To remove it by hand: open Keychain Access, search for \"{KEYCHAIN_SERVICE}\", and \
-         delete the item it finds. Then try again."
-    )
-}
-
-/// What the person is told when the certificate could not be created. The usual cause is the
-/// keychain: an item of the same name that cannot be replaced, or a refused prompt.
-pub fn certificate_not_created(reason: &str) -> String {
-    let reason = reason.trim().trim_end_matches('.');
-    format!(
-        "The certificate could not be created ({reason}). If this keeps happening: open \
-         Keychain Access, search for \"{KEYCHAIN_SERVICE}\", delete the item it finds, and \
-         try again."
-    )
 }
 
 /// What the key store said, without the "key store:" in front.
@@ -1169,7 +1552,7 @@ fn store_reason(error: &authexodus_core::ca::CaError) -> String {
 
 /// One log line for a Bitwarden failure: the stage, the kind of error, and its message with
 /// anything that could identify the person taken out.
-fn log_bw_failure(stage: &str, error: &bitwarden::BwError) {
+fn log_bw_failure(stage: &str, error: &BwError) {
     tracing::warn!(
         stage = %stage,
         kind = %bw_error_kind(error),

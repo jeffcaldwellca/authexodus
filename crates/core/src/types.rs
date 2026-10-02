@@ -13,6 +13,7 @@ pub struct EncryptedToken {
     pub name: String,
     pub issuer: Option<String>,
     pub logo: Option<String>,
+    /// Read from Authy's response and kept as sent; nothing in the app acts on it today.
     pub account_type: String,
     pub digits: u32,
     pub encrypted_seed: String, // base64
@@ -25,6 +26,7 @@ pub struct EncryptedToken {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct NativeApp {
     pub name: String,
+    /// Read from Authy's response; the app lists native tokens by name only.
     pub digits: u32,
 }
 

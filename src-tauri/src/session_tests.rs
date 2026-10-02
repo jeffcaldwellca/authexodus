@@ -3,6 +3,8 @@
 //! computer. All data is synthetic.
 
 use super::*;
+use crate::awake::{KeepAwake, KeepAwakeCommand};
+use crate::errors::ErrorCode;
 use async_trait::async_trait;
 use authexodus_core::bitwarden::{BwError, Region, SetTotp, VaultLogin};
 use authexodus_core::ca::{CaError, MemoryKeyStore};
@@ -117,8 +119,8 @@ async fn marker_makes_next_launch_resume_cleanup() {
     let dir = tempfile::tempdir().unwrap();
     let store = Arc::new(MemoryKeyStore::new());
     let first = session(dir.path(), store.clone());
-    assert!(!first.get_state().resume_cleanup);
-    assert_eq!(first.get_state().step, Step::Welcome);
+    assert!(!first.get_state(&loopback()).resume_cleanup);
+    assert_eq!(first.get_state(&loopback()).step, Step::Welcome);
 
     first.ensure_ca().await.unwrap();
     assert_eq!(
@@ -128,7 +130,7 @@ async fn marker_makes_next_launch_resume_cleanup() {
     drop(first); // the app quits without cleaning up
 
     let second = session(dir.path(), store);
-    let state = second.get_state();
+    let state = second.get_state(&loopback());
     assert!(state.resume_cleanup);
     assert_eq!(state.step, Step::Cleanup);
 }
@@ -137,9 +139,6 @@ async fn marker_makes_next_launch_resume_cleanup() {
 struct BrokenStore;
 
 impl KeyStore for BrokenStore {
-    fn load(&self) -> Result<Option<Vec<u8>>, CaError> {
-        Ok(None)
-    }
     fn store(&self, _: &[u8]) -> Result<(), CaError> {
         Err(CaError::Store("the keychain is locked".into()))
     }
@@ -152,17 +151,23 @@ impl KeyStore for BrokenStore {
 async fn a_key_that_could_not_be_stored_leaves_no_marker() {
     let dir = tempfile::tempdir().unwrap();
     let s = Session::new(Arc::new(BrokenStore), dir.path().to_path_buf());
-    let error = s.ensure_ca().await.err().expect("no certificate").0;
-    assert_eq!(error, certificate_not_created("the keychain is locked"));
-    assert!(error.contains("(the keychain is locked)"), "{error}");
-    assert!(error.contains("Keychain Access"), "{error}");
+    let error = s.ensure_ca().await.err().expect("no certificate");
+    assert_eq!(error.code(), ErrorCode::KeychainFailed);
+    assert!(
+        error.sentence().contains("Keychain Access"),
+        "the way out is on the screen: {error}"
+    );
+    assert!(
+        !error.to_string().contains("the keychain is locked"),
+        "what the key store said is for the log: {error}"
+    );
     assert!(
         !dir.path().join("session.json").exists(),
         "no marker claims a certificate that was never created"
     );
     assert!(
         !Session::new(Arc::new(BrokenStore), dir.path().to_path_buf())
-            .get_state()
+            .get_state(&loopback())
             .resume_cleanup
     );
 }
@@ -191,9 +196,13 @@ async fn finish_clears_the_marker_for_the_next_launch() {
     s.ensure_ca().await.unwrap();
     s.cleanup().await.unwrap();
     s.finish().await.unwrap();
-    assert!(!s.get_state().resume_cleanup);
+    assert!(!s.get_state(&loopback()).resume_cleanup);
     assert!(!dir.path().join("session.json").exists());
-    assert!(!session(dir.path(), store).get_state().resume_cleanup);
+    assert!(
+        !session(dir.path(), store)
+            .get_state(&loopback())
+            .resume_cleanup
+    );
 }
 
 #[tokio::test]
@@ -214,7 +223,7 @@ fn state_carries_the_releases_address() {
     );
     let dir = tempfile::tempdir().unwrap();
     let s = session(dir.path(), Arc::new(MemoryKeyStore::new()));
-    let json = serde_json::to_value(s.get_state()).unwrap();
+    let json = serde_json::to_value(s.get_state(&loopback())).unwrap();
     assert_eq!(json["releasesUrl"], RELEASES_URL);
     assert_eq!(json["version"], env!("CARGO_PKG_VERSION"));
 }
@@ -238,6 +247,10 @@ struct FakeBw {
     logins: Arc<AtomicUsize>,
     /// The two-step code of the last `login`, if one was sent.
     code_sent: Arc<Mutex<Option<String>>>,
+    /// The API key of the last `login_with_api_key`, and the password that came with it.
+    api_key_sent: Arc<Mutex<Option<(String, String, String)>>>,
+    /// When set, the session has ended: every call after sign-in says so.
+    expired: Arc<AtomicBool>,
 }
 
 fn login(id: &str, name: &str, has_totp: bool) -> VaultLogin {
@@ -263,6 +276,8 @@ impl FakeBw {
             error: None,
             logins: Arc::default(),
             code_sent: Arc::default(),
+            api_key_sent: Arc::default(),
+            expired: Arc::default(),
         }
     }
 
@@ -279,6 +294,26 @@ impl FakeBw {
     fn was_wiped(&self) -> bool {
         self.wiped.load(Ordering::SeqCst)
     }
+
+    /// What every call after sign-in answers: an ended session, when that is set.
+    fn alive(&self) -> Result<(), BwError> {
+        if self.expired.load(Ordering::SeqCst) {
+            return Err(BwError::SessionExpired);
+        }
+        Ok(())
+    }
+
+    async fn answer(&self) -> Result<LoginOutcome, BwError> {
+        self.logins.fetch_add(1, Ordering::SeqCst);
+        if let (Some(entered), Some(release)) = (&self.entered, &self.release) {
+            entered.notify_one();
+            release.notified().await;
+        }
+        match &self.error {
+            Some(error) => Err(error.clone()),
+            None => Ok(self.outcome),
+        }
+    }
 }
 
 #[async_trait]
@@ -290,27 +325,36 @@ impl BwClient for FakeBw {
         _: &Region,
         code: Option<&str>,
     ) -> Result<LoginOutcome, BwError> {
-        self.logins.fetch_add(1, Ordering::SeqCst);
         *lock(&self.code_sent) = code.map(str::to_owned);
-        if let (Some(entered), Some(release)) = (&self.entered, &self.release) {
-            entered.notify_one();
-            release.notified().await;
-        }
-        match &self.error {
-            Some(error) => Err(error.clone()),
-            None => Ok(self.outcome),
-        }
+        self.answer().await
+    }
+    async fn login_with_api_key(
+        &mut self,
+        client_id: &str,
+        client_secret: &str,
+        password: &str,
+        _: &Region,
+    ) -> Result<LoginOutcome, BwError> {
+        *lock(&self.api_key_sent) = Some((
+            client_id.to_owned(),
+            client_secret.to_owned(),
+            password.to_owned(),
+        ));
+        self.answer().await
     }
     async fn sync(&self) -> Result<(), BwError> {
-        Ok(())
+        self.alive()
     }
     async fn list_logins(&self) -> Result<Vec<VaultLogin>, BwError> {
+        self.alive()?;
         Ok(self.vault.clone())
     }
     async fn import_folder_titles(&self) -> Result<Vec<String>, BwError> {
+        self.alive()?;
         Ok(vec![])
     }
     async fn set_totp(&self, item: &str, _: &str) -> Result<SetTotp, BwError> {
+        self.alive()?;
         lock(&self.writes).push(format!("attach {item}"));
         Ok(SetTotp::Attached)
     }
@@ -320,6 +364,7 @@ impl BwClient for FakeBw {
         _: Option<&str>,
         _: &str,
     ) -> Result<(), BwError> {
+        self.alive()?;
         lock(&self.writes).push(format!("create {title}"));
         Ok(())
     }
@@ -390,7 +435,7 @@ async fn cleanup_on_fresh_launch_with_only_marker_and_key() {
     }
 
     let fresh = session(dir.path(), store.clone());
-    assert!(fresh.get_state().resume_cleanup);
+    assert!(fresh.get_state(&loopback()).resume_cleanup);
     // Bitwarden data that turns up with no client to wipe it.
     std::fs::create_dir_all(dir.path().join("bw-data")).unwrap();
     std::fs::write(dir.path().join("bw-data").join("data.json"), b"{}").unwrap();
@@ -461,8 +506,8 @@ async fn closing_the_app_mid_flow_stops_the_proxy_and_keeps_the_key_for_cleanup(
     s.on_exit(); // twice is fine
     drop(s);
     let next = session(dir.path(), store.clone());
-    assert!(next.get_state().resume_cleanup);
-    assert_eq!(next.get_state().step, Step::Cleanup);
+    assert!(next.get_state(&loopback()).resume_cleanup);
+    assert_eq!(next.get_state(&loopback()).step, Step::Cleanup);
     next.cleanup().await.unwrap();
     next.finish().await.unwrap();
     assert_eq!(store.load().unwrap(), None);
@@ -487,7 +532,7 @@ async fn start_proxy_is_idempotent_and_moves_only_while_nothing_is_captured() {
     assert_eq!(first.check_url, "https://authexodus-check.api.authy.com/");
     assert!(first.cert_qr_svg.starts_with("<?xml") || first.cert_qr_svg.contains("<svg"));
     assert_eq!(first.addresses.len(), 2);
-    assert_eq!(s.get_state().step, Step::Connect);
+    assert_eq!(s.get_state(&loopback()).step, Step::Connect);
 
     // The same address, or no address at all: the running proxy, untouched.
     for again in [Some("127.0.0.1"), None, Some("  ")] {
@@ -527,7 +572,9 @@ async fn start_proxy_is_idempotent_and_moves_only_while_nothing_is_captured() {
         .start_proxy(Some("0.0.0.0"), &net, no_emit())
         .await
         .unwrap_err();
-    assert!(refused.0.contains("starting over"), "{}", refused.0);
+    assert_eq!(refused, CmdError(Reject::CaptureWouldBeLost));
+    assert!(refused.to_string().starts_with("capture_would_be_lost: "));
+    assert!(refused.sentence().contains("starting over"), "{refused}");
     assert!(lock(&s.unlocked).is_some(), "what was unlocked is kept");
     let still = s.start_proxy(None, &net, no_emit()).await.unwrap();
     assert_eq!((still.ip.as_str(), still.port), ("127.0.0.1", back.port));
@@ -557,7 +604,7 @@ async fn restart_proxy_starts_over_with_the_same_certificate() {
         .unwrap();
     s.bw_propose().await.unwrap();
     s.live_codes().unwrap();
-    assert_eq!(s.get_state().step, Step::Verify);
+    assert_eq!(s.get_state(&loopback()).step, Step::Destination);
 
     // An address that cannot be used is refused before anything is thrown away.
     assert!(s
@@ -575,7 +622,11 @@ async fn restart_proxy_starts_over_with_the_same_certificate() {
     assert!(lock(&s.unlocked).is_none(), "what was unlocked is gone");
     assert!(lock(&s.proposals).is_none());
     assert!(s.live_codes().is_err());
-    assert_eq!(s.get_state().step, Step::Connect, "back to connecting");
+    assert_eq!(
+        s.get_state(&loopback()).step,
+        Step::Connect,
+        "back to connecting"
+    );
     assert_eq!(
         s.ensure_ca().await.unwrap().cert_der(),
         certificate,
@@ -662,17 +713,18 @@ async fn unlock_with_the_right_password_returns_the_summary_and_keeps_secrets_in
     assert_eq!(json["invalid"], serde_json::json!([]));
     assert_eq!(json["native"], serde_json::json!([]));
     assert!(!json.to_string().contains("JBSWY3DPEHPK3PXP"));
-    assert_eq!(s.get_state().step, Step::Destination);
+    assert_eq!(s.get_state(&loopback()).step, Step::Destination);
 
     assert!(s.token_qr("1").unwrap().contains("<svg"));
     assert!(s.token_qr("nope").is_err());
-    assert_eq!(s.get_state().step, Step::Destination);
+    assert_eq!(s.get_state(&loopback()).step, Step::Destination);
 
-    // Asking for the live codes is the Verify screen.
+    // Asking for the live codes does not move the step: the shell cannot tell the Verify
+    // screen from the Destination one, and does not pretend to.
     let codes = s.live_codes().unwrap();
     assert_eq!(codes.len(), 1);
     assert_eq!(codes[0].code.len(), 6);
-    assert_eq!(s.get_state().step, Step::Verify);
+    assert_eq!(s.get_state(&loopback()).step, Step::Destination);
 }
 
 #[tokio::test]
@@ -1051,7 +1103,7 @@ async fn propose_joins_candidates_against_the_vault() {
 }
 
 #[tokio::test]
-async fn apply_refuses_what_was_never_offered_and_applies_nothing() {
+async fn apply_attaches_to_any_login_without_a_code_and_refuses_the_rest_whole() {
     let dir = tempfile::tempdir().unwrap();
     let s = session(dir.path(), Arc::new(MemoryKeyStore::new()));
     let mut sample = token("2", "Sample", 6);
@@ -1072,12 +1124,24 @@ async fn apply_refuses_what_was_never_offered_and_applies_nothing() {
         .unwrap();
     let writes = || lock(&bw.writes).clone();
 
-    // Before any proposal there is nothing an attach could have been chosen from.
-    assert!(s
-        .bw_apply(vec![attach("1", "item-example")], no_progress())
-        .await
-        .is_err());
+    // Before the vault has been read there is nothing an attach could be checked against.
+    assert_eq!(
+        s.bw_apply(vec![attach("1", "item-example")], no_progress())
+            .await
+            .unwrap_err(),
+        CmdError(Reject::DecisionUnknownLogin)
+    );
 
+    // The whole vault, for the person to pick from by hand: no passwords, no codes.
+    let logins = s.bw_logins().await.unwrap();
+    assert_eq!(
+        serde_json::to_value(&logins).unwrap(),
+        serde_json::json!([
+            { "itemId": "item-example", "name": "Example", "username": null, "hasCode": false },
+            { "itemId": "item-sample-full", "name": "Sample", "username": null, "hasCode": true },
+            { "itemId": "item-unrelated", "name": "Bank", "username": null, "hasCode": false },
+        ])
+    );
     let proposals = s.bw_propose().await.unwrap();
     let candidates = |token: &str| -> Vec<(String, bool)> {
         proposals
@@ -1092,53 +1156,102 @@ async fn apply_refuses_what_was_never_offered_and_applies_nothing() {
     assert_eq!(candidates("1"), [("item-example".to_string(), false)]);
     assert_eq!(candidates("2"), [("item-sample-full".to_string(), true)]);
 
-    let refused: Vec<Vec<DecisionEntry>> = vec![
-        // A login that was in the vault but never a candidate for this token.
-        vec![attach("1", "item-unrelated")],
+    let refused: Vec<(Vec<DecisionEntry>, Reject)> = vec![
         // A login that does not exist at all.
-        vec![attach("1", "made-up")],
-        // A candidate for another token.
-        vec![attach("2", "item-example")],
-        // A candidate that already has a code.
-        vec![attach("2", "item-sample-full")],
+        (vec![attach("1", "made-up")], Reject::DecisionUnknownLogin),
+        // A login that already has a code.
+        (
+            vec![attach("2", "item-sample-full")],
+            Reject::DecisionLoginHasCode,
+        ),
         // A token that is not in the unlocked backup, whatever the decision.
-        vec![decide("99", DecisionDto::CreateNew)],
-        vec![decide("99", DecisionDto::Skip)],
+        (
+            vec![decide("99", DecisionDto::CreateNew)],
+            Reject::DecisionUnknownAccount,
+        ),
+        (
+            vec![decide("99", DecisionDto::Skip)],
+            Reject::DecisionUnknownAccount,
+        ),
+        (
+            vec![attach("99", "item-example")],
+            Reject::DecisionUnknownAccount,
+        ),
+        // Two tokens attached to one login: it can hold only one code.
+        (
+            vec![attach("1", "item-unrelated"), attach("2", "item-unrelated")],
+            Reject::DecisionLoginTwice,
+        ),
         // One bad entry spoils the list: the good ones before it are not applied either.
-        vec![
-            attach("1", "item-example"),
-            decide("2", DecisionDto::CreateNew),
-            attach("1", "item-unrelated"),
-        ],
-    ];
-    for decisions in refused {
-        let described = format!("{decisions:?}");
-        assert!(
-            s.bw_apply(decisions, no_progress()).await.is_err(),
-            "{described}"
-        );
-        assert_eq!(writes(), Vec::<String>::new(), "{described}");
-    }
-
-    // What was offered goes through.
-    let report = s
-        .bw_apply(
+        (
             vec![
                 attach("1", "item-example"),
                 decide("2", DecisionDto::CreateNew),
+                attach("1", "made-up"),
             ],
+            Reject::DecisionUnknownLogin,
+        ),
+    ];
+    for (decisions, reason) in refused {
+        let described = format!("{decisions:?}");
+        let error = s.bw_apply(decisions, no_progress()).await.unwrap_err();
+        assert_eq!(error, CmdError(reason), "{described}");
+        assert_eq!(error.code(), ErrorCode::BwFailed);
+        assert!(error.sentence().ends_with("Nothing was changed."));
+        assert_eq!(writes(), Vec::<String>::new(), "{described}");
+    }
+
+    // A login the matcher never offered for this token, picked by hand: it is in the vault
+    // and holds no code, so it goes through. So does one that was a candidate for another
+    // token.
+    let report = s
+        .bw_apply(
+            vec![attach("1", "item-unrelated"), attach("2", "item-example")],
             no_progress(),
         )
         .await
         .unwrap();
-    assert_eq!((report.attached, report.created), (1, 1));
-    assert_eq!(writes(), ["attach item-example", "create Sample"]);
+    assert_eq!((report.attached, report.created), (2, 0));
+    assert_eq!(writes(), ["attach item-unrelated", "attach item-example"]);
 
     // Running the same decisions again is still allowed (the apply itself is idempotent).
     assert!(s
-        .bw_apply(vec![attach("1", "item-example")], no_progress())
+        .bw_apply(vec![attach("1", "item-unrelated")], no_progress())
         .await
         .is_ok());
+}
+
+#[tokio::test]
+async fn a_login_that_already_holds_this_very_code_may_be_chosen_again() {
+    use authexodus_core::bitwarden::CodeMark;
+    let dir = tempfile::tempdir().unwrap();
+    let s = session(dir.path(), Arc::new(MemoryKeyStore::new()));
+    *lock(&s.unlocked) = Some(Arc::new(unlocked_one()));
+    // An earlier run attached the code; the vault, read again since, says so.
+    let mut bw = FakeBw::new();
+    let mut done = login("item-1", "Example", true);
+    done.code = CodeMark::of_secret("JBSWY3DPEHPK3PXP");
+    let mut other = login("item-2", "Other", true);
+    other.code = CodeMark::of_secret("GEZDGNBVGY3TQOJQGEZDGNBVGY3TQOJQ");
+    bw.vault = vec![done, other, login("item-3", "Unreadable", true)];
+    s.bw_login(Box::new(bw.clone()), login_input())
+        .await
+        .unwrap();
+    s.bw_logins().await.unwrap();
+    assert!(
+        s.bw_apply(vec![attach("1", "item-1")], no_progress())
+            .await
+            .is_ok(),
+        "running the same choice again after the vault was re-read is not refused"
+    );
+    for held_elsewhere in ["item-2", "item-3"] {
+        assert_eq!(
+            s.bw_apply(vec![attach("1", held_elsewhere)], no_progress())
+                .await
+                .unwrap_err(),
+            CmdError(Reject::DecisionLoginHasCode)
+        );
+    }
 }
 
 #[tokio::test]
@@ -1182,17 +1295,34 @@ async fn a_second_sign_in_wipes_the_first() {
     assert!(second.was_wiped());
     assert!(s.bw.lock().await.is_none(), "neither is kept");
     assert!(
-        lock(&s.proposals).is_none(),
-        "proposals from the first vault are dropped"
+        lock(&s.proposals).is_some(),
+        "the same account signing in again keeps what was proposed for it"
     );
+
+    // Another account: what was read from the first one's vault is dropped.
+    let other: BwLoginInput =
+        serde_json::from_str(r#"{"email":"b@example.com","password":"pw","region":{"kind":"us"}}"#)
+            .unwrap();
+    s.bw_login(Box::new(FakeBw::new()), other).await.unwrap();
+    assert!(lock(&s.proposals).is_none());
+    assert!(lock(&s.vault).is_none());
+    // The same address on another server is another account too.
+    s.bw_propose().await.unwrap();
+    let elsewhere: BwLoginInput =
+        serde_json::from_str(r#"{"email":"B@example.com","password":"pw","region":{"kind":"eu"}}"#)
+            .unwrap();
+    s.bw_login(Box::new(FakeBw::new()), elsewhere)
+        .await
+        .unwrap();
+    assert!(lock(&s.proposals).is_none());
 }
 
 #[tokio::test]
-async fn a_sign_in_that_finishes_after_cleanup_leaves_nothing_behind() {
+async fn cleanup_stops_a_sign_in_that_is_under_way_and_nothing_of_it_is_left() {
     let dir = tempfile::tempdir().unwrap();
     let store = Arc::new(MemoryKeyStore::new());
     let s = Arc::new(session(dir.path(), store));
-    let (bw, entered, release) = FakeBw::new().held();
+    let (bw, entered, _release) = FakeBw::new().held();
     let bw_data = dir.path().join("bw-data");
 
     let signing_in = {
@@ -1203,24 +1333,93 @@ async fn a_sign_in_that_finishes_after_cleanup_leaves_nothing_behind() {
     entered.notified().await;
     // The Bitwarden tool has started filling its folder.
     std::fs::create_dir_all(&bw_data).unwrap();
+    std::fs::write(bw_data.join("data.json"), b"{}").unwrap();
 
-    // Cleanup does not wait for the sign-in.
+    // Cleanup does not wait for the sign-in to end by itself (this one never would).
     tokio::time::timeout(Duration::from_secs(5), s.cleanup())
         .await
-        .expect("cleanup does not wait for a sign-in")
+        .expect("cleanup stops a sign-in instead of waiting for it")
         .unwrap();
-    assert!(!bw_data.exists());
+    let result = tokio::time::timeout(Duration::from_secs(5), signing_in)
+        .await
+        .expect("the sign-in has ended")
+        .unwrap();
 
-    // The sign-in then succeeds, and writes its session into the folder as it does.
-    std::fs::create_dir_all(&bw_data).unwrap();
-    std::fs::write(bw_data.join("data.json"), b"{}").unwrap();
-    release.notify_one();
-    let result = signing_in.await.unwrap();
-
-    assert!(result.is_err(), "the sign-in reports that it was overtaken");
+    assert_eq!(result.unwrap_err(), CmdError(Reject::BwStopped));
     assert!(s.bw.lock().await.is_none(), "no client is kept");
     assert!(bw.was_wiped(), "its session was signed out and wiped");
     assert!(!bw_data.exists(), "and its folder is gone");
+}
+
+#[tokio::test]
+async fn a_sign_in_overtaken_by_the_app_closing_keeps_no_client() {
+    let dir = tempfile::tempdir().unwrap();
+    let s = Arc::new(session(dir.path(), Arc::new(MemoryKeyStore::new())));
+    // A client that does not notice it was told to stop: it answers "signed in" anyway.
+    struct Deaf(FakeBw);
+    #[async_trait]
+    impl BwClient for Deaf {
+        async fn login(
+            &mut self,
+            a: &str,
+            b: &str,
+            c: &Region,
+            d: Option<&str>,
+        ) -> Result<LoginOutcome, BwError> {
+            self.0.login(a, b, c, d).await
+        }
+        async fn login_with_api_key(
+            &mut self,
+            a: &str,
+            b: &str,
+            c: &str,
+            d: &Region,
+        ) -> Result<LoginOutcome, BwError> {
+            self.0.login_with_api_key(a, b, c, d).await
+        }
+        async fn sync(&self) -> Result<(), BwError> {
+            self.0.sync().await
+        }
+        async fn list_logins(&self) -> Result<Vec<VaultLogin>, BwError> {
+            self.0.list_logins().await
+        }
+        async fn import_folder_titles(&self) -> Result<Vec<String>, BwError> {
+            self.0.import_folder_titles().await
+        }
+        async fn set_totp(&self, a: &str, b: &str) -> Result<SetTotp, BwError> {
+            self.0.set_totp(a, b).await
+        }
+        async fn create_in_import_folder(
+            &self,
+            a: &str,
+            b: Option<&str>,
+            c: &str,
+        ) -> Result<(), BwError> {
+            self.0.create_in_import_folder(a, b, c).await
+        }
+        async fn logout_and_wipe(&mut self) -> Result<(), BwError> {
+            self.0.logout_and_wipe().await
+        }
+    }
+    let bw = FakeBw::new();
+    // The secrets are thrown away (as a start-over does) with no stop signal given: the
+    // sign-in that then succeeds must still not be kept.
+    let discarding = {
+        let s = Arc::clone(&s);
+        async move { s.discard_secrets() }
+    };
+    let (bw_held, entered, release) = bw.clone().held();
+    let signing_in = {
+        let s = Arc::clone(&s);
+        tokio::spawn(async move { s.bw_login(Box::new(Deaf(bw_held)), login_input()).await })
+    };
+    entered.notified().await;
+    discarding.await;
+    release.notify_one();
+    let result = signing_in.await.unwrap();
+    assert_eq!(result.unwrap_err(), CmdError(Reject::BwOvertaken));
+    assert!(s.bw.lock().await.is_none());
+    assert!(bw.was_wiped());
 }
 
 #[tokio::test]
@@ -1293,9 +1492,6 @@ struct StubbornStore {
 }
 
 impl KeyStore for StubbornStore {
-    fn load(&self) -> Result<Option<Vec<u8>>, CaError> {
-        self.inner.load()
-    }
     fn store(&self, blob: &[u8]) -> Result<(), CaError> {
         if let Some(marker) = lock(&self.marker).as_ref() {
             lock(&self.marker_when_stored).push(marker.exists());
@@ -1344,14 +1540,20 @@ async fn a_key_that_will_not_go_is_reported_with_the_way_to_remove_it_by_hand() 
     std::fs::create_dir_all(dir.path().join("bw-data")).unwrap();
     store.refuse_delete.store(true, Ordering::SeqCst);
 
-    let error = s.cleanup().await.unwrap_err().0;
+    let error = s.cleanup().await.unwrap_err();
+    assert_eq!(error, CmdError(Reject::CleanupKeychainFailed));
+    assert!(error
+        .to_string()
+        .starts_with("cleanup_keychain_failed: The certificate key could not be removed"));
+    assert!(error.sentence().contains("Keychain Access"), "{error}");
     assert!(
-        error.contains("(User interaction is not allowed)"),
-        "the reason: {error}"
+        error.sentence().contains("\"dev.somecorp.authexodus\""),
+        "{error}"
     );
-    assert!(error.contains("Keychain Access"), "{error}");
-    assert!(error.contains("\"dev.somecorp.authexodus\""), "{error}");
-    assert_eq!(error, key_not_removed("User interaction is not allowed."));
+    assert!(
+        !error.to_string().contains("User interaction"),
+        "what the key store said is for the log: {error}"
+    );
 
     // Everything else was still done.
     assert!(s.proxy.lock().await.is_none(), "the proxy is stopped");
@@ -1361,8 +1563,33 @@ async fn a_key_that_will_not_go_is_reported_with_the_way_to_remove_it_by_hand() 
     assert!(bw.was_wiped());
     assert!(!dir.path().join("bw-data").exists(), "Bitwarden data wiped");
     assert!(lock(&s.unlocked).is_none());
-    // Nothing can be finished while the key is there; the marker stays for the next launch.
-    assert!(s.finish().await.is_err());
+    // Nothing can be finished while the key is there, whatever the person ticked: finish
+    // says why, with the same code, and the marker stays for the next launch.
+    for _ in 0..2 {
+        assert_eq!(
+            s.finish().await.unwrap_err(),
+            CmdError(Reject::CleanupKeychainFailed)
+        );
+        assert_eq!(
+            s.finish().await.unwrap_err().code(),
+            ErrorCode::CleanupKeychainFailed
+        );
+        assert!(dir.path().join("session.json").exists());
+        assert!(
+            store.inner.load().unwrap().is_some(),
+            "the key is still there"
+        );
+        let state = s.get_state(&loopback());
+        assert_eq!(state.step, Step::Cleanup, "not done");
+    }
+    // The same on the next launch, which has only the marker and the key to go by.
+    let next = Session::new(store.clone(), dir.path().to_path_buf());
+    assert!(next.get_state(&loopback()).resume_cleanup);
+    assert_eq!(
+        next.finish().await.unwrap_err(),
+        CmdError(Reject::CleanupKeychainFailed)
+    );
+    assert!(next.get_state(&loopback()).resume_cleanup);
     assert!(dir.path().join("session.json").exists());
 
     // Once the person has removed it by hand, cleanup and finish go through.
@@ -1374,32 +1601,47 @@ async fn a_key_that_will_not_go_is_reported_with_the_way_to_remove_it_by_hand() 
 
 #[tokio::test]
 async fn sign_in_input_is_checked_before_the_tool_is_asked() {
-    use authexodus_core::bitwarden::{BAD_EMAIL, BAD_SERVER_URL};
     let dir = tempfile::tempdir().unwrap();
     let s = session(dir.path(), Arc::new(MemoryKeyStore::new()));
     let bw = FakeBw::new();
     for (input, message) in [
         (
             r#"{"email":"a@example.com","password":"pw","region":{"kind":"selfHosted","url":"http://vault.example.test"}}"#,
-            BAD_SERVER_URL,
+            Reject::BadServerUrl,
         ),
         (
             r#"{"email":"a@example.com","password":"pw","region":{"kind":"selfHosted","url":"https://me:pw@vault.example.test"}}"#,
-            BAD_SERVER_URL,
+            Reject::BadServerUrl,
         ),
         (
             r#"{"email":"--raw","password":"pw","region":{"kind":"us"}}"#,
-            BAD_EMAIL,
+            Reject::BadEmail,
         ),
         (
             r#"{"email":"nobody","password":"pw","region":{"kind":"eu"}}"#,
-            BAD_EMAIL,
+            Reject::BadEmail,
+        ),
+        // With an API key the email is not sent anywhere, but the server still counts.
+        (
+            r#"{"email":"","password":"pw","region":{"kind":"selfHosted","url":"http://vault.example.test"},"apiKey":{"clientId":"user.11111111-0000-4000-8000-000000000001","clientSecret":"synthetic0secret0value"}}"#,
+            Reject::BadServerUrl,
         ),
     ] {
         let input: BwLoginInput = serde_json::from_str(input).unwrap();
         let refused = s.bw_login(Box::new(bw.clone()), input).await.unwrap_err();
-        assert_eq!(refused.0, message);
+        assert_eq!(refused, CmdError(message));
+        assert!(
+            !refused.to_string().contains("example"),
+            "what was typed is not repeated: {refused}"
+        );
     }
+    assert_eq!(
+        CmdError(Reject::BadEmail).to_string(),
+        "bad_email: That does not look like an email address."
+    );
+    assert!(CmdError(Reject::BadServerUrl)
+        .to_string()
+        .starts_with("bad_server_url: The server address must start with https://"));
     assert_eq!(
         bw.logins.load(Ordering::SeqCst),
         0,
@@ -1419,7 +1661,6 @@ async fn sign_in_input_is_checked_before_the_tool_is_asked() {
 
 #[tokio::test]
 async fn a_refused_two_step_code_is_its_own_answer_and_unsupported_methods_say_so() {
-    use authexodus_core::bitwarden::cli::{EMAIL_CODE_UNSUPPORTED, METHOD_UNSUPPORTED};
     let dir = tempfile::tempdir().unwrap();
     let s = session(dir.path(), Arc::new(MemoryKeyStore::new()));
     let with_code = || -> BwLoginInput {
@@ -1454,18 +1695,47 @@ async fn a_refused_two_step_code_is_its_own_answer_and_unsupported_methods_say_s
         BwLoginResult::NeedsTwoFactor
     );
 
-    // An account this app cannot sign in to: the message says why, word for word.
-    for message in [EMAIL_CODE_UNSUPPORTED, METHOD_UNSUPPORTED] {
-        let mut bw = FakeBw::new();
-        bw.error = Some(BwError::Unsupported(message.into()));
-        let error = s
-            .bw_login(Box::new(bw.clone()), with_code())
-            .await
-            .unwrap_err();
-        assert_eq!(error.0, message);
+    // What a password sign-in cannot get past (an emailed code, a method the tool cannot
+    // do) is an answer of its own, not a failure: the way through is an API key.
+    let mut bw = FakeBw::new();
+    bw.outcome = LoginOutcome::NeedsApiKey;
+    for input in [with_code(), login_input()] {
+        let r = s.bw_login(Box::new(bw.clone()), input).await.unwrap();
+        assert_eq!(r, BwLoginResult::NeedsApiKey);
+        assert_eq!(
+            serde_json::to_string(&r).unwrap(),
+            r#"{"kind":"needsApiKey"}"#
+        );
         assert!(bw.was_wiped());
     }
     assert!(s.bw.lock().await.is_none());
+
+    // What the tool says when it fails some other way stays off the screen.
+    let mut bw = FakeBw::new();
+    bw.error = Some(BwError::Cli(
+        "Username sam@example.test could not log in to https://vault.example.test".into(),
+    ));
+    let error = s
+        .bw_login(Box::new(bw.clone()), login_input())
+        .await
+        .unwrap_err();
+    assert_eq!(error, CmdError(Reject::BwSignInFailed));
+    assert_eq!(error.code(), ErrorCode::BwFailed);
+    bw.error = Some(BwError::Server(
+        "getaddrinfo ENOTFOUND vault.example.test".into(),
+    ));
+    let error = s
+        .bw_login(Box::new(bw.clone()), login_input())
+        .await
+        .unwrap_err();
+    assert_eq!(error.code(), ErrorCode::BwUnreachable);
+    assert!(!error.to_string().contains("example"), "{error}");
+    bw.error = Some(BwError::ChecksumMismatch);
+    let error = s
+        .bw_login(Box::new(bw.clone()), login_input())
+        .await
+        .unwrap_err();
+    assert_eq!(error.code(), ErrorCode::BwChecksumMismatch);
 }
 
 #[test]
@@ -1499,6 +1769,14 @@ async fn the_proxy_serves_the_certificate_whose_fingerprint_it_reports() {
         assert_eq!(ca.is_constrained(), constrained);
         assert_eq!(info.cert_fingerprint, ca.fingerprint());
         assert_eq!(info.cert_fingerprint.len(), 95);
+        assert_eq!(
+            info.cert_constrained, constrained,
+            "the UI is told which kind of certificate this is"
+        );
+        assert_eq!(
+            serde_json::to_value(&info).unwrap()["certConstrained"],
+            constrained
+        );
         // The same certificate after a start-over, so the same fingerprint.
         let again = s.restart_proxy(None, &loopback(), no_emit()).await.unwrap();
         assert_eq!(again.cert_fingerprint, info.cert_fingerprint);
@@ -1520,21 +1798,26 @@ async fn the_proxy_never_listens_where_the_internet_can_reach_it() {
         .start_proxy(None, &public_only, no_emit())
         .await
         .unwrap_err();
-    assert_eq!(none.0, NO_LAN_ADDRESS);
-    assert!(none.0.contains("not on a home or office Wi-Fi network"));
+    assert_eq!(none, CmdError(Reject::NoPrivateAddress));
+    assert_eq!(none.code().as_str(), "no_private_address");
+    assert!(none
+        .sentence()
+        .contains("not on a home or office Wi-Fi network"));
     let asked = s
         .start_proxy(Some("198.51.100.23"), &public_only, no_emit())
         .await
         .unwrap_err();
     assert_eq!(
-        asked.0, PUBLIC_ADDRESS,
+        asked,
+        CmdError(Reject::AddressPublic),
         "refused even when asked for by name"
     );
+    assert_eq!(asked.code().as_str(), "address_not_private");
     let restart = s
         .restart_proxy(Some("198.51.100.23"), &public_only, no_emit())
         .await
         .unwrap_err();
-    assert_eq!(restart.0, PUBLIC_ADDRESS);
+    assert_eq!(restart, CmdError(Reject::AddressPublic));
     assert!(s.proxy.lock().await.is_none(), "nothing was started");
     assert!(
         !dir.path().join("session.json").exists(),
@@ -1546,7 +1829,13 @@ async fn the_proxy_never_listens_where_the_internet_can_reach_it() {
         .start_proxy(Some("10.9.8.7"), &loopback(), no_emit())
         .await
         .unwrap_err();
-    assert_eq!(not_ours.0, NOT_OUR_ADDRESS);
+    assert_eq!(not_ours, CmdError(Reject::AddressNotOurs));
+    assert_eq!(not_ours.code().as_str(), "address_changed");
+    let nonsense = s
+        .start_proxy(Some("nonsense"), &loopback(), no_emit())
+        .await
+        .unwrap_err();
+    assert_eq!(nonsense.code().as_str(), "internal");
 }
 
 #[tokio::test]
@@ -1610,10 +1899,6 @@ struct WatchedStore {
 }
 
 impl KeyStore for WatchedStore {
-    fn load(&self) -> Result<Option<Vec<u8>>, CaError> {
-        lock(&self.calls).push("load");
-        self.inner.load()
-    }
     fn store(&self, blob: &[u8]) -> Result<(), CaError> {
         lock(&self.calls).push("store");
         self.inner.store(blob)
@@ -1649,7 +1934,7 @@ async fn a_stored_key_is_never_read_only_replaced_or_deleted() {
     // The next launch finds the marker. All it does with the key is delete it.
     lock(&store.calls).clear();
     let resumed = Session::new(store.clone(), dir.path().to_path_buf());
-    assert!(resumed.get_state().resume_cleanup);
+    assert!(resumed.get_state(&loopback()).resume_cleanup);
     resumed.cleanup().await.unwrap();
     resumed.finish().await.unwrap();
     assert_eq!(*lock(&store.calls), ["delete"]);
@@ -1662,4 +1947,860 @@ async fn a_stored_key_is_never_read_only_replaced_or_deleted() {
     again.finish().await.unwrap();
     assert_eq!(*lock(&store.calls), ["delete", "store", "delete"]);
     assert_eq!(store.inner.load().unwrap(), None);
+}
+
+// ---------------------------------------------------------------------------------------------
+// Completeness fixes
+
+fn events() -> (
+    EmitProxy,
+    tokio::sync::mpsc::UnboundedReceiver<ProxyEventDto>,
+) {
+    let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+    let emit: EmitProxy = Arc::new(move |event| {
+        let _ = tx.send(event);
+    });
+    (emit, rx)
+}
+
+/// Is there a process with this id? (Signal 0 delivers nothing; it only asks.)
+fn alive(pid: u32) -> bool {
+    // SAFETY: `kill` with signal 0 has no effect on the target.
+    unsafe { libc::kill(pid as libc::pid_t, 0) == 0 }
+}
+
+fn sleeper() -> Option<KeepAwakeCommand> {
+    Some(KeepAwakeCommand {
+        program: PathBuf::from("/bin/sleep"),
+        args: vec!["600".into()],
+    })
+}
+
+async fn awake_pid(s: &Session) -> Option<u32> {
+    s.proxy
+        .lock()
+        .await
+        .as_ref()
+        .and_then(|run| run._awake.as_ref().map(KeepAwake::pid))
+}
+
+#[tokio::test]
+async fn the_state_says_what_the_shell_knows_so_a_reloaded_window_can_carry_on() {
+    let dir = tempfile::tempdir().unwrap();
+    let s = session(dir.path(), Arc::new(MemoryKeyStore::new()));
+    s.tune_proxy(0, None);
+    let net = loopback();
+
+    // Nothing yet.
+    let fresh = s.get_state(&net);
+    assert_eq!(fresh.step, Step::Welcome);
+    assert_eq!(
+        serde_json::to_value(&fresh.session).unwrap(),
+        serde_json::json!({
+            "proxy": null, "deviceConnected": false, "trustWorking": false,
+            "captured": 0, "summary": null
+        })
+    );
+
+    // The proxy runs: the very description `start_proxy` gave is there to be had again.
+    s.set_device(Device::Ipad);
+    let info = s
+        .start_proxy(Some("127.0.0.1"), &net, no_emit())
+        .await
+        .unwrap();
+    let running = s.get_state(&net);
+    assert_eq!(running.step, Step::Connect);
+    assert_eq!(running.device, Some(Device::Ipad));
+    assert_eq!(running.session.proxy.as_ref(), Some(&info));
+    assert!(!running.session.device_connected && !running.session.trust_working);
+    assert_eq!(running.session.captured, 0);
+
+    // What the proxy reports is remembered for this run of it...
+    {
+        let slot = s.proxy.lock().await;
+        let facts = &slot.as_ref().unwrap().facts;
+        facts.note(&ProxyEvent::TlsRejected);
+        assert_eq!(
+            s.get_state(&net).step,
+            Step::Welcome,
+            "busy: not waited for"
+        );
+        facts.note(&ProxyEvent::DeviceConnected);
+    }
+    let connected = s.get_state(&net);
+    assert!(connected.session.device_connected && !connected.session.trust_working);
+    assert_eq!(connected.step, Step::Certificate);
+    s.proxy
+        .lock()
+        .await
+        .as_ref()
+        .unwrap()
+        .facts
+        .note(&ProxyEvent::TrustWorking);
+    let trusted = s.get_state(&net);
+    assert!(trusted.session.trust_working);
+    assert_eq!(trusted.step, Step::Authy);
+
+    // ...and starts again from nothing when the proxy is started over.
+    s.restart_proxy(None, &net, no_emit()).await.unwrap();
+    let restarted = s.get_state(&net);
+    assert!(!restarted.session.device_connected && !restarted.session.trust_working);
+    assert_eq!(restarted.step, Step::Connect);
+
+    // Unlocked: the summary is there too, and it carries no secret.
+    s.unlock_backup(fixture_backup(), password("hunter2"))
+        .await
+        .unwrap();
+    let unlocked = s.get_state(&net);
+    assert_eq!(unlocked.step, Step::Destination);
+    let summary = serde_json::to_value(&unlocked.session.summary).unwrap();
+    assert_eq!(summary["tokens"][0]["id"], "1");
+    assert!(!serde_json::to_string(&unlocked)
+        .unwrap()
+        .contains("JBSWY3DPEHPK3PXP"));
+
+    // Cleanup, then done; and a new start after that begins again.
+    s.cleanup().await.unwrap();
+    let cleaned = s.get_state(&net);
+    assert_eq!(cleaned.step, Step::Cleanup);
+    assert_eq!(cleaned.session.proxy, None);
+    assert_eq!(cleaned.session.summary, None);
+    s.finish().await.unwrap();
+    assert_eq!(s.get_state(&net).step, Step::Done);
+    s.start_proxy(Some("127.0.0.1"), &net, no_emit())
+        .await
+        .unwrap();
+    assert_eq!(s.get_state(&net).step, Step::Connect);
+    s.cleanup().await.unwrap();
+}
+
+#[tokio::test]
+async fn a_backup_of_only_authy_native_tokens_unlocks_to_their_names_without_a_password() {
+    use authexodus_core::types::NativeApp;
+    let dir = tempfile::tempdir().unwrap();
+    let s = session(dir.path(), Arc::new(MemoryKeyStore::new()));
+    let native_only = CapturedBackup {
+        tokens: vec![],
+        native_apps: vec![
+            NativeApp {
+                name: "Synthetic Native".into(),
+                digits: 7,
+            },
+            NativeApp {
+                name: "Another Native".into(),
+                digits: 7,
+            },
+        ],
+    };
+    // There is nothing to decrypt, so whatever is typed, the answer is the list.
+    for typed in ["", "anything at all"] {
+        let result = s
+            .unlock_backup(native_only.clone(), password(typed))
+            .await
+            .unwrap();
+        assert_eq!(
+            serde_json::to_value(&result).unwrap(),
+            serde_json::json!({
+                "tokens": [], "invalid": [],
+                "native": [{ "name": "Synthetic Native" }, { "name": "Another Native" }]
+            })
+        );
+    }
+    let state = s.get_state(&loopback());
+    assert_eq!(state.step, Step::Destination);
+    assert_eq!(state.session.summary.unwrap().native.len(), 2);
+    // With no tokens there is nothing to draw, and that is said, not shown as an empty list.
+    assert_eq!(s.live_codes().unwrap().len(), 0);
+    assert_eq!(
+        s.google_migration_qrs().unwrap_err(),
+        CmdError(Reject::NoGoogleCodes)
+    );
+
+    // Nothing at all captured is still "not arrived".
+    let nothing = s
+        .unlock_backup(CapturedBackup::default(), password("x"))
+        .await
+        .unwrap_err();
+    assert_eq!(nothing, CmdError(Reject::BackupNotArrived));
+    assert_eq!(nothing.code().as_str(), "no_backup");
+    let fresh = session(dir.path(), Arc::new(MemoryKeyStore::new()));
+    assert_eq!(
+        fresh
+            .unlock(password("x"))
+            .await
+            .unwrap_err()
+            .code()
+            .as_str(),
+        "no_backup"
+    );
+
+    // The proxy's "no accounts" notice reaches the UI as its own kind.
+    let mut bridge = Bridge::default();
+    assert_eq!(
+        bridge.map(&ProxyEvent::EmptyBackup, Instant::now()),
+        Some(ProxyEventDto::EmptyBackup)
+    );
+    assert_eq!(event_kind(&ProxyEvent::EmptyBackup), "emptyBackup");
+}
+
+#[tokio::test]
+async fn a_code_that_cannot_be_drawn_is_an_error_not_an_empty_picture() {
+    let dir = tempfile::tempdir().unwrap();
+    let s = session(dir.path(), Arc::new(MemoryKeyStore::new()));
+    assert_eq!(s.token_qr("1").unwrap_err(), CmdError(Reject::NotUnlocked));
+    assert_eq!(s.token_qr("1").unwrap_err().code().as_str(), "not_unlocked");
+
+    // A name so long that no QR code can hold the account, and a seven-digit account, which
+    // Google Authenticator cannot take.
+    let mut endless = token("long", "Endless", 6);
+    endless.name = "n".repeat(4000);
+    *lock(&s.unlocked) = Some(Arc::new(Unlocked {
+        tokens: vec![endless, token("seven", "Seven Digits", 7)],
+        invalid: vec![],
+        native: vec![],
+    }));
+    let undrawn = s.token_qr("long").unwrap_err();
+    assert_eq!(undrawn, CmdError(Reject::QrNotDrawn));
+    assert_eq!(undrawn.code().as_str(), "export_failed");
+    assert!(s.token_qr("seven").unwrap().contains("<svg"));
+    let unknown = s.token_qr("nobody").unwrap_err();
+    assert_eq!(unknown.code().as_str(), "export_failed");
+
+    // Neither account fits a Google transfer code: an error, and the list of what cannot go
+    // says which.
+    let none = s.google_migration_qrs().unwrap_err();
+    assert_eq!(none, CmdError(Reject::NoGoogleCodes));
+    assert_eq!(none.code().as_str(), "export_failed");
+    assert_eq!(s.google_unsupported().unwrap(), ["Endless", "Seven Digits"]);
+    assert_eq!(
+        s.prepare_export(DestinationDto::GoogleAuthenticator)
+            .unwrap_err()
+            .code()
+            .as_str(),
+        "export_failed"
+    );
+}
+
+#[tokio::test]
+async fn a_changed_address_is_noticed_once_and_the_stale_proxy_is_not_described_again() {
+    let dir = tempfile::tempdir().unwrap();
+    let s = session(dir.path(), Arc::new(MemoryKeyStore::new()));
+    s.tune_proxy(0, None);
+    let own = Arc::new(Mutex::new(vec![IpAddr::V4(Ipv4Addr::LOCALHOST)]));
+    let source = Arc::clone(&own);
+    s.tune_address_watch(
+        Duration::from_millis(15),
+        Arc::new(move || lock(&source).clone()),
+    );
+    let (emit, mut heard) = events();
+    let net = loopback();
+    let info = s
+        .start_proxy(Some("127.0.0.1"), &net, emit.clone())
+        .await
+        .unwrap();
+
+    // Nothing is said while the address is where it was.
+    tokio::time::sleep(Duration::from_millis(120)).await;
+    assert!(heard.try_recv().is_err());
+
+    // The computer moves to another network: its old address is gone.
+    let elsewhere = Network {
+        candidates: vec![candidate(Ipv4Addr::new(10, 0, 0, 5), "Wi-Fi (en0)")],
+        own: vec![IpAddr::V4(Ipv4Addr::new(10, 0, 0, 5))],
+    };
+    *lock(&own) = elsewhere.own.clone();
+    let event = tokio::time::timeout(Duration::from_secs(5), heard.recv())
+        .await
+        .expect("the change is noticed");
+    assert_eq!(event, Some(ProxyEventDto::AddressChanged));
+    assert_eq!(
+        serde_json::to_string(&ProxyEventDto::AddressChanged).unwrap(),
+        r#"{"kind":"addressChanged"}"#
+    );
+    // Once per change, not once per look.
+    tokio::time::sleep(Duration::from_millis(150)).await;
+    assert!(heard.try_recv().is_err(), "said once");
+
+    // Asked for the proxy now, the shell does not hand back the address nothing can reach.
+    for asked in [None, Some("127.0.0.1")] {
+        let stale = s
+            .start_proxy(asked, &elsewhere, emit.clone())
+            .await
+            .unwrap_err();
+        assert_eq!(stale, CmdError(Reject::AddressChanged));
+        assert!(stale.to_string().starts_with("address_changed: "));
+        assert!(stale.sentence().contains("Restart the connection"));
+    }
+    // A capture, had there been one, is still in memory: nothing was torn down.
+    assert!(s.proxy.lock().await.is_some());
+
+    // The address comes back (the same Wi-Fi again): the proxy is described as before...
+    *lock(&own) = net.own.clone();
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    let again = s.start_proxy(None, &net, emit.clone()).await.unwrap();
+    assert_eq!(again.port, info.port);
+    assert!(heard.try_recv().is_err());
+    // ...and a second loss is a second change.
+    *lock(&own) = elsewhere.own.clone();
+    let event = tokio::time::timeout(Duration::from_secs(5), heard.recv())
+        .await
+        .expect("the second change is noticed");
+    assert_eq!(event, Some(ProxyEventDto::AddressChanged));
+
+    // The way out is the start-over, which does not insist on the address that is gone.
+    let gone = s
+        .restart_proxy(Some("127.0.0.1"), &elsewhere, emit.clone())
+        .await
+        .unwrap_err();
+    assert_eq!(gone.code().as_str(), "address_changed");
+    // (10.0.0.5 is not really this computer's, so the listener cannot be opened there; the
+    // point is that the default was chosen and tried.)
+    let tried = s.restart_proxy(None, &elsewhere, emit.clone()).await;
+    assert_eq!(tried.unwrap_err(), CmdError(Reject::ListenFailed));
+
+    // A stopped proxy is no longer watched.
+    s.cleanup().await.unwrap();
+    *lock(&own) = vec![];
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    assert!(heard.try_recv().is_err());
+}
+
+#[tokio::test]
+async fn the_computer_is_kept_awake_exactly_while_the_proxy_runs() {
+    let dir = tempfile::tempdir().unwrap();
+    let s = session(dir.path(), Arc::new(MemoryKeyStore::new()));
+    s.tune_proxy(0, None);
+    s.tune_keep_awake(sleeper());
+    let net = two_addresses();
+    assert_eq!(awake_pid(&s).await, None);
+
+    s.start_proxy(Some("127.0.0.1"), &net, no_emit())
+        .await
+        .unwrap();
+    let first = awake_pid(&s).await.expect("a helper runs with the proxy");
+    assert!(alive(first));
+    // Asking again starts no second helper.
+    s.start_proxy(None, &net, no_emit()).await.unwrap();
+    assert_eq!(awake_pid(&s).await, Some(first));
+
+    // Moving and starting over each stop the old helper and start one for the new proxy.
+    s.start_proxy(Some("0.0.0.0"), &net, no_emit())
+        .await
+        .unwrap();
+    let second = awake_pid(&s).await.unwrap();
+    assert!(!alive(first), "the old helper was stopped and collected");
+    assert!(alive(second));
+    s.restart_proxy(None, &net, no_emit()).await.unwrap();
+    let third = awake_pid(&s).await.unwrap();
+    assert!(!alive(second));
+    assert!(alive(third));
+
+    // Cleanup stops the proxy, and the helper with it.
+    s.cleanup().await.unwrap();
+    assert_eq!(awake_pid(&s).await, None);
+    assert!(!alive(third));
+
+    // So does closing the app, which cannot wait.
+    s.start_proxy(Some("127.0.0.1"), &net, no_emit())
+        .await
+        .unwrap();
+    let fourth = awake_pid(&s).await.unwrap();
+    assert!(alive(fourth));
+    s.on_exit();
+    assert!(!alive(fourth));
+
+    // A helper that cannot be started is not a reason to refuse to run.
+    s.tune_keep_awake(Some(KeepAwakeCommand {
+        program: PathBuf::from("/nonexistent/keep-awake"),
+        args: vec![],
+    }));
+    s.start_proxy(Some("127.0.0.1"), &net, no_emit())
+        .await
+        .unwrap();
+    assert_eq!(awake_pid(&s).await, None);
+    // And a session that is simply dropped takes its helper with it.
+    s.tune_keep_awake(sleeper());
+    s.restart_proxy(None, &net, no_emit()).await.unwrap();
+    let last = awake_pid(&s).await.unwrap();
+    drop(s);
+    assert!(!alive(last));
+}
+
+fn api_key_input() -> BwLoginInput {
+    serde_json::from_str(
+        r#"{"email":"a@example.com","password":"master pw","region":{"kind":"us"},
+            "apiKey":{"clientId":"user.11111111-0000-4000-8000-000000000001","clientSecret":"synthetic0secret0value"}}"#,
+    )
+    .unwrap()
+}
+
+#[tokio::test]
+async fn an_api_key_signs_in_by_the_key_and_unlocks_with_the_password() {
+    let dir = tempfile::tempdir().unwrap();
+    let s = session(dir.path(), Arc::new(MemoryKeyStore::new()));
+    *lock(&s.unlocked) = Some(Arc::new(unlocked_one()));
+    let bw = FakeBw::new();
+    let result = s
+        .bw_login(Box::new(bw.clone()), api_key_input())
+        .await
+        .unwrap();
+    assert_eq!(result, BwLoginResult::Ok);
+    assert_eq!(
+        lock(&bw.api_key_sent).clone(),
+        Some((
+            "user.11111111-0000-4000-8000-000000000001".to_string(),
+            "synthetic0secret0value".to_string(),
+            "master pw".to_string()
+        ))
+    );
+    assert_eq!(
+        *lock(&bw.code_sent),
+        None,
+        "the password sign-in was not used"
+    );
+    assert_eq!(bw.logins.load(Ordering::SeqCst), 1);
+    assert!(s.bw.lock().await.is_some());
+    s.bw_propose().await.unwrap();
+
+    // A key or a master password Bitwarden refuses is "the details are wrong".
+    let mut refused = FakeBw::new();
+    refused.outcome = LoginOutcome::BadCredentials;
+    assert_eq!(
+        s.bw_login(Box::new(refused.clone()), api_key_input())
+            .await
+            .unwrap(),
+        BwLoginResult::BadCredentials
+    );
+    assert!(refused.was_wiped());
+
+    // The key is held the way the password is: wiped when dropped, and never printable.
+    let input = api_key_input();
+    let key = input.api_key.as_ref().unwrap();
+    let _id: &Zeroizing<String> = &key.client_id;
+    let _secret: &Zeroizing<String> = &key.client_secret;
+    <BwApiKeyInput as AmbiguousIfDebug<_>>::check();
+    // Without one, the field is simply absent.
+    assert!(login_input().api_key.is_none());
+}
+
+#[tokio::test]
+async fn an_ended_session_is_its_own_error_and_the_choices_survive_signing_in_again() {
+    let dir = tempfile::tempdir().unwrap();
+    let s = session(dir.path(), Arc::new(MemoryKeyStore::new()));
+    let mut second = token("2", "Sample", 6);
+    second.secret = Secret::new("GEZDGNBVGY3TQOJQGEZDGNBVGY3TQOJQ".into());
+    *lock(&s.unlocked) = Some(Arc::new(Unlocked {
+        tokens: vec![token("1", "Example", 6), second],
+        invalid: vec![],
+        native: vec![],
+    }));
+    let mut bw = FakeBw::new();
+    bw.vault = vec![
+        login("item-1", "Example", false),
+        login("item-2", "Bank", false),
+    ];
+
+    // Not signed in at all is the same thing to the person: sign in.
+    for error in [
+        s.bw_propose().await.unwrap_err(),
+        s.bw_logins().await.unwrap_err(),
+        s.bw_apply(vec![], no_progress()).await.unwrap_err(),
+    ] {
+        assert_eq!(error.code().as_str(), "bw_session_expired");
+    }
+
+    s.bw_login(Box::new(bw.clone()), login_input())
+        .await
+        .unwrap();
+    let proposals = s.bw_propose().await.unwrap();
+    s.bw_logins().await.unwrap();
+    // What the person chose on the review screen.
+    let chosen = vec![attach("1", "item-1"), attach("2", "item-2")];
+
+    // The session ends before the apply gets anywhere.
+    bw.expired.store(true, Ordering::SeqCst);
+    for error in [
+        s.bw_apply(chosen.clone(), no_progress()).await.unwrap_err(),
+        s.bw_propose().await.unwrap_err(),
+        s.bw_logins().await.unwrap_err(),
+    ] {
+        assert_eq!(error, CmdError(Reject::BwSessionExpired));
+        assert!(error.to_string().starts_with("bw_session_expired: "));
+    }
+    assert_eq!(lock(&bw.writes).len(), 0);
+    assert_eq!(
+        lock(&s.proposals).as_ref(),
+        Some(&proposals),
+        "what was proposed is still there"
+    );
+
+    // Signing in again to the same account, then running the very same choices: no new
+    // review, no new reading of the vault.
+    let fresh = FakeBw {
+        vault: bw.vault.clone(),
+        ..FakeBw::new()
+    };
+    assert_eq!(
+        s.bw_login(Box::new(fresh.clone()), login_input())
+            .await
+            .unwrap(),
+        BwLoginResult::Ok
+    );
+    assert_eq!(lock(&s.proposals).as_ref(), Some(&proposals));
+    let report = s.bw_apply(chosen, no_progress()).await.unwrap();
+    assert_eq!((report.attached, report.failed), (2, None));
+    assert_eq!(*lock(&fresh.writes), ["attach item-1", "attach item-2"]);
+
+    // A vault that cannot be read for some other reason is not a sign-in failure.
+    struct Unreadable(FakeBw);
+    #[async_trait]
+    impl BwClient for Unreadable {
+        async fn login(
+            &mut self,
+            a: &str,
+            b: &str,
+            c: &Region,
+            d: Option<&str>,
+        ) -> Result<LoginOutcome, BwError> {
+            self.0.login(a, b, c, d).await
+        }
+        async fn login_with_api_key(
+            &mut self,
+            a: &str,
+            b: &str,
+            c: &str,
+            d: &Region,
+        ) -> Result<LoginOutcome, BwError> {
+            self.0.login_with_api_key(a, b, c, d).await
+        }
+        async fn sync(&self) -> Result<(), BwError> {
+            Ok(())
+        }
+        async fn list_logins(&self) -> Result<Vec<VaultLogin>, BwError> {
+            Err(BwError::Cli(
+                "unexpected output from `bw list items`".into(),
+            ))
+        }
+        async fn import_folder_titles(&self) -> Result<Vec<String>, BwError> {
+            Ok(vec![])
+        }
+        async fn set_totp(&self, _: &str, _: &str) -> Result<SetTotp, BwError> {
+            Ok(SetTotp::Attached)
+        }
+        async fn create_in_import_folder(
+            &self,
+            _: &str,
+            _: Option<&str>,
+            _: &str,
+        ) -> Result<(), BwError> {
+            Ok(())
+        }
+        async fn logout_and_wipe(&mut self) -> Result<(), BwError> {
+            Ok(())
+        }
+    }
+    s.bw_login(Box::new(Unreadable(FakeBw::new())), login_input())
+        .await
+        .unwrap();
+    for error in [
+        s.bw_propose().await.unwrap_err(),
+        s.bw_logins().await.unwrap_err(),
+    ] {
+        assert_eq!(error, CmdError(Reject::BwVaultReadFailed));
+        assert_eq!(error.code().as_str(), "bw_vault_read_failed");
+    }
+}
+
+/// A zip that holds one entry, `bw`, with `program` in it.
+fn bw_zip(program: &[u8]) -> Vec<u8> {
+    use std::io::Write;
+    let mut buffer = std::io::Cursor::new(Vec::new());
+    let mut writer = zip::ZipWriter::new(&mut buffer);
+    let stored =
+        zip::write::SimpleFileOptions::default().compression_method(zip::CompressionMethod::Stored);
+    writer.start_file("bw", stored).unwrap();
+    writer.write_all(program).unwrap();
+    writer.finish().unwrap();
+    buffer.into_inner()
+}
+
+fn sha256_hex(bytes: &[u8]) -> String {
+    use sha2::{Digest, Sha256};
+    hex::encode(Sha256::digest(bytes))
+}
+
+/// Serve `body` to every request on a local port, announcing `length` bytes. With a `length`
+/// larger than the body, the connection is then held open and silent. Returns the base URL.
+async fn download_server(body: Vec<u8>, length: usize) -> String {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+    tokio::spawn(async move {
+        loop {
+            let Ok((mut sock, _)) = listener.accept().await else {
+                return;
+            };
+            let body = body.clone();
+            tokio::spawn(async move {
+                let mut seen = Vec::new();
+                while !seen.ends_with(b"\r\n\r\n") {
+                    match sock.read_u8().await {
+                        Ok(byte) => seen.push(byte),
+                        Err(_) => return,
+                    }
+                }
+                let head = format!("HTTP/1.1 200 OK\r\nContent-Length: {length}\r\n\r\n");
+                let _ = sock.write_all(head.as_bytes()).await;
+                let _ = sock.write_all(&body).await;
+                if length > body.len() {
+                    tokio::time::sleep(Duration::from_secs(120)).await;
+                }
+                let _ = sock.shutdown().await;
+            });
+        }
+    });
+    format!("http://127.0.0.1:{port}")
+}
+
+fn collect_lines() -> (EmitProgress, Arc<Mutex<Vec<String>>>) {
+    let lines = Arc::new(Mutex::new(Vec::new()));
+    let sink = Arc::clone(&lines);
+    (Arc::new(move |line| lock(&sink).push(line)), lines)
+}
+
+fn names_under(dir: &Path) -> Vec<String> {
+    if dir.exists() {
+        names_in(dir)
+    } else {
+        Vec::new()
+    }
+}
+
+#[tokio::test]
+async fn preparing_the_tool_reports_progress_in_plain_lines() {
+    let dir = tempfile::tempdir().unwrap();
+    let s = session(dir.path(), Arc::new(MemoryKeyStore::new()));
+    assert_eq!(
+        s.new_cli_client().err(),
+        Some(CmdError(Reject::BwNotPrepared))
+    );
+    // A megabyte and a half of "program".
+    let program: Vec<u8> = (0..1_500_000u32).map(|i| (i % 251) as u8).collect();
+    let zip = bw_zip(&program);
+    let base = download_server(zip.clone(), zip.len()).await;
+    s.tune_bw_download(&base, "bw-test.zip", &sha256_hex(&zip));
+
+    let (progress, lines) = collect_lines();
+    s.bw_prepare(progress).await.unwrap();
+    assert_eq!(
+        *lock(&lines),
+        [
+            "Downloading… 0 of 2 MB",
+            "Downloading… 1 of 2 MB",
+            "Checking the download",
+            "Ready"
+        ]
+    );
+    assert!(s.new_cli_client().is_ok());
+    assert_eq!(names_in(&dir.path().join("bw-cli")), ["bw", "bw-test.zip"]);
+
+    // Again, with the verified download still there: nothing to download.
+    let (progress, lines) = collect_lines();
+    s.bw_prepare(progress).await.unwrap();
+    assert_eq!(*lock(&lines), ["Checking the download", "Ready"]);
+
+    // A download that is not the file expected, and one that cannot be had at all, are
+    // told apart by their codes.
+    s.tune_bw_download(&base, "bw-other.zip", &sha256_hex(b"something else"));
+    let mismatch = s.bw_prepare(no_progress()).await.unwrap_err();
+    assert_eq!(mismatch, CmdError(Reject::BwChecksumMismatch));
+    assert_eq!(mismatch.code().as_str(), "bw_checksum_mismatch");
+    s.tune_bw_download("http://127.0.0.1:1", "bw-none.zip", &sha256_hex(b"x"));
+    let unreachable = s.bw_prepare(no_progress()).await.unwrap_err();
+    assert_eq!(unreachable.code().as_str(), "bw_download_failed");
+    assert!(
+        !unreachable.to_string().contains("127.0.0.1"),
+        "no address in what the person is told: {unreachable}"
+    );
+    assert_eq!(names_in(&dir.path().join("bw-cli")), ["bw", "bw-test.zip"]);
+}
+
+#[tokio::test]
+async fn a_download_or_a_sign_in_can_be_stopped_and_leaves_nothing() {
+    let dir = tempfile::tempdir().unwrap();
+    let s = Arc::new(session(dir.path(), Arc::new(MemoryKeyStore::new())));
+    // With nothing under way, stopping is a no-op, as often as it is asked.
+    s.bw_cancel().await;
+    s.bw_cancel().await;
+
+    // ---- a download that would never end by itself
+    let base = download_server(vec![7u8; 1_572_864], 3 * 1024 * 1024).await;
+    s.tune_bw_download(&base, "bw-test.zip", &sha256_hex(b"x"));
+    let (progress, lines) = collect_lines();
+    let preparing = {
+        let s = Arc::clone(&s);
+        tokio::spawn(async move { s.bw_prepare(progress).await })
+    };
+    let part = dir.path().join("bw-cli").join("bw-test.zip.part");
+    for _ in 0..500 {
+        if lock(&lines).iter().any(|l| l == "Downloading… 1 of 3 MB") {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    assert!(
+        part.exists(),
+        "the download is under way: {:?}",
+        lock(&lines)
+    );
+    tokio::time::timeout(Duration::from_secs(5), s.bw_cancel())
+        .await
+        .expect("stopping does not hang");
+    // By the time the stop returns, the work is over and its leavings are gone.
+    assert_eq!(
+        names_under(&dir.path().join("bw-cli")),
+        Vec::<String>::new()
+    );
+    let stopped = preparing.await.unwrap().unwrap_err();
+    assert_eq!(stopped, CmdError(Reject::BwStopped));
+    assert_eq!(stopped.code().as_str(), "bw_failed");
+    assert_eq!(
+        s.new_cli_client().err(),
+        Some(CmdError(Reject::BwNotPrepared)),
+        "nothing was prepared"
+    );
+    s.bw_cancel().await;
+
+    // ---- a sign-in that would never end by itself
+    let (bw, entered, _release) = FakeBw::new().held();
+    let bw_data = dir.path().join("bw-data");
+    let signing_in = {
+        let s = Arc::clone(&s);
+        let client = Box::new(bw.clone());
+        tokio::spawn(async move { s.bw_login(client, login_input()).await })
+    };
+    entered.notified().await;
+    std::fs::create_dir_all(&bw_data).unwrap();
+    std::fs::write(bw_data.join("data.json"), b"{}").unwrap();
+    tokio::time::timeout(Duration::from_secs(5), s.bw_cancel())
+        .await
+        .expect("stopping does not hang");
+    assert!(bw.was_wiped(), "signed out and wiped");
+    assert!(!bw_data.exists(), "its data folder is gone");
+    assert!(s.bw.lock().await.is_none(), "no client is left behind");
+    assert_eq!(
+        signing_in.await.unwrap().unwrap_err(),
+        CmdError(Reject::BwStopped)
+    );
+    s.bw_cancel().await;
+
+    // A sign-in after a stopped one works as if nothing had happened.
+    assert_eq!(
+        s.bw_login(Box::new(FakeBw::new()), login_input())
+            .await
+            .unwrap(),
+        BwLoginResult::Ok
+    );
+    // And stopping when the work has already finished changes nothing.
+    s.bw_cancel().await;
+    assert!(s.bw.lock().await.is_some());
+}
+
+#[tokio::test]
+async fn the_downloaded_tool_is_removed_and_finish_leaves_the_data_folder_empty() {
+    let dir = tempfile::tempdir().unwrap();
+    let data = dir.path().join("app-data");
+    std::fs::create_dir(&data).unwrap();
+    let store = Arc::new(MemoryKeyStore::new());
+    let zip = bw_zip(b"#!/bin/sh\necho pretend bw\n");
+    let base = download_server(zip.clone(), zip.len()).await;
+    let prepared = |store: Arc<MemoryKeyStore>| {
+        let (base, hash, data) = (base.clone(), sha256_hex(&zip), data.clone());
+        async move {
+            let s = session(&data, store);
+            s.tune_proxy(0, None);
+            s.tune_bw_download(&base, "bw-test.zip", &hash);
+            s.start_proxy(Some("127.0.0.1"), &loopback(), no_emit())
+                .await
+                .unwrap();
+            s.bw_prepare(no_progress()).await.unwrap();
+            std::fs::create_dir_all(data.join("bw-data")).unwrap();
+            std::fs::write(data.join("bw-data").join("data.json"), b"{}").unwrap();
+            assert_eq!(names_in(&data), ["bw-cli", "bw-data", "session.json"]);
+            s
+        }
+    };
+
+    // Cleanup removes the tool; finish then leaves nothing of the app's own making.
+    let s = prepared(store.clone()).await;
+    s.cleanup().await.unwrap();
+    assert_eq!(
+        names_in(&data),
+        ["session.json"],
+        "only the marker, until Finish"
+    );
+    assert_eq!(
+        s.new_cli_client().err(),
+        Some(CmdError(Reject::BwNotPrepared))
+    );
+    s.finish().await.unwrap();
+    assert_eq!(names_in(&data), Vec::<String>::new());
+    assert_eq!(store.load().unwrap(), None);
+
+    // Finish without a cleanup first does the same.
+    let s = prepared(store.clone()).await;
+    s.finish().await.unwrap();
+    assert_eq!(names_in(&data), Vec::<String>::new());
+
+    // Closing the app mid-flow removes the tool too; the marker stays for the next launch,
+    // whose cleanup has nothing of Bitwarden's left to find.
+    let s = prepared(store.clone()).await;
+    s.on_exit();
+    assert_eq!(names_in(&data), ["session.json"]);
+    drop(s);
+
+    // A launch after a crash (nothing was removed): the leftovers go at once, and the
+    // resumed cleanup and finish leave the folder empty.
+    std::fs::create_dir_all(data.join("bw-cli")).unwrap();
+    std::fs::write(data.join("bw-cli").join("bw"), b"left by a crash").unwrap();
+    std::fs::create_dir_all(data.join("bw-data")).unwrap();
+    let resumed = session(&data, store.clone());
+    assert!(resumed.get_state(&loopback()).resume_cleanup);
+    assert_eq!(names_in(&data), ["session.json"]);
+    // Something puts the folder back before the cleanup runs: cleanup removes it itself.
+    std::fs::create_dir_all(data.join("bw-cli")).unwrap();
+    std::fs::write(data.join("bw-cli").join("bw"), b"again").unwrap();
+    resumed.cleanup().await.unwrap();
+    assert_eq!(names_in(&data), ["session.json"]);
+    resumed.finish().await.unwrap();
+    assert_eq!(names_in(&data), Vec::<String>::new());
+    assert_eq!(store.load().unwrap(), None);
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn a_tool_that_cannot_be_removed_fails_the_cleanup_in_a_full_sentence() {
+    use std::os::unix::fs::PermissionsExt;
+    let dir = tempfile::tempdir().unwrap();
+    let s = session(dir.path(), Arc::new(MemoryKeyStore::new()));
+    s.ensure_ca().await.unwrap();
+    // A folder that cannot be emptied: its owner may not write to it.
+    let tool = dir.path().join("bw-cli");
+    std::fs::create_dir_all(&tool).unwrap();
+    std::fs::write(tool.join("bw"), b"x").unwrap();
+    std::fs::set_permissions(&tool, std::fs::Permissions::from_mode(0o500)).unwrap();
+
+    let error = s.cleanup().await.unwrap_err();
+    std::fs::set_permissions(&tool, std::fs::Permissions::from_mode(0o700)).unwrap();
+    assert_eq!(error, CmdError(Reject::CleanupBwToolNotRemoved));
+    assert_eq!(error.code().as_str(), "cleanup_failed");
+    assert!(error.sentence().starts_with("The Bitwarden tool"));
+    assert!(error.sentence().ends_with('.'));
+    assert!(
+        !error.to_string().contains(&*dir.path().to_string_lossy()),
+        "no path in what the person is told"
+    );
+    // Finish refuses for the same reason, and goes through once the cause is gone.
+    assert!(dir.path().join("session.json").exists());
+    s.finish().await.unwrap();
+    assert_eq!(names_in(dir.path()), Vec::<String>::new());
 }

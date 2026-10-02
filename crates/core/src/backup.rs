@@ -18,9 +18,12 @@ use zeroize::Zeroize;
 pub enum BackupError {
     #[error("malformed response: {0}")]
     Malformed(String),
-    #[error("wrong backup password")]
-    WrongPassword,
 }
+
+/// The one way [`unlock`] fails: the password does not open the backup.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+#[error("wrong backup password")]
+pub struct WrongPassword;
 
 /// Authy's fixed PBKDF2 round count before the response started carrying one per token.
 const DEFAULT_KDF_ITERATIONS: u32 = 1000;
@@ -311,8 +314,10 @@ fn name_token(tok: &EncryptedToken) -> (Option<String>, Option<String>, String) 
 /// Decrypt the backup with the password exactly as typed.
 ///
 /// Tokens that fail to decrypt individually (when the password is right overall) are reported in
-/// `invalid` as `NotBase32`, since the type has no other reason; they are never exported.
-pub fn unlock(backup: &CapturedBackup, password: &str) -> Result<Unlocked, BackupError> {
+/// `invalid` as `NotBase32`, since the type has no other reason; they are never exported. The
+/// same goes for a token whose number of digits no code can have. Every token that does come
+/// out can therefore show a code.
+pub fn unlock(backup: &CapturedBackup, password: &str) -> Result<Unlocked, WrongPassword> {
     let total = backup.tokens.len();
     let mut tokens = Vec::new();
     let mut invalid = Vec::new();
@@ -323,7 +328,7 @@ pub fn unlock(backup: &CapturedBackup, password: &str) -> Result<Unlocked, Backu
             failed += 1;
             // Even if every remaining token decrypted, fewer than half would: stop early.
             if (total - failed) * 2 < total {
-                return Err(BackupError::WrongPassword);
+                return Err(WrongPassword);
             }
             invalid.push(InvalidToken {
                 name: t.name.clone(),
@@ -343,6 +348,12 @@ pub fn unlock(backup: &CapturedBackup, password: &str) -> Result<Unlocked, Backu
                 name: t.name.clone(),
                 reason: InvalidReason::TooShort,
             }),
+            // No authenticator makes codes of this length ([`crate::totp::code`] refuses it),
+            // so the token could never be checked. The type has no reason of its own for it.
+            Ok(_) if !(1..=10).contains(&t.digits) => invalid.push(InvalidToken {
+                name: t.name.clone(),
+                reason: InvalidReason::NotBase32,
+            }),
             Ok(_) => {
                 let (issuer, username, title) = name_token(t);
                 tokens.push(Token {
@@ -360,7 +371,7 @@ pub fn unlock(backup: &CapturedBackup, password: &str) -> Result<Unlocked, Backu
         cleaned.zeroize();
     }
     if decrypted * 2 < total {
-        return Err(BackupError::WrongPassword);
+        return Err(WrongPassword);
     }
     Ok(Unlocked {
         tokens,
@@ -435,6 +446,30 @@ mod tests {
     }
 
     #[test]
+    fn a_token_no_code_can_be_made_for_is_listed_as_unusable_not_dropped_later() {
+        // Authy says how many digits a token's codes have. A number no code can have must
+        // not come out as a token: it would be exported, and then be missing, with no reason
+        // given, from the list of codes to check.
+        let mut odd = make(1, "Eleven Digits", GOOD, true, PW);
+        odd.digits = 11;
+        let fine = make(2, "Eight Digits", GOOD, true, PW);
+        let u = unlock(&backup(vec![odd, EncryptedToken { digits: 8, ..fine }]), PW).unwrap();
+        let titles: Vec<&str> = u.tokens.iter().map(|t| t.title.as_str()).collect();
+        assert_eq!(titles, ["Eight Digits"]);
+        assert_eq!(
+            u.invalid,
+            vec![InvalidToken {
+                name: "Eleven Digits".into(),
+                reason: InvalidReason::NotBase32
+            }]
+        );
+        for token in &u.tokens {
+            crate::totp::code(token.secret.expose(), token.digits, token.period, 59)
+                .expect("every token that comes out can show a code");
+        }
+    }
+
+    #[test]
     fn decrypts_with_zero_iv() {
         let t = make(1, "A", GOOD, false, PW);
         assert!(t.unique_iv.is_none());
@@ -446,10 +481,7 @@ mod tests {
     fn wrong_password_is_rejected() {
         let b = twenty(PW);
         assert_eq!(b.tokens.len(), 20);
-        assert!(matches!(
-            unlock(&b, "not the password"),
-            Err(BackupError::WrongPassword)
-        ));
+        assert!(matches!(unlock(&b, "not the password"), Err(WrongPassword)));
         assert_eq!(unlock(&b, PW).unwrap().tokens.len(), 20);
     }
 
@@ -467,7 +499,7 @@ mod tests {
             }
             for wrong in &wrongs {
                 assert!(
-                    matches!(unlock(&b, wrong), Err(BackupError::WrongPassword)),
+                    matches!(unlock(&b, wrong), Err(WrongPassword)),
                     "{wrong:?} must not unlock"
                 );
             }
@@ -485,7 +517,7 @@ mod tests {
         let (tx, rx) = std::sync::mpsc::channel();
         std::thread::spawn(move || {
             let outcome = unlock(&backup(vec![absurd, over]), "pw");
-            let _ = tx.send(matches!(outcome, Err(BackupError::WrongPassword)));
+            let _ = tx.send(matches!(outcome, Err(WrongPassword)));
         });
         let refused = rx
             .recv_timeout(std::time::Duration::from_secs(3))
@@ -666,7 +698,7 @@ mod tests {
         v.encrypted_seed = STANDARD.encode([1u8; 5]);
         assert!(matches!(
             unlock(&backup(vec![t, u, v]), PW),
-            Err(BackupError::WrongPassword)
+            Err(WrongPassword)
         ));
     }
 }

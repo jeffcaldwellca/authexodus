@@ -89,6 +89,8 @@ const DIAL_TIMEOUT: Duration = Duration::from_secs(15);
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
 /// At most one [`ProxyEvent::DeviceRefused`] in this long.
 const REFUSED_EVERY: Duration = Duration::from_secs(2);
+/// At most one [`ProxyEvent::EmptyBackup`] in this long.
+const EMPTY_BACKUP_EVERY: Duration = Duration::from_secs(2);
 const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(30);
 /// A blind tunnel that carries no bytes in either direction for this long is closed.
 const TUNNEL_IDLE: Duration = Duration::from_secs(10 * 60);
@@ -165,6 +167,10 @@ pub enum ProxyEvent {
     TlsRejected,
     /// The captured backup grew. `count` is the number of encrypted tokens now held.
     BackupCaptured { count: usize },
+    /// Authy answered the device's tokens request with no accounts at all, and none are held
+    /// from an earlier answer: backups are probably switched off in Authy. Sent at most once
+    /// every two seconds.
+    EmptyBackup,
     /// Authy answered with a 4xx or 5xx. `path` has no query string, and its all-digit
     /// segments (account and device ids) are replaced by `:id`.
     AuthyError { status: u16, path: String },
@@ -379,6 +385,7 @@ pub async fn start(
         trust_working: Once::default(),
         device: Mutex::new(None),
         refused: Throttle::new(REFUSED_EVERY),
+        empty_backup: Throttle::new(EMPTY_BACKUP_EVERY),
         per_peer: Mutex::new(HashMap::new()),
         max_per_peer,
         tunnels: Mutex::new(Vec::new()),
@@ -438,6 +445,7 @@ struct Shared {
     /// host.
     device: Mutex<Option<IpAddr>>,
     refused: Throttle,
+    empty_backup: Throttle,
     /// Open connections for each peer address.
     per_peer: Mutex<HashMap<IpAddr, usize>>,
     max_per_peer: usize,
@@ -1802,6 +1810,8 @@ impl CaptureSink {
         let Some(captured) = capture::inspect(&body) else {
             return;
         };
+        let no_accounts =
+            matches!(&captured, capture::Captured::Tokens(tokens) if tokens.is_empty());
         let (count, native) = {
             // The device lock is held across the merge, so a capture can never slip in from a
             // peer that is not (or is no longer) the device. Lock order: device, then backup.
@@ -1811,6 +1821,15 @@ impl CaptureSink {
             }
             let mut backup = shared.lock_backup();
             if !capture::merge(&mut backup, captured) {
+                // Nothing grew. An answer with no accounts, while none are held from an
+                // earlier answer, is worth saying: there is nothing to wait for.
+                let nothing_held = backup.tokens.is_empty();
+                drop(backup);
+                drop(device);
+                if no_accounts && nothing_held && shared.empty_backup.ready() {
+                    tracing::info!(encoded, "Authy answered with no accounts");
+                    shared.emit(ProxyEvent::EmptyBackup);
+                }
                 return;
             }
             (backup.tokens.len(), backup.native_apps.len())
@@ -1895,7 +1914,7 @@ mod tests {
     #[tokio::test]
     async fn device_connected_fires_once_for_the_first_non_loopback_peer() {
         let ca =
-            Arc::new(Authority::load_or_create(&crate::ca::MemoryKeyStore::new(), true).unwrap());
+            Arc::new(Authority::create_fresh(&crate::ca::MemoryKeyStore::new(), true).unwrap());
         let (tx, mut events) = mpsc::unbounded_channel();
         let handle = start(
             ProxyConfig {

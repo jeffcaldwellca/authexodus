@@ -3,11 +3,19 @@
 DIR="$(dirname "$0")"
 echo "$@" >> "$DIR/args.log"
 env >> "$DIR/env.full"
-echo "appdata=$BITWARDENCLI_APPDATA_DIR session=${BW_SESSION:-none} pw=${BW_PASSWORD:-none} cid=${BW_CLIENTID:-none} sec=${BW_CLIENTSECRET:-none} resp=${BW_RESPONSE:-none}" >> "$DIR/env.log"
+echo "appdata=$BITWARDENCLI_APPDATA_DIR session=${BW_SESSION:-none} pw=${BW_PASSWORD:-none} mine=${AUTHEXODUS_BW_PASSWORD:-none} cid=${BW_CLIENTID:-none} sec=${BW_CLIENTSECRET:-none} resp=${BW_RESPONSE:-none}" >> "$DIR/env.log"
 case "$1" in
   logout) exit 0 ;;
   config) exit 0 ;;
   login)
+    case "$*" in
+      *--apikey*)
+        # The wording CLI 2026.9.1 uses for a refused key (read from the release; see cli.rs).
+        if [ "$BW_CLIENTID" != "user.11111111-0000-4000-8000-000000000001" ] || [ "$BW_CLIENTSECRET" != "synthetic0secret0value" ]; then
+          echo "client_id or client_secret is incorrect. Try again." >&2; exit 1
+        fi
+        echo "You are logged in!"; exit 0 ;;
+    esac
     if [ "$AUTHEXODUS_BW_PASSWORD" != "correct horse" ]; then
       echo "Invalid master password. Confirm your email is correct and your account was created on vault.bitwarden.com." >&2; exit 1
     fi
@@ -27,7 +35,9 @@ case "$1" in
         ;;
     esac
     echo "SESSIONKEYFROMLOGIN"; exit 0 ;;
-  unlock) echo "fake-session-key"; exit 0 ;;
+  unlock)
+    if [ "$AUTHEXODUS_BW_PASSWORD" != "correct horse" ]; then echo "Invalid master password." >&2; exit 1; fi
+    echo "fake-session-key"; exit 0 ;;
   list)
     case "$2" in
       items) if [ "$3" = "--folderid" ]; then cat "$DIR/import_folder_items.json"; else cat "$DIR/list_items.json"; fi ;;

@@ -311,7 +311,7 @@ async fn rig_tuned(tune: impl FnOnce(TestUpstream) -> TestUpstream) -> Rig {
 }
 
 async fn rig_with(upstream: Option<TestUpstream>) -> Rig {
-    let ca = Arc::new(Authority::load_or_create(&MemoryKeyStore::new(), true).unwrap());
+    let ca = Arc::new(Authority::create_fresh(&MemoryKeyStore::new(), true).unwrap());
     let (tx, events) = tokio::sync::mpsc::unbounded_channel();
     let handle = proxy::start(
         ProxyConfig {
@@ -874,7 +874,7 @@ async fn falls_back_when_port_in_use() {
     let blocker = std::net::TcpListener::bind((LOCALHOST, 0)).unwrap();
     let taken = blocker.local_addr().unwrap().port();
 
-    let ca = Arc::new(Authority::load_or_create(&MemoryKeyStore::new(), true).unwrap());
+    let ca = Arc::new(Authority::create_fresh(&MemoryKeyStore::new(), true).unwrap());
     let (tx, _events) = tokio::sync::mpsc::unbounded_channel();
     let handle = proxy::start(
         ProxyConfig {
@@ -2104,5 +2104,68 @@ async fn a_device_at_its_limit_gives_up_its_longest_idle_tunnel_for_a_new_connec
         b'y',
         "the busy tunnel is untouched"
     );
+    rig.handle.shutdown().await;
+}
+
+// ---------------------------------------------------------------------------------------------
+// Completeness fixes
+// ---------------------------------------------------------------------------------------------
+
+#[tokio::test]
+async fn an_answer_with_no_accounts_is_reported_as_an_empty_backup() {
+    let mut rig = phone_rig().await;
+    let client = rig.trusting_client();
+    let get = |path: &str| client.get(format!("https://{AUTHY_HOST}{path}")).send();
+
+    // Authy answers the tokens request with zero accounts (backups are probably off).
+    get("/json/users/2/authenticator_tokens").await.unwrap();
+    let seen = rig.wait_for(|e| *e == ProxyEvent::EmptyBackup).await;
+    assert!(
+        !seen
+            .iter()
+            .any(|e| matches!(e, ProxyEvent::BackupCaptured { .. })),
+        "{seen:?}"
+    );
+    assert_eq!(rig.handle.backup().tokens.len(), 0);
+
+    // Authy asks more than once; the notice is not repeated straight away.
+    get("/json/users/2/authenticator_tokens").await.unwrap();
+    get("/json/users/2/authenticator_tokens").await.unwrap();
+    assert_eq!(rig.drain().await, []);
+
+    // An account with only Authy-native tokens: the names still arrive, with a count of zero.
+    get("/json/users/2/devices/9/apps").await.unwrap();
+    assert_eq!(
+        rig.wait_for(|e| matches!(e, ProxyEvent::BackupCaptured { .. }))
+            .await,
+        [ProxyEvent::BackupCaptured { count: 0 }]
+    );
+    assert_eq!(rig.handle.backup().native_apps.len(), 2);
+
+    // Once a real backup is held, a later empty answer is not news.
+    get("/json/users/1/authenticator_tokens").await.unwrap();
+    rig.wait_for(|e| *e == ProxyEvent::BackupCaptured { count: 3 })
+        .await;
+    tokio::time::sleep(std::time::Duration::from_millis(2100)).await;
+    get("/json/users/2/authenticator_tokens").await.unwrap();
+    assert_eq!(rig.drain().await, []);
+    rig.handle.shutdown().await;
+}
+
+#[tokio::test]
+async fn an_empty_answer_to_this_computer_is_not_an_empty_backup() {
+    let mut rig = rig().await;
+    let ca = rig.ca_der.clone();
+    let (head, _) = raw_https(
+        rig.proxy,
+        AUTHY_HOST,
+        443,
+        &[&ca],
+        "GET",
+        "/json/users/2/authenticator_tokens",
+    )
+    .await;
+    assert!(head.starts_with("HTTP/1.1 200"), "{head}");
+    assert_eq!(rig.drain().await, [ProxyEvent::TrustWorking]);
     rig.handle.shutdown().await;
 }

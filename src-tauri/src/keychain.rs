@@ -2,9 +2,10 @@
 //!
 //! The only file that touches the real Keychain. Tests never construct a `KeychainStore`.
 //!
-//! The session never reads the item back to use it and never updates it in place: a new run
-//! deletes whatever is there and creates the item again (`Authority::create_fresh`), so the
-//! item's access rules are always the ones this app's own creation gives it.
+//! The item is never read back (`KeyStore` has no operation for it) and never updated in
+//! place: a new run deletes whatever is there and creates the item again
+//! (`Authority::create_fresh`), so the item's access rules are always the ones this app's own
+//! creation gives it, and all a later launch does with an item is delete it.
 
 use authexodus_core::ca::{CaError, KeyStore};
 
@@ -22,14 +23,6 @@ impl KeychainStore {
 }
 
 impl KeyStore for KeychainStore {
-    fn load(&self) -> Result<Option<Vec<u8>>, CaError> {
-        match Self::entry()?.get_secret() {
-            Ok(blob) => Ok(Some(blob)),
-            Err(keyring::Error::NoEntry) => Ok(None),
-            Err(e) => Err(CaError::Store(e.to_string())),
-        }
-    }
-
     fn store(&self, blob: &[u8]) -> Result<(), CaError> {
         Self::entry()?
             .set_secret(blob)

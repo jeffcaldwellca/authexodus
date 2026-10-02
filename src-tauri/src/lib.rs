@@ -1,16 +1,40 @@
 //! authexodus Tauri shell: holds one session's state and exposes the core to the UI as
 //! commands and events matching `ui/src/api.ts`.
 
+pub mod awake;
 pub mod commands;
 pub mod dto;
+pub mod errors;
 pub mod keychain;
 pub mod logging;
 pub mod network;
+pub mod progress;
 pub mod session;
 
+use std::path::Path;
 use std::sync::Arc;
 
 use tauri::{Manager, RunEvent};
+use tauri_plugin_dialog::{DialogExt, MessageDialogKind};
+
+/// The label of the app's one window (Tauri's default, and the one the capability names).
+const MAIN_WINDOW: &str = "main";
+
+/// Shown in a system dialog, as it is written here, when the app cannot make or use its own
+/// data folder at launch. There is no window to say it in: the app closes when the dialog is
+/// dismissed.
+pub const SETUP_FAILED: &str = "authexodus could not start, because it could not create or open its own folder in your Library's Application Support folder. Check that this computer's disk is not full and that your user account can write to its Library folder, then open authexodus again.";
+
+/// Make the app's data folder, for its owner only.
+fn prepare_data_dir(dir: &Path) -> std::io::Result<()> {
+    std::fs::create_dir_all(dir)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700))?;
+    }
+    Ok(())
+}
 
 pub fn run() {
     // Before anything else, so that every stage of the run can be followed from Terminal.
@@ -19,30 +43,70 @@ pub fn run() {
         Some(limit) => tracing::debug!(limit, "open-file limit"),
         None => tracing::warn!("the open-file limit could not be read"),
     }
-    let app = tauri::Builder::default()
+    let built = tauri::Builder::default()
+        // First, as the plugin asks: a second copy of the app stops here, before it has
+        // touched anything the first copy owns (the keychain item, the marker, the Bitwarden
+        // folders), and the first copy's window comes forward instead.
+        .plugin(tauri_plugin_single_instance::init(|app, _args, _cwd| {
+            tracing::info!("a second copy was opened; bringing this one forward");
+            if let Some(window) = app.get_webview_window(MAIN_WINDOW) {
+                let _ = window.unminimize();
+                let _ = window.show();
+                let _ = window.set_focus();
+            }
+        }))
         .plugin(tauri_plugin_dialog::init())
         .setup(|app| {
-            let dir = app.path().app_data_dir()?;
-            std::fs::create_dir_all(&dir)?;
-            #[cfg(unix)]
-            {
-                use std::os::unix::fs::PermissionsExt;
-                std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700))?;
+            let prepared = app
+                .path()
+                .app_data_dir()
+                .map_err(|_| std::io::ErrorKind::NotFound)
+                .and_then(|dir| prepare_data_dir(&dir).map(|()| dir).map_err(|e| e.kind()));
+            match prepared {
+                Ok(dir) => {
+                    app.manage(session::Session::new(
+                        Arc::new(keychain::KeychainStore),
+                        dir,
+                    ));
+                }
+                Err(kind) => {
+                    // Not a panic and not a window that cannot work: say why in a system
+                    // dialog, then leave. (The dialog is shown once the event loop runs,
+                    // which is why this returns normally.)
+                    tracing::error!(?kind, "the app's data folder could not be prepared");
+                    if let Some(window) = app.get_webview_window(MAIN_WINDOW) {
+                        let _ = window.hide();
+                    }
+                    let handle = app.handle().clone();
+                    app.dialog()
+                        .message(SETUP_FAILED)
+                        .title("authexodus")
+                        .kind(MessageDialogKind::Error)
+                        .show(move |_| handle.exit(1));
+                }
             }
-            app.manage(session::Session::new(
-                Arc::new(keychain::KeychainStore),
-                dir,
-            ));
             Ok(())
         })
         .invoke_handler(commands::handler())
-        .build(tauri::generate_context!())
-        .expect("error while building authexodus");
+        .build(tauri::generate_context!());
+    let app = match built {
+        Ok(app) => app,
+        Err(error) => {
+            // Nothing of Tauri is running, so there is nothing to show a dialog with; the
+            // reason goes to the log and the exit status says it failed.
+            tracing::error!(
+                error = %logging::sanitised(&error.to_string()),
+                "the app could not be started"
+            );
+            std::process::exit(1);
+        }
+    };
 
     app.run(|handle, event| {
-        // Closing the window mid-flow: stop listening on the network and remove what Bitwarden
-        // left on disk. The certificate key and the marker stay, so the next launch opens on
-        // cleanup. Both events can arrive for one exit; doing it twice is harmless.
+        // Closing the window mid-flow: stop listening on the network (and stop keeping the
+        // computer awake) and remove what Bitwarden left on disk. The certificate key and
+        // the marker stay, so the next launch opens on cleanup. Both events can arrive for
+        // one exit; doing it twice is harmless.
         if matches!(event, RunEvent::ExitRequested { .. } | RunEvent::Exit) {
             if let Some(session) = handle.try_state::<session::Session>() {
                 session.on_exit();
@@ -54,6 +118,55 @@ pub fn run() {
 #[cfg(test)]
 mod tests {
     use std::collections::BTreeMap;
+
+    #[cfg(unix)]
+    #[test]
+    fn the_data_folder_is_made_for_its_owner_only_and_a_failure_is_an_error_not_a_panic() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let data = dir.path().join("Application Support").join("authexodus");
+        super::prepare_data_dir(&data).unwrap();
+        let mode = std::fs::metadata(&data).unwrap().permissions().mode();
+        assert_eq!(mode & 0o777, 0o700);
+        super::prepare_data_dir(&data).expect("a folder that is already there is fine");
+
+        // Something that is not a folder is in the way: reported, for the dialog to say.
+        std::fs::write(dir.path().join("blocked"), b"a file").unwrap();
+        assert!(super::prepare_data_dir(&dir.path().join("blocked").join("authexodus")).is_err());
+    }
+
+    #[test]
+    fn what_the_person_is_told_when_the_app_cannot_start_is_plain() {
+        let said = super::SETUP_FAILED;
+        assert!(said.starts_with("authexodus could not start"));
+        assert!(said.ends_with('.'));
+        for mark in ['/', '\\', '{', '}', '~'] {
+            assert!(!said.contains(mark), "{mark:?} in {said}");
+        }
+        for jargon in ["error", "panic", "directory", "permission denied"] {
+            assert!(
+                !said.to_lowercase().contains(jargon),
+                "{jargon:?} in {said}"
+            );
+        }
+    }
+
+    #[test]
+    fn the_app_has_one_window_and_it_is_the_one_a_second_launch_brings_forward() {
+        let config: serde_json::Value =
+            serde_json::from_str(include_str!("../tauri.conf.json")).unwrap();
+        let windows = config["app"]["windows"].as_array().unwrap();
+        assert_eq!(windows.len(), 1);
+        // Tauri names a window "main" unless told otherwise.
+        let label = windows[0]["label"].as_str().unwrap_or("main");
+        assert_eq!(label, super::MAIN_WINDOW);
+        let capability: serde_json::Value =
+            serde_json::from_str(include_str!("../capabilities/default.json")).unwrap();
+        assert_eq!(
+            capability["windows"],
+            serde_json::json!([super::MAIN_WINDOW])
+        );
+    }
 
     /// A policy as `directive -> sources`.
     fn directives(policy: &str) -> BTreeMap<&str, Vec<&str>> {

@@ -32,14 +32,33 @@ pub enum Device {
     Ipad,
 }
 
+/// What the shell already knows about this run, so that the UI can pick up where it was
+/// after its window is reloaded.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SessionSnapshot {
+    /// The running proxy, if one is.
+    pub proxy: Option<ProxyInfo>,
+    /// Whether a device has used this proxy run, and whether it has trusted the certificate
+    /// on it. Both start again from false when the proxy is restarted.
+    pub device_connected: bool,
+    pub trust_working: bool,
+    /// How many encrypted accounts this proxy run holds.
+    pub captured: usize,
+    /// What was unlocked, if anything is.
+    pub summary: Option<UnlockSummary>,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct AppState {
+    /// The furthest step the facts in `session` establish (see `Session::get_state`).
     pub step: Step,
     pub device: Option<Device>,
     pub resume_cleanup: bool,
     pub version: String,
     pub releases_url: String,
+    pub session: SessionSnapshot,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -60,6 +79,9 @@ pub struct ProxyInfo {
     /// SHA-256 of the certificate: 32 upper-case hexadecimal pairs joined by colons, as an
     /// iPhone or iPad shows it under More Details.
     pub cert_fingerprint: String,
+    /// False when the certificate is not limited to Authy's names (the device-test fallback):
+    /// the UI must then not say that it is.
+    pub cert_constrained: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -72,9 +94,19 @@ pub enum ProxyEventDto {
     DeviceConnected,
     TrustWorking,
     TlsRejected,
-    BackupCaptured { count: usize },
-    AuthyError { status: u16, path: String },
+    BackupCaptured {
+        count: usize,
+    },
+    AuthyError {
+        status: u16,
+        path: String,
+    },
     DeviceRefused,
+    /// Authy answered with no accounts: backups are probably off.
+    EmptyBackup,
+    /// This computer's address is no longer the one the proxy is on. Not from the proxy
+    /// itself: the session notices it (see `Session::launch`).
+    AddressChanged,
 }
 
 impl From<&ProxyEvent> for ProxyEventDto {
@@ -89,6 +121,7 @@ impl From<&ProxyEvent> for ProxyEventDto {
                 path: path.clone(),
             },
             ProxyEvent::DeviceRefused => ProxyEventDto::DeviceRefused,
+            ProxyEvent::EmptyBackup => ProxyEventDto::EmptyBackup,
         }
     }
 }
@@ -235,8 +268,16 @@ impl From<BwRegionDto> for bitwarden::Region {
     }
 }
 
-/// Holds the Bitwarden password and the two-factor code: deliberately no `Debug`. Both are
-/// wiped from memory when this is dropped.
+/// A personal API key: deliberately no `Debug`, and wiped from memory when dropped.
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct BwApiKeyInput {
+    pub client_id: Zeroizing<String>,
+    pub client_secret: Zeroizing<String>,
+}
+
+/// Holds the Bitwarden password, the two-factor code and the API key: deliberately no
+/// `Debug`. All are wiped from memory when this is dropped.
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct BwLoginInput {
@@ -245,6 +286,9 @@ pub struct BwLoginInput {
     pub region: BwRegionDto,
     #[serde(default)]
     pub two_factor_code: Option<Zeroizing<String>>,
+    /// With a key, the sign-in is by API key and the password only unlocks the vault.
+    #[serde(default)]
+    pub api_key: Option<BwApiKeyInput>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
@@ -256,6 +300,9 @@ pub enum BwLoginResult {
     BadCredentials,
     /// A two-step code was sent and Bitwarden did not accept it.
     BadTwoFactorCode,
+    /// Bitwarden wants a code it sends by email, or a method this app cannot do: the way
+    /// through is to sign in with an API key.
+    NeedsApiKey,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -299,13 +346,25 @@ pub enum ConfidenceDto {
     Low,
 }
 
+/// One login of the vault, as the person sees it: never its password or its code.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "camelCase")]
-pub struct CandidateDto {
+pub struct VaultLoginView {
     pub item_id: String,
     pub name: String,
     pub username: Option<String>,
     pub has_code: bool,
+}
+
+impl From<&VaultLogin> for VaultLoginView {
+    fn from(login: &VaultLogin) -> Self {
+        VaultLoginView {
+            item_id: login.id.clone(),
+            name: login.name.clone(),
+            username: login.username.clone(),
+            has_code: login.has_totp,
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -314,7 +373,7 @@ pub struct ProposalDto {
     pub token_id: String,
     pub decision: DecisionDto,
     pub confidence: ConfidenceDto,
-    pub candidates: Vec<CandidateDto>,
+    pub candidates: Vec<VaultLoginView>,
 }
 
 /// Turn the matcher's proposals (candidates are item ids) into the UI's, by looking each id up
@@ -333,12 +392,7 @@ pub fn join_proposals(proposals: &[bitwarden::Proposal], vault: &[VaultLogin]) -
                 .candidates
                 .iter()
                 .filter_map(|id| vault.iter().find(|v| &v.id == id))
-                .map(|v| CandidateDto {
-                    item_id: v.id.clone(),
-                    name: v.name.clone(),
-                    username: v.username.clone(),
-                    has_code: v.has_totp,
-                })
+                .map(VaultLoginView::from)
                 .collect(),
         })
         .collect()
@@ -348,7 +402,10 @@ pub fn join_proposals(proposals: &[bitwarden::Proposal], vault: &[VaultLogin]) -
 pub struct ApplyReportDto {
     pub attached: usize,
     pub created: usize,
+    /// Only what the person chose to skip, or what was refused: these stay only in Authy.
     pub skipped: usize,
+    /// One sentence, shown as it is, for every account that needed nothing written because
+    /// Bitwarden already holds a code there.
     pub kept: Vec<String>,
     pub failed: Option<String>,
 }
@@ -373,26 +430,4 @@ pub struct DecisionEntry {
     pub decision: DecisionDto,
 }
 
-/// A failed command, as the plain-language message the UI shows. Never built from a password
-/// or a secret.
-#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
-#[error("{0}")]
-pub struct CmdError(pub String);
-
-impl CmdError {
-    pub fn new(msg: impl Into<String>) -> Self {
-        CmdError(msg.into())
-    }
-}
-
-impl Serialize for CmdError {
-    fn serialize<S: serde::Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
-        s.serialize_str(&self.0)
-    }
-}
-
-impl From<bitwarden::BwError> for CmdError {
-    fn from(e: bitwarden::BwError) -> Self {
-        CmdError(e.to_string())
-    }
-}
+pub use crate::errors::{CmdError, ErrorCode, Reject};

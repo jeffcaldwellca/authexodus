@@ -5,18 +5,42 @@ use std::collections::HashSet;
 use crate::export::otpauth_uri;
 use crate::types::Token;
 
-use super::{BwClient, BwError, CodeMark, Decision, SetTotp};
+use super::{BwClient, BwError, CodeMark, Decision, SetTotp, IMPORT_FOLDER};
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct ApplyReport {
     pub attached: usize,
     pub created: usize,
+    /// Rows the person chose to skip, and rows that were refused (their token is not in the
+    /// backup). Nothing was done for these: the accounts stay only in Authy.
     pub skipped: usize,
-    /// Titles of tokens whose login already had a different authenticator key, left untouched.
+    /// One sentence for every row that needed nothing written because Bitwarden already holds
+    /// a code there: see [`kept_other_code`], [`kept_same_title`] and [`kept_same_code`].
     /// (A login that already holds this token's own key counts as attached: it is done.)
     pub kept: Vec<String>,
     /// A plain-language message when the run stopped early; everything before it stays done.
     pub failed: Option<String>,
+    /// The error behind `failed`, so that a caller can tell an ended session from the rest.
+    pub error: Option<BwError>,
+}
+
+// The sentences below, the progress lines in `run` and the messages in `plain_message` are
+// shown to the person exactly as they are written here. Keep them plain, and never put a
+// secret in one.
+
+/// The chosen login already holds a different code, which was left alone.
+pub fn kept_other_code(title: &str) -> String {
+    format!("{title}: the login you chose already has a different code, which was left as it is. This account is still only in Authy.")
+}
+
+/// A login of this name is already in the import folder (an earlier run made it).
+pub fn kept_same_title(title: &str) -> String {
+    format!("{title}: a login with this name is already in the \"{IMPORT_FOLDER}\" folder in Bitwarden, so no second one was made.")
+}
+
+/// Some login in the vault already holds this very code.
+pub fn kept_same_code(title: &str) -> String {
+    format!("{title}: this code is already in Bitwarden, so no new login was made.")
 }
 
 fn plain_message(e: &BwError) -> String {
@@ -29,10 +53,9 @@ fn plain_message(e: &BwError) -> String {
             "Bitwarden's server had a problem or could not be reached. Wait a moment, then run this again. {RERUN}"
         ),
         BwError::Cli(detail) => format!("Bitwarden reported a problem: {detail}. {RERUN}"),
-        BwError::Download(_) | BwError::ChecksumMismatch => {
-            format!("The Bitwarden tool could not be prepared. {RERUN}")
-        }
-        BwError::Input(detail) | BwError::Unsupported(detail) => format!("{detail} {RERUN}"),
+        // Nothing in an apply produces the remaining kinds (they belong to the download and
+        // to sign-in), so they share one sentence.
+        _ => format!("The Bitwarden tool stopped unexpectedly. {RERUN}"),
     }
 }
 
@@ -82,7 +105,10 @@ pub async fn apply(
     let mut report = ApplyReport::default();
     match run(client, tokens, decisions, progress, &mut report).await {
         Ok(()) => progress("Done.".to_string()),
-        Err(e) => report.failed = Some(plain_message(&e)),
+        Err(e) => {
+            report.failed = Some(plain_message(&e));
+            report.error = Some(e);
+        }
     }
     report
 }
@@ -136,7 +162,7 @@ async fn run(
                         progress(format!("{} already has this code", token.title));
                     }
                     SetTotp::AlreadyHasCode => {
-                        report.kept.push(token.title.clone());
+                        report.kept.push(kept_other_code(&token.title));
                         progress(format!("Kept the existing code for {}", token.title));
                     }
                 }
@@ -144,13 +170,13 @@ async fn run(
             Decision::CreateNew => {
                 let title = &titles[n];
                 if existing.contains(title) {
-                    report.skipped += 1;
+                    report.kept.push(kept_same_title(title));
                     progress(format!("{title} is already in the import folder"));
                     continue;
                 }
                 let mark = CodeMark::of_secret(token.secret.expose());
                 if mark.is_some_and(|mark| present.contains(&mark)) {
-                    report.skipped += 1;
+                    report.kept.push(kept_same_code(title));
                     progress(format!("{title} already has this code in Bitwarden"));
                     continue;
                 }

@@ -5,12 +5,12 @@ use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 
 use async_trait::async_trait;
+use authexodus_core::bitwarden::apply::{kept_other_code, kept_same_code, kept_same_title};
 use authexodus_core::bitwarden::cli::{classify_failure, parse_login_items};
-use authexodus_core::bitwarden::cli::{EMAIL_CODE_UNSUPPORTED, METHOD_UNSUPPORTED};
-use authexodus_core::bitwarden::download::{ensure_cli_from, ensure_cli_within};
+use authexodus_core::bitwarden::download::{ensure_cli_from, ensure_cli_within, PrepareStage};
 use authexodus_core::bitwarden::{
-    apply, check_login_input, is_vault_id, propose, BwClient, BwError, CliClient, CodeMark,
-    Confidence, Decision, LoginOutcome, Region, SetTotp, VaultLogin, BAD_EMAIL, BAD_SERVER_URL,
+    apply, check_login_input, is_vault_id, propose, BwClient, BwError, Cancel, CliClient, CodeMark,
+    Confidence, Decision, LoginOutcome, Region, SetTotp, VaultLogin,
 };
 use authexodus_core::types::{Secret, Token};
 
@@ -125,6 +125,15 @@ impl BwClient for FakeBw {
         _: &str,
         _: &Region,
         _: Option<&str>,
+    ) -> Result<LoginOutcome, BwError> {
+        Ok(LoginOutcome::Ok)
+    }
+    async fn login_with_api_key(
+        &mut self,
+        _: &str,
+        _: &str,
+        _: &str,
+        _: &Region,
     ) -> Result<LoginOutcome, BwError> {
         Ok(LoginOutcome::Ok)
     }
@@ -456,7 +465,8 @@ async fn apply_never_overwrites_existing_code() {
     ];
     let r = apply(&fake, &tokens, &decisions, &no_progress()).await;
     assert_eq!(r.attached, 1);
-    assert_eq!(r.kept, vec!["Has Code".to_string()]);
+    assert_eq!(r.kept, vec![kept_other_code("Has Code")]);
+    assert_eq!(r.skipped, 0, "nobody chose to skip it");
     assert_eq!(r.failed, None);
     assert_eq!(
         fake.totp_of("L0"),
@@ -512,7 +522,13 @@ async fn apply_resumes_after_failure() {
         assert_eq!(third.created, 0);
         assert_eq!(third.failed, None);
         assert_eq!(third.attached, 6, "the six attaches are reported as done");
-        assert!(third.kept.is_empty(), "{:?}", third.kept);
+        assert_eq!(
+            third.kept.len(),
+            6,
+            "the six created earlier: {:?}",
+            third.kept
+        );
+        assert_eq!(third.skipped, 0);
         assert_eq!(fake.writes(), writes);
     }
 }
@@ -524,13 +540,18 @@ async fn session_expiry_stops_with_plain_message() {
     let r = apply(&fake, &tokens, &decisions, &no_progress()).await;
     let msg = r.failed.expect("stopped");
     assert!(msg.to_lowercase().contains("sign in again"), "{msg}");
+    assert_eq!(
+        r.error,
+        Some(BwError::SessionExpired),
+        "the caller can tell an ended session from any other failure"
+    );
     assert!(!msg.contains("SessionExpired"));
     assert_eq!(r.attached, 2);
     assert_eq!(fake.writes(), 3, "nothing is attempted after the failure");
 }
 
 #[tokio::test]
-async fn skip_and_existing_titles_are_counted_as_skipped() {
+async fn only_a_chosen_skip_is_counted_as_skipped() {
     let fake = FakeBw::new(vec![]);
     fake.0
         .lock()
@@ -546,8 +567,24 @@ async fn skip_and_existing_titles_are_counted_as_skipped() {
         ("b".to_string(), Decision::Skip),
     ];
     let r = apply(&fake, &tokens, &decisions, &no_progress()).await;
-    assert_eq!((r.created, r.skipped, r.failed), (0, 2, None));
+    assert_eq!((r.created, r.skipped, r.failed), (0, 1, None));
+    assert_eq!(
+        r.kept,
+        vec![kept_same_title("Already There")],
+        "what is already in Bitwarden is said so, not counted with the skipped"
+    );
+    assert_eq!(r.error, None);
     assert_eq!(fake.0.lock().unwrap().synced, 1, "syncs first");
+
+    // A row whose token is not in the backup is refused, and that is counted as skipped.
+    let r = apply(
+        &fake,
+        &tokens,
+        &[("nobody".to_string(), Decision::CreateNew)],
+        &no_progress(),
+    )
+    .await;
+    assert_eq!((r.created, r.skipped, r.kept.len()), (0, 1, 0));
 }
 
 // ---------- download ----------
@@ -1196,7 +1233,8 @@ async fn two_tokens_with_one_title_make_two_logins_and_rerun_adds_nothing() {
         vec!["Shop (Admin)".to_string(), "Shop (Admin) (2)".to_string()]
     );
     let again = apply(&fake, &tokens, &decisions, &no_progress()).await;
-    assert_eq!((again.created, again.skipped), (0, 2));
+    assert_eq!((again.created, again.skipped), (0, 0));
+    assert_eq!(again.kept.len(), 2, "{:?}", again.kept);
     assert_eq!(fake.titles().len(), 2);
 }
 
@@ -1354,13 +1392,15 @@ async fn a_rerun_reports_its_own_attaches_as_done_not_as_codes_that_were_already
     .await;
     assert_eq!(second.failed, None);
     assert_eq!(fake.writes(), writes, "nothing is written twice");
-    assert!(
-        second.kept.is_empty(),
-        "the codes this app attached are not \"codes that were already there\": {:?}",
-        second.kept
+    assert_eq!(second.attached, 6, "the codes this app attached are done");
+    assert_eq!((second.created, second.skipped), (0, 0));
+    assert_eq!(
+        second.kept,
+        (6..12)
+            .map(|i| kept_same_title(&format!("Svc{i}")))
+            .collect::<Vec<_>>(),
+        "the logins the first run made are reported as already in Bitwarden, not as skipped"
     );
-    assert_eq!(second.attached, 6, "they are done");
-    assert_eq!((second.created, second.skipped), (0, 6));
     let lines = lines.into_inner().unwrap();
     assert!(
         lines.iter().any(|l| l == "Svc0 already has this code"),
@@ -1393,7 +1433,10 @@ async fn a_rerun_reports_its_own_attaches_as_done_not_as_codes_that_were_already
         &no_progress(),
     )
     .await;
-    assert_eq!((r.attached, r.kept.clone()), (0, vec![mine.title.clone()]));
+    assert_eq!(
+        (r.attached, r.kept.clone()),
+        (0, vec![kept_other_code(&mine.title)])
+    );
     assert!(other.totp_of("L0").unwrap().contains("JBSWY3DPEHPK3PXP"));
 }
 
@@ -1494,7 +1537,6 @@ async fn two_step_outcomes_follow_what_the_tool_says_and_whether_a_code_was_sent
         c.login("sam@example.test", "correct horse", &Region::Us, code)
             .await
     };
-    let unsupported = |message: &str| Err(BwError::Unsupported(message.to_string()));
 
     // No code yet: Bitwarden wants one.
     assert_eq!(
@@ -1521,29 +1563,25 @@ async fn two_step_outcomes_follow_what_the_tool_says_and_whether_a_code_was_sent
         Ok(LoginOutcome::BadTwoFactorCode)
     );
 
-    // Methods this app cannot do are said plainly, not reported as a failure to connect.
+    // What a password sign-in cannot get past is its own answer, so the person can be sent
+    // to sign in with an API key: never a failure to connect, never "needs a code" again.
     assert_eq!(
         try_login("devicecheck", Some("123456")).await,
-        unsupported(EMAIL_CODE_UNSUPPORTED),
+        Ok(LoginOutcome::NeedsApiKey),
         "a code was sent and the tool still asks for one: it is the emailed code it wants"
     );
     assert_eq!(
         try_login("noauthapp", Some("123456")).await,
-        unsupported(METHOD_UNSUPPORTED)
+        Ok(LoginOutcome::NeedsApiKey)
     );
     assert_eq!(
         try_login("noproviders", None).await,
-        unsupported(METHOD_UNSUPPORTED)
+        Ok(LoginOutcome::NeedsApiKey)
     );
     assert_eq!(
         try_login("noproviders", Some("123456")).await,
-        unsupported(METHOD_UNSUPPORTED)
+        Ok(LoginOutcome::NeedsApiKey)
     );
-    for message in [EMAIL_CODE_UNSUPPORTED, METHOD_UNSUPPORTED] {
-        assert!(message.contains("authenticator app"), "{message}");
-        assert!(message.contains("import file"), "{message}");
-        assert_eq!(BwError::Unsupported(message.into()).to_string(), message);
-    }
 
     // The wrong master password is still that, code or no code.
     let sb = sandbox();
@@ -1590,7 +1628,7 @@ fn sign_in_input_is_checked_before_it_can_reach_the_tool() {
     ] {
         assert_eq!(
             ok("sam@example.test", Region::SelfHosted(bad.into())),
-            Err(BwError::Input(BAD_SERVER_URL.into())),
+            Err(BwError::BadServerUrl),
             "{bad:?}"
         );
     }
@@ -1604,11 +1642,7 @@ fn sign_in_input_is_checked_before_it_can_reach_the_tool() {
         "sam @example.test",
         "sam@example.test\n--raw",
     ] {
-        assert_eq!(
-            ok(bad, Region::Us),
-            Err(BwError::Input(BAD_EMAIL.into())),
-            "{bad:?}"
-        );
+        assert_eq!(ok(bad, Region::Us), Err(BwError::BadEmail), "{bad:?}");
     }
     // What goes to `bw config server` is the address as parsed, without the padding.
     assert_eq!(
@@ -1649,11 +1683,11 @@ async fn the_client_refuses_bad_input_and_odd_ids_without_running_the_tool_on_th
             None
         )
         .await,
-        Err(BwError::Input(BAD_SERVER_URL.into()))
+        Err(BwError::BadServerUrl)
     );
     assert_eq!(
         c.login("--raw", "correct horse", &Region::Us, None).await,
-        Err(BwError::Input(BAD_EMAIL.into()))
+        Err(BwError::BadEmail)
     );
     assert_eq!(sb.log("args.log"), "", "the tool was never started");
     assert!(!sb.data_dir.exists());
@@ -1747,6 +1781,8 @@ async fn an_oversized_download_is_abandoned_and_planted_links_are_not_followed()
         "bw-test.zip",
         &expected,
         zip.len() as u64 - 1,
+        &|_| {},
+        &Cancel::new(),
     )
     .await
     .unwrap_err();
@@ -1765,6 +1801,8 @@ async fn an_oversized_download_is_abandoned_and_planted_links_are_not_followed()
         "bw-test.zip",
         &expected,
         zip.len() as u64,
+        &|_| {},
+        &Cancel::new(),
     )
     .await
     .unwrap();
@@ -1850,7 +1888,8 @@ async fn a_token_whose_code_is_already_in_the_vault_is_not_given_a_second_login(
         &|line| lines.lock().unwrap().push(line),
     )
     .await;
-    assert_eq!((r.created, r.skipped, r.failed), (0, 1, None));
+    assert_eq!((r.created, r.skipped, r.failed), (0, 0, None));
+    assert_eq!(r.kept, vec![kept_same_code("Quillpad")]);
     assert_eq!(fake.writes(), 0);
     assert!(lines
         .into_inner()
@@ -1869,5 +1908,340 @@ async fn a_token_whose_code_is_already_in_the_vault_is_not_given_a_second_login(
         ("b".to_string(), Decision::CreateNew),
     ];
     let r = apply(&fake, &twins, &decisions, &no_progress()).await;
-    assert_eq!((r.created, r.skipped), (1, 1));
+    assert_eq!((r.created, r.skipped), (1, 0));
+    assert_eq!(r.kept, vec![kept_same_code("Twin B")]);
+}
+
+// ---------- completeness fixes ----------
+
+const API_CLIENT_ID: &str = "user.11111111-0000-4000-8000-000000000001";
+const API_CLIENT_SECRET: &str = "synthetic0secret0value";
+
+#[tokio::test]
+async fn an_api_key_reaches_one_child_only_and_the_password_only_the_unlock() {
+    let _g = SCRIPT_LOCK.lock().await;
+    let sb = sandbox();
+    let mut c = sb.client();
+    let out = c
+        .login_with_api_key(
+            &format!("  {API_CLIENT_ID} "),
+            API_CLIENT_SECRET,
+            "correct horse",
+            &Region::Eu,
+        )
+        .await
+        .unwrap();
+    assert_eq!(out, LoginOutcome::Ok);
+    c.sync().await.unwrap();
+    assert_eq!(c.list_logins().await.unwrap().len(), 4);
+
+    let args = sb.log("args.log");
+    let env = sb.log("env.log");
+    assert!(
+        !args.contains(API_CLIENT_ID),
+        "the key is never an argument"
+    );
+    assert!(!args.contains(API_CLIENT_SECRET), "{args}");
+    assert!(!args.contains("correct horse"), "{args}");
+    let runs: Vec<(&str, &str)> = args.lines().zip(env.lines()).collect();
+    assert_eq!(args.lines().count(), env.lines().count());
+    let words: Vec<&str> = runs
+        .iter()
+        .map(|(args, _)| args.split(' ').next().unwrap())
+        .collect();
+    assert_eq!(
+        words,
+        ["logout", "config", "login", "unlock", "sync", "list"],
+        "{args}"
+    );
+    for (args, env) in &runs {
+        let has_key = env.contains(&format!("cid={API_CLIENT_ID} sec={API_CLIENT_SECRET}"));
+        let has_password = env.contains("mine=correct horse");
+        match args.split(' ').next().unwrap() {
+            "login" => {
+                assert_eq!(*args, "login --apikey --nointeraction");
+                assert!(has_key, "{env}");
+                assert!(
+                    !has_password,
+                    "the sign-in does not need the password: {env}"
+                );
+            }
+            "unlock" => {
+                assert!(
+                    args.starts_with("unlock --passwordenv=AUTHEXODUS_BW_PASSWORD --raw"),
+                    "{args}"
+                );
+                assert!(has_password, "{env}");
+                assert!(env.contains("cid=none sec=none"), "{env}");
+            }
+            _ => {
+                assert!(env.contains("cid=none sec=none"), "{args}: {env}");
+                assert!(env.contains("mine=none"), "{args}: {env}");
+            }
+        }
+    }
+    // The session key comes from the unlock and is what later runs are given.
+    assert!(env
+        .lines()
+        .last()
+        .unwrap()
+        .contains("session=fake-session-key"));
+
+    // A key Bitwarden refuses, a key that is not shaped like one, and a wrong master
+    // password are all "the details are wrong", not failures to connect.
+    let sb = sandbox();
+    let mut c = sb.client();
+    assert_eq!(
+        c.login_with_api_key(
+            API_CLIENT_ID,
+            "another0secret0value00",
+            "correct horse",
+            &Region::Us
+        )
+        .await,
+        Ok(LoginOutcome::BadCredentials)
+    );
+    assert_eq!(
+        c.login_with_api_key(API_CLIENT_ID, API_CLIENT_SECRET, "wrong", &Region::Us)
+            .await,
+        Ok(LoginOutcome::BadCredentials)
+    );
+    let runs_before = sb.log("args.log").lines().count();
+    for (id, secret) in [
+        ("", API_CLIENT_SECRET),
+        ("11111111-0000-4000-8000-000000000001", API_CLIENT_SECRET),
+        (
+            "organization.11111111-0000-4000-8000-000000000001",
+            API_CLIENT_SECRET,
+        ),
+        ("user.not-an-id", API_CLIENT_SECRET),
+        (API_CLIENT_ID, ""),
+        (API_CLIENT_ID, "has a space in it"),
+        (API_CLIENT_ID, "--raw"),
+    ] {
+        assert_eq!(
+            c.login_with_api_key(id, secret, "correct horse", &Region::Us)
+                .await,
+            Ok(LoginOutcome::BadCredentials),
+            "{id:?} {secret:?}"
+        );
+    }
+    assert_eq!(
+        sb.log("args.log").lines().count(),
+        runs_before,
+        "the tool is not run for a key that is not shaped like one"
+    );
+    // The server address is checked for this kind of sign-in too.
+    assert_eq!(
+        c.login_with_api_key(
+            API_CLIENT_ID,
+            API_CLIENT_SECRET,
+            "correct horse",
+            &Region::SelfHosted("http://vault.example.test".into())
+        )
+        .await,
+        Err(BwError::BadServerUrl)
+    );
+}
+
+/// A megabyte and a half that is not one byte repeated, inside a zip that holds `bw`.
+fn big_bw_zip() -> Vec<u8> {
+    let program: Vec<u8> = (0..1_500_000u32).map(|i| (i % 251) as u8).collect();
+    bw_zip(&program)
+}
+
+#[tokio::test]
+async fn preparing_the_tool_says_how_far_it_is() {
+    let zip = big_bw_zip();
+    let expected = sha256_hex(&zip);
+    let size = zip.len() as u64;
+    let base = file_server(zip).await;
+    let dir = tempfile::tempdir().unwrap();
+    let stages = Mutex::new(Vec::new());
+    let note = |stage: PrepareStage| stages.lock().unwrap().push(stage);
+
+    ensure_cli_within(
+        dir.path(),
+        &base,
+        "bw-test.zip",
+        &expected,
+        10 * 1024 * 1024,
+        &note,
+        &Cancel::new(),
+    )
+    .await
+    .unwrap();
+    let first = std::mem::take(&mut *stages.lock().unwrap());
+    assert_eq!(
+        first.first(),
+        Some(&PrepareStage::Downloading {
+            received: 0,
+            total: Some(size)
+        })
+    );
+    let megabytes: Vec<u64> = first
+        .iter()
+        .filter_map(|stage| match stage {
+            PrepareStage::Downloading { received, total } => {
+                assert_eq!(*total, Some(size));
+                Some(received / (1024 * 1024))
+            }
+            _ => None,
+        })
+        .collect();
+    assert_eq!(megabytes, [0, 1], "once at the start, then once a megabyte");
+    assert_eq!(
+        first[first.len() - 2..],
+        [PrepareStage::Checking, PrepareStage::Ready]
+    );
+
+    // With the verified download kept from before, there is nothing to download.
+    ensure_cli_within(
+        dir.path(),
+        "http://127.0.0.1:1",
+        "bw-test.zip",
+        &expected,
+        10 * 1024 * 1024,
+        &note,
+        &Cancel::new(),
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        *stages.lock().unwrap(),
+        [PrepareStage::Checking, PrepareStage::Ready]
+    );
+}
+
+#[tokio::test]
+async fn a_stopped_download_leaves_no_partial_file() {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    // A server that sends a megabyte and a half of three, then goes quiet with the
+    // connection open: the download can only end by being stopped.
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+    tokio::spawn(async move {
+        let (mut sock, _) = listener.accept().await.unwrap();
+        let mut buf = [0u8; 2048];
+        let _ = sock.read(&mut buf).await;
+        let _ = sock
+            .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 3145728\r\n\r\n")
+            .await;
+        let _ = sock.write_all(&vec![7u8; 1_572_864]).await;
+        tokio::time::sleep(std::time::Duration::from_secs(120)).await;
+    });
+    let dir = tempfile::tempdir().unwrap();
+    let cancel = Cancel::new();
+    let stop_at_a_megabyte = |stage: PrepareStage| {
+        if matches!(stage, PrepareStage::Downloading { received, .. } if received >= 1024 * 1024) {
+            cancel.cancel();
+        }
+    };
+    let stopped = tokio::time::timeout(
+        std::time::Duration::from_secs(20),
+        ensure_cli_within(
+            dir.path(),
+            &format!("http://127.0.0.1:{port}"),
+            "bw-test.zip",
+            &sha256_hex(b"x"),
+            10 * 1024 * 1024,
+            &stop_at_a_megabyte,
+            &cancel,
+        ),
+    )
+    .await
+    .expect("a stopped download returns at once");
+    assert_eq!(stopped.unwrap_err(), BwError::Cancelled);
+    let left: Vec<_> = std::fs::read_dir(dir.path())
+        .unwrap()
+        .map(|entry| entry.unwrap().file_name())
+        .collect();
+    assert!(left.is_empty(), "left behind: {left:?}");
+
+    // Stopped before it began: nothing is fetched, nothing is made.
+    let dir = tempfile::tempdir().unwrap();
+    let zip = bw_zip(b"#!/bin/sh\necho pretend bw\n");
+    let expected = sha256_hex(&zip);
+    let base = file_server(zip.clone()).await;
+    let cancel = Cancel::new();
+    cancel.cancel();
+    let stopped = ensure_cli_within(
+        dir.path().join("bw-cli").as_path(),
+        &base,
+        "bw-test.zip",
+        &expected,
+        1024 * 1024,
+        &|_| {},
+        &cancel,
+    )
+    .await;
+    assert_eq!(stopped.unwrap_err(), BwError::Cancelled);
+    assert!(!dir.path().join("bw-cli").exists());
+
+    // Stopped while unpacking a download that is already there: the half-written program
+    // is removed and the old one, if any, is not replaced.
+    std::fs::write(dir.path().join("bw-test.zip"), &zip).unwrap();
+    let cancel = Cancel::new();
+    let stop_when_checking = |stage: PrepareStage| {
+        if stage == PrepareStage::Checking {
+            cancel.cancel();
+        }
+    };
+    let stopped = ensure_cli_within(
+        dir.path(),
+        &base,
+        "bw-test.zip",
+        &expected,
+        1024 * 1024,
+        &stop_when_checking,
+        &cancel,
+    )
+    .await;
+    assert_eq!(stopped.unwrap_err(), BwError::Cancelled);
+    assert!(!dir.path().join("bw.partial").exists());
+    assert!(!dir.path().join("bw").exists());
+}
+
+/// Downloads the real pinned release through `ensure_cli` and runs it, through the client's
+/// own way of running it (the cleared environment, `--nointeraction`), three times: its
+/// version, its status, and `encode` reading standard input. None of the three signs in or
+/// contacts a vault. Run by hand:
+///
+/// ```text
+/// cargo test -p authexodus-core --test bitwarden -- --ignored --nocapture the_real_tool
+/// ```
+///
+/// Set `AUTHEXODUS_BW_TEST_DIR` to keep the download in a folder of your choosing.
+#[tokio::test]
+#[ignore]
+async fn the_real_tool_starts_under_the_cleared_environment() {
+    use authexodus_core::bitwarden::download::CLI_VERSION;
+    use base64::Engine;
+    let temp = tempfile::tempdir().unwrap();
+    let dir = std::env::var_os("AUTHEXODUS_BW_TEST_DIR")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| temp.path().to_path_buf());
+    let binary = authexodus_core::bitwarden::ensure_cli(&dir.join("bw-cli"))
+        .await
+        .expect("the pinned release downloads and verifies");
+    let data = dir.join("bw-data");
+    std::fs::create_dir_all(&data).unwrap();
+    let client = CliClient::new(binary.path.clone(), data).expecting_sha256(binary.sha256);
+
+    let version = client.probe(&["--version"], None).await.unwrap();
+    println!("bw --version -> {}", version.trim());
+    assert_eq!(version.trim(), CLI_VERSION);
+
+    let status = client.probe(&["status"], None).await.unwrap();
+    println!("bw status -> {}", status.trim());
+    let status: serde_json::Value = serde_json::from_str(status.trim()).unwrap();
+    assert_eq!(status["status"], "unauthenticated");
+
+    let payload = r#"{"name":"Authy import"}"#;
+    let encoded = client.probe(&["encode"], Some(payload)).await.unwrap();
+    println!("bw encode -> {}", encoded.trim());
+    assert_eq!(
+        encoded.trim(),
+        base64::engine::general_purpose::STANDARD.encode(payload)
+    );
 }
