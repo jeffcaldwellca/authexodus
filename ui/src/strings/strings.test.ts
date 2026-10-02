@@ -144,9 +144,10 @@ describe("strings", () => {
     // Only fixed strings are checked here; wording built by a function takes the device's
     // name as an argument, which is how it gets "iPhone or iPad" before a device is chosen.
     // These are other things that happen to contain the word: a phone number, an Android
-    // phone, Authy's "new device" and "Multi-device", the drawn "This device" row, the
-    // questions that ask which device, and the dev-only pretend phone.
-    const other = /phone number|Android phone|new device|Multi-device|^This device$|^Which device|^Choose your device|^Pretend phone$|^A different device|Device Management/;
+    // phone, the phone that receives the text message, Authy's "new device" and
+    // "Multi-device", some other device than the one being used, the drawn "This device"
+    // row, and the questions that ask which device.
+    const other = /phone number|Android phone|the phone is not with you|[Aa]nother device|other device|multi-device|new device|Multi-device|^This device$|^Which device|^Choose your device|^Pretend phone$|^A different device|Device Management/;
     const generic = texts.filter((s) => /\b(phone|device)\b/i.test(s.replace(/iPhone/g, "")) && !/iPhone or iPad|iPad or iPhone/.test(s) && !other.test(s));
     expect(generic).toEqual([]);
   });

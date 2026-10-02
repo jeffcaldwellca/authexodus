@@ -74,7 +74,7 @@ export function Unlock({ api, state, dispatch }: ScreenProps) {
             aria-describedby={problem === "wrong" ? "unlock-error" : undefined}
           />
           <button type="button" className="quiet" aria-pressed={visible} onClick={() => setVisible((v) => !v)}>
-            {visible ? t.hide : t.show}
+            {t.show}
           </button>
         </div>
         <div id="unlock-error">
@@ -88,7 +88,7 @@ export function Unlock({ api, state, dispatch }: ScreenProps) {
         <button type="button" className="quiet danger small" onClick={() => setConfirming(true)}>{en.common.stopAndCleanUp}</button>
       </p>
       {confirming && (
-        <StopConfirm mentionAuthy onCancel={() => setConfirming(false)} onConfirm={() => dispatch({ type: "abandon" })} />
+        <StopConfirm d={d} mentionAuthy onCancel={() => setConfirming(false)} onConfirm={() => dispatch({ type: "abandon" })} />
       )}
     </Screen>
   );

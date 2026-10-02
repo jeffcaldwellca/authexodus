@@ -1,5 +1,7 @@
-// Screen 7: live codes beside each account, refreshed every second, to compare with the new
-// app. Codes are held only while this screen is showing.
+// Screen 7: live codes beside each account, to compare with the new app. The codes are
+// refreshed every second, and faster as a code is about to change, so the screen turns over
+// with the code rather than up to a second after it. Codes are held only while this screen
+// is showing.
 import { useEffect, useState } from "react";
 import type { LiveCode } from "../api";
 import { Callout, Screen, Waiting } from "../components/ui";
@@ -7,6 +9,10 @@ import { en } from "../strings/en";
 import type { ScreenProps } from "./types";
 
 const t = en.verify;
+
+/** The usual pause between refreshes, and the short one used around the moment codes change. */
+export const REFRESH_MS = 1000;
+export const REFRESH_NEAR_CHANGE_MS = 250;
 
 /** "123456" → "123 456", the way authenticator apps show it. */
 function grouped(code: string): string {
@@ -16,15 +22,29 @@ function grouped(code: string): string {
 
 export function Verify({ api, state, dispatch }: ScreenProps) {
   const [codes, setCodes] = useState<Map<string, LiveCode> | null>(null);
+  const [failed, setFailed] = useState(false);
 
   useEffect(() => {
     let live = true;
+    let timer: ReturnType<typeof setTimeout> | undefined;
     const refresh = () => {
-      api.liveCodes().then((list) => { if (live) setCodes(new Map(list.map((c) => [c.id, c]))); }).catch(() => undefined);
+      api.liveCodes()
+        .then((list) => {
+          if (!live) return;
+          setCodes(new Map(list.map((c) => [c.id, c])));
+          setFailed(false);
+          // `secondsLeft` is whole seconds, so in the last second poll quickly to catch the change.
+          const soonest = Math.min(...list.map((c) => c.secondsLeft), Infinity);
+          timer = setTimeout(refresh, soonest <= 1 ? REFRESH_NEAR_CHANGE_MS : REFRESH_MS);
+        })
+        .catch(() => {
+          if (!live) return;
+          setFailed(true);
+          timer = setTimeout(refresh, REFRESH_MS);
+        });
     };
     refresh();
-    const timer = setInterval(refresh, 1000);
-    return () => { live = false; clearInterval(timer); setCodes(null); };
+    return () => { live = false; clearTimeout(timer); setCodes(null); };
   }, [api]);
 
   const tokens = state.summary?.tokens ?? [];
@@ -40,7 +60,9 @@ export function Verify({ api, state, dispatch }: ScreenProps) {
         </>
       }
     >
-      {codes === null ? <Waiting>{t.loading}</Waiting> : (
+      {failed && <Callout tone="error" title={t.failed} alert />}
+      {codes === null && !failed && <Waiting>{t.loading}</Waiting>}
+      {codes !== null && (
         <ul className="codes" aria-label={t.listLabel}>
           {tokens.map((token) => {
             const live = codes.get(token.id);
@@ -53,8 +75,9 @@ export function Verify({ api, state, dispatch }: ScreenProps) {
                 {live && (
                   <>
                     <span className="code">{grouped(live.code)}</span>
-                    <span className={`countdown ${live.secondsLeft <= 5 ? "ending" : ""}`} aria-label={t.secondsLeftLabel(live.secondsLeft)}>
-                      {t.secondsLeft(live.secondsLeft)}
+                    <span className={`countdown ${live.secondsLeft <= 5 ? "ending" : ""}`}>
+                      <span aria-hidden="true">{t.secondsLeft(live.secondsLeft)}</span>
+                      <span className="sr-only">{t.secondsLeftLabel(live.secondsLeft)}</span>
                     </span>
                   </>
                 )}
@@ -64,6 +87,7 @@ export function Verify({ api, state, dispatch }: ScreenProps) {
         </ul>
       )}
       <Callout tone="info"><p>{t.mismatch}</p></Callout>
+      {state.cantMove > 0 && <p className="quiet-text">{t.cantMove(state.cantMove)}</p>}
     </Screen>
   );
 }

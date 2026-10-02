@@ -1,6 +1,6 @@
 import { act, cleanup, screen, waitFor, within } from "@testing-library/react";
 import { en } from "./strings/en";
-import { mountApp, moveByQr, tickAllChecks, walkTo } from "./test-utils";
+import { mountApp, tickAllChecks, walkTo } from "./test-utils";
 
 const iphone = en.deviceName.iphone;
 
@@ -10,9 +10,12 @@ describe("wizard", () => {
     const start = screen.getByRole("button", { name: en.welcome.start });
     expect(start).toBeDisabled();
 
-    // All four ticked, no device: still blocked.
+    // All five ticked, no device: still blocked.
     await tickAllChecks(user);
-    expect(screen.getAllByRole("checkbox")).toHaveLength(4);
+    expect(screen.getAllByRole("checkbox")).toHaveLength(5);
+    expect(screen.getByRole("checkbox", { name: new RegExp(en.welcome.checks.sms.label) })).toBeChecked();
+    expect(en.welcome.checksTitle).toMatch(/five/);
+    expect(en.welcome.blocked).toMatch(/five/);
     expect(start).toBeDisabled();
 
     // Device chosen, one check unticked: still blocked.
@@ -127,12 +130,25 @@ describe("wizard", () => {
     await screen.findByRole("heading", { level: 1, name: en.cleanup.title });
   });
 
-  it("an Authy error shows the attestation workaround with the live address", async () => {
+  it("an Authy error is titled by what the person sees, with the attestation workaround only as a possibility", async () => {
     const { api } = await walkTo("authy");
     act(() => api.emitProxyEvent({ kind: "authyError", status: 400, path: "/x" }));
     const alert = await screen.findByRole("alert");
     expect(within(alert).getByRole("heading", { name: en.failures.attestation.title })).toBeInTheDocument();
+    expect(en.failures.attestation.title).not.toMatch(/attestation/i);
+    expect(within(alert).getByText(en.failures.attestation.body)).toBeInTheDocument();
+    expect(within(alert).getByText(en.failures.attestation.ifAttestation)).toBeInTheDocument();
+    expect(en.failures.attestation.ifAttestation).toMatch(/^If Authy mentions/);
     expect(within(alert).getByText(en.failures.attestation.steps("192.168.4.109", 8080)[2]!)).toBeInTheDocument();
+  });
+
+  it("a server error from Authy gets the generic advice and no attestation workaround", async () => {
+    const { api } = await walkTo("authy");
+    act(() => api.emitProxyEvent({ kind: "authyError", status: 503, path: "/x" }));
+    const alert = await screen.findByRole("alert");
+    expect(within(alert).getByText(en.failures.attestation.body)).toBeInTheDocument();
+    expect(within(alert).queryByText(en.failures.attestation.ifAttestation)).not.toBeInTheDocument();
+    expect(within(alert).queryByRole("list")).not.toBeInTheDocument();
   });
 
   it("Having trouble? opens the panels for the step and closes with Escape", async () => {
@@ -154,7 +170,7 @@ describe("wizard", () => {
     await user.click(screen.getByRole("button", { name: en.common.stopAndCleanUp }));
 
     const confirm = screen.getByRole("alertdialog", { name: en.failures.stop.title });
-    expect(within(confirm).getByText(en.failures.stop.lost)).toBeInTheDocument();
+    expect(within(confirm).getByText(en.failures.stop.lost(iphone))).toBeInTheDocument();
     expect(within(confirm).getByText(en.failures.stop.redo)).toBeInTheDocument();
     // Authy has not been deleted yet at this step, so nothing is said about signing in to it.
     expect(within(confirm).queryByText(en.common.authyFinish)).not.toBeInTheDocument();
@@ -212,6 +228,7 @@ describe("wizard", () => {
       expect(within(sheet).getByText(en.failures.restart.body(iphone))).toBeInTheDocument();
       await user.click(within(sheet).getByRole("button", { name: en.common.restart }));
       await waitFor(() => expect(api.calls.filter((c) => c.method === "restartProxy")).toHaveLength(1));
+      expect(api.calls.find((c) => c.method === "restartProxy")?.args).toEqual(["192.168.4.109"]);
       await screen.findByRole("heading", { level: 1, name: en.connect.title(iphone) });
       expect(screen.queryByRole("dialog")).not.toBeInTheDocument();
       // The phone still has its certificate: trust seen again moves straight on.
@@ -234,16 +251,98 @@ describe("wizard", () => {
   });
 
   it("a restart that fails says so and can be tried again", async () => {
-    const { api, user } = await walkTo("certificate");
-    const real = api.restartProxy;
-    let fail = true;
-    api.restartProxy = async (ip) => { if (fail) { fail = false; throw new Error("port busy"); } return real(ip); };
+    // Both the restart on the current address and the fallback with no address fail.
+    const { api, user } = await walkTo("certificate", { restartErrors: ["port busy", "port busy"] });
     act(() => api.emitProxyEvent({ kind: "deviceRefused" }));
     await user.click(await screen.findByRole("button", { name: en.common.restart }));
     await screen.findByText(en.common.restartFailed);
-    expect(screen.getByRole("heading", { level: 1, name: en.certificate.title })).toBeInTheDocument();
     await user.click(screen.getByRole("button", { name: en.common.tryAgain }));
+    await waitFor(() => expect(screen.queryByText(en.common.restartFailed)).not.toBeInTheDocument());
+    expect(screen.getByRole("heading", { level: 1, name: en.connect.title(iphone) })).toBeInTheDocument();
+  });
+
+  it("a restart stays on the address the device is set to", async () => {
+    // The person had switched to the second address; a restart must not fall back to the first.
+    const { api, user } = await walkTo("connect");
+    await user.selectOptions(screen.getByLabelText(new RegExp(en.connect.addressLabel)), "10.0.0.12");
+    const values = screen.getByRole("group", { name: en.connect.valuesLabel(iphone) });
+    await within(values).findByText("10.0.0.12");
+
+    await user.click(screen.getByRole("button", { name: en.common.havingTrouble }));
+    await user.click(screen.getByRole("button", { name: en.common.restart }));
+    await waitFor(() => expect(api.calls.filter((c) => c.method === "restartProxy")).toHaveLength(1));
+    expect(api.calls.find((c) => c.method === "restartProxy")?.args).toEqual(["10.0.0.12"]);
+    expect(within(screen.getByRole("group", { name: en.connect.valuesLabel(iphone) })).getByText("10.0.0.12")).toBeInTheDocument();
+    expect(screen.queryByText(en.connect.addressChanged(iphone))).not.toBeInTheDocument();
+  });
+
+  it("when this computer's address is gone, a restart falls back and says to update the device", async () => {
+    const { api, user } = await walkTo("connect");
+    await user.selectOptions(screen.getByLabelText(new RegExp(en.connect.addressLabel)), "10.0.0.12");
+    await within(screen.getByRole("group", { name: en.connect.valuesLabel(iphone) })).findByText("10.0.0.12");
+    // The Mac loses that address (cable pulled, Wi-Fi changed).
+    api.script.addresses = [{ ip: "192.168.4.109", label: "Wi-Fi" }];
+
+    await user.click(screen.getByRole("button", { name: en.common.havingTrouble }));
+    await user.click(screen.getByRole("button", { name: en.common.restart }));
+    const notice = await screen.findByText(en.connect.addressChanged(iphone));
+    expect(notice.closest("[role=alert]")).not.toBeNull();
+    // First on the old address, then once with none.
+    expect(api.calls.filter((c) => c.method === "restartProxy").map((c) => c.args[0])).toEqual(["10.0.0.12", undefined]);
+    const values = screen.getByRole("group", { name: en.connect.valuesLabel(iphone) });
+    expect(within(values).getByText("192.168.4.109")).toBeInTheDocument();
+    expect(within(values).getByText("8080")).toBeInTheDocument();
+  });
+
+  it("events from the new proxy that arrive before the restart answers are not lost", async () => {
+    const { api, user } = await walkTo("authy");
+    // The phone reconnects and Authy's handshake succeeds while restartProxy is still pending.
+    api.script.beforeRestartResolves = () => {
+      api.emitProxyEvent({ kind: "deviceConnected" });
+      api.emitProxyEvent({ kind: "trustWorking" });
+    };
+    await user.click(screen.getByRole("button", { name: en.common.havingTrouble }));
+    await user.click(screen.getByRole("button", { name: en.common.restart }));
+    // Without the early reset the wizard would be stranded on Connect, waiting for events
+    // that have already been and gone.
+    await screen.findByRole("heading", { level: 1, name: en.authy.title });
+    await waitFor(() => expect(api.calls.filter((c) => c.method === "restartProxy")).toHaveLength(1));
+    await new Promise((r) => setTimeout(r, 20));
+    expect(screen.getByRole("heading", { level: 1, name: en.authy.title })).toBeInTheDocument();
+  });
+
+  it("after a restart the waiting screens say what not to do again", async () => {
+    const { api, user } = await walkTo("authy");
+    expect(screen.getByText(en.authy.lastCheck.title)).toBeInTheDocument();
+    await user.click(screen.getByRole("button", { name: en.common.havingTrouble }));
+    await user.click(screen.getByRole("button", { name: en.common.restart }));
     await screen.findByRole("heading", { level: 1, name: en.connect.title(iphone) });
+    const notice = en.failures.restart.noticeAfterTrust(iphone);
+    expect(notice).toMatch(/Do not do either again/);
+    expect(screen.getByText(notice)).toBeInTheDocument();
+
+    act(() => api.emitProxyEvent({ kind: "deviceConnected" }));
+    await screen.findByRole("heading", { level: 1, name: en.certificate.title });
+    expect(screen.getByText(notice)).toBeInTheDocument();
+
+    act(() => api.emitProxyEvent({ kind: "trustWorking" }));
+    await screen.findByRole("heading", { level: 1, name: en.authy.title });
+    expect(screen.getByText(notice)).toBeInTheDocument();
+    // "You are about to delete Authy" is not repeated to someone who already did.
+    expect(screen.queryByText(en.authy.lastCheck.title)).not.toBeInTheDocument();
+  });
+
+  it("a restart before the certificate was ever trusted does not claim it is installed", async () => {
+    const { user } = await walkTo("connect");
+    await user.click(screen.getByRole("button", { name: en.common.havingTrouble }));
+    await user.click(screen.getByRole("button", { name: en.common.restart }));
+    await screen.findByText(en.failures.restart.noticeBeforeTrust(iphone));
+    expect(screen.queryByText(en.failures.restart.noticeAfterTrust(iphone))).not.toBeInTheDocument();
+  });
+
+  it("the restart action has one name everywhere", () => {
+    expect(en.failures.restart.title).toBe(en.common.restart);
+    expect(en.connect.addressRejected("1.2.3.4")).toMatch(/restarting the connection/);
   });
 
   it("an address change the shell refuses after a capture offers a restart on that address", async () => {
@@ -275,20 +374,110 @@ describe("wizard", () => {
     expect(url.closest("a")).toBeNull();
   });
 
-  it("Check the codes is blocked until something has been moved", async () => {
+  it("Check the codes is blocked until something has been moved, and says why", async () => {
     const { user } = await walkTo("destination");
-    const go = screen.getByRole("button", { name: en.destination.continue });
-    expect(go).toBeDisabled();
+    const go = () => screen.getByRole("button", { name: en.destination.continue });
+    expect(go()).toBeDisabled();
     expect(screen.getByText(en.destination.continueBlocked)).toBeInTheDocument();
+    expect(en.destination.continueBlocked).toMatch(/scan a QR code and tick it/);
 
-    // Opening the QR codes and backing out moves nothing.
+    // Looking at the QR codes, even all of them, moves nothing until one is ticked as scanned.
     await user.click(screen.getByRole("button", { name: new RegExp(en.destination.options.qr.title) }));
-    await user.click(await screen.findByRole("button", { name: en.destination.backToOptions }));
-    expect(screen.getByRole("button", { name: en.destination.continue })).toBeDisabled();
+    await screen.findByRole("checkbox", { name: en.destination.qr.scanned });
+    await user.click(screen.getByRole("button", { name: en.common.next }));
+    await user.click(screen.getByRole("button", { name: en.destination.backToOptions }));
+    expect(go()).toBeDisabled();
 
-    await moveByQr(user);
-    expect(screen.getByRole("button", { name: en.destination.continue })).toBeEnabled();
+    // One code scanned and ticked is enough, wherever in the walk the person stops.
+    await user.click(screen.getByRole("button", { name: new RegExp(en.destination.options.qr.title) }));
+    await user.click(await screen.findByRole("checkbox", { name: en.destination.qr.scanned }));
+    expect(screen.getByText(en.destination.qr.scannedCount(1, 8))).toBeInTheDocument();
+    await user.click(screen.getByRole("button", { name: en.destination.backToOptions }));
+    expect(go()).toBeEnabled();
     expect(screen.queryByText(en.destination.continueBlocked)).not.toBeInTheDocument();
+  });
+
+  it("Done after giving up says nothing was moved and shows the manual route", async () => {
+    const { user } = await walkTo("unlock");
+    await user.click(screen.getByRole("button", { name: en.common.stopAndCleanUp }));
+    await user.click(within(screen.getByRole("alertdialog")).getByRole("button", { name: en.common.stopAndCleanUp }));
+    await screen.findByText(en.cleanup.clean(iphone));
+    for (const box of screen.getAllByRole("checkbox")) await user.click(box);
+    await user.click(screen.getByRole("button", { name: en.cleanup.finish }));
+    await screen.findByRole("heading", { level: 1, name: en.done.titleNothingMoved });
+    expect(screen.getByText(en.done.bodyNothingMoved)).toBeInTheDocument();
+    expect(screen.getByText(en.manual.steps[0])).toBeInTheDocument();
+    expect(screen.queryByText(en.done.again)).not.toBeInTheDocument();
+    expect(screen.queryByRole("heading", { name: en.done.title })).not.toBeInTheDocument();
+  });
+
+  it("accounts that can't move are still named as a count on Verify and on Done", async () => {
+    const { user } = await walkTo("verify");
+    expect(screen.getByText(en.verify.cantMove(2))).toBeInTheDocument();
+    await user.click(screen.getByRole("button", { name: en.verify.confirm }));
+    await screen.findByText(en.cleanup.clean(iphone));
+    expect(screen.getByText(en.cleanup.keepAuthy)).toBeInTheDocument();
+    expect(en.cleanup.keepAuthy).toMatch(/Do not delete Authy until/);
+    for (const box of screen.getAllByRole("checkbox")) await user.click(box);
+    await user.click(screen.getByRole("button", { name: en.cleanup.finish }));
+    await screen.findByRole("heading", { level: 1, name: en.done.title });
+    expect(screen.getByText(en.done.notMoved(2))).toBeInTheDocument();
+  });
+
+  it("the Welcome screen asks about the text message, the network and a spare device", async () => {
+    await mountApp();
+    expect(screen.getByText(en.welcome.network)).toBeInTheDocument();
+    expect(en.welcome.network).toMatch(/home or office network you control/);
+    expect(screen.getByText(en.welcome.spare)).toBeInTheDocument();
+    expect(en.welcome.spare).toMatch(/Install Authy on it and sign in first/);
+    expect(screen.getByText(en.welcome.checks.sms.where)).toBeInTheDocument();
+    expect(screen.getByText(en.welcome.checks.password.where)).toBeInTheDocument();
+    expect(en.welcome.checks.password.where).toMatch(/cannot be opened without it/);
+    // The warning about the checks is a callout, not quiet text.
+    expect(screen.getByText(en.welcome.checksWhy).closest(".callout-warn")).not.toBeNull();
+  });
+
+  it("the picture button's name follows what it will do", async () => {
+    const { user } = await mountApp();
+    const label = en.welcome.checks.backups.label;
+    const show = screen.getByRole("button", { name: en.common.showPictureFor(label) });
+    await user.click(show);
+    expect(screen.getByRole("button", { name: en.common.hidePictureFor(label) })).toHaveTextContent(en.common.hidePicture);
+  });
+
+  it("the Certificate screen shows the fingerprint to compare, and claims no more than the app does", async () => {
+    const { api } = await walkTo("certificate");
+    const info = await api.startProxy();
+    const shown = screen.getByTestId("fingerprint");
+    expect(shown.textContent!.replace(/[^0-9A-F]/g, "")).toBe(info.certFingerprint.replace(/:/g, ""));
+    expect(shown.querySelectorAll("span")).toHaveLength(4);
+    expect(screen.getByText(en.certificate.fingerprintHow(iphone))).toBeInTheDocument();
+    expect(en.certificate.fingerprintHow(iphone)).toMatch(/More Details/);
+    expect(screen.getByText(en.certificate.lede)).toBeInTheDocument();
+    expect(en.certificate.lede).toBe("The app uses this certificate only to read what Authy sends. You remove it at the end.");
+    // The trust step warns about the iOS warning and says to tap Continue.
+    expect(screen.getByText(en.certificate.steps.trust(iphone))).toBeInTheDocument();
+    expect(en.certificate.steps.trust(iphone)).toMatch(/Your iPhone shows a warning. That is expected. Tap Continue\./);
+  });
+
+  it("the status line comes after the heading, so it is read when the heading takes focus", async () => {
+    await walkTo("certificate");
+    const heading = screen.getByRole("heading", { level: 1 });
+    const status = screen.getByText(en.certificate.connected(iphone));
+    expect(heading.compareDocumentPosition(status) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy();
+  });
+
+  it("says which step this is in words, for when the step list is hidden", async () => {
+    await walkTo("certificate");
+    expect(screen.getByText(en.common.stepOf(3, 8, en.rail.steps.certificate))).toBeInTheDocument();
+  });
+
+  it("the unlock screen's forgot-password line says to keep trying and never to type it elsewhere", async () => {
+    await walkTo("unlock");
+    expect(screen.getByText(en.unlock.forgotten)).toBeInTheDocument();
+    expect(en.unlock.forgotten).toMatch(/nothing is lost by a wrong try/);
+    const toggle = screen.getByRole("button", { name: en.unlock.show });
+    expect(toggle).toHaveAttribute("aria-pressed", "false");
   });
 
   it("wrong_password_shows_inline_error_and_keeps_input", async () => {
@@ -322,14 +511,18 @@ describe("wizard", () => {
     const { api } = await mountApp({ resumeCleanup: true });
     expect(screen.getByRole("heading", { level: 1, name: en.cleanup.title })).toBeInTheDocument();
     expect(screen.getByText(en.cleanup.resumed)).toBeInTheDocument();
-    await screen.findByText(en.cleanup.clean);
+    await screen.findByText(en.cleanup.clean(en.deviceName.either));
+    // The app no longer knows what happened before it was closed, so it asks about Authy
+    // and about a saved file as well.
+    expect(screen.getAllByRole("checkbox")).toHaveLength(4);
+    expect(screen.getByRole("checkbox", { name: new RegExp(en.cleanup.items.fileDeletedMaybe.label) })).toBeInTheDocument();
     expect(api.calls.filter((c) => c.method === "cleanup")).toHaveLength(1);
     expect(api.calls.some((c) => c.method === "startProxy")).toBe(false);
   });
 
   it("cleanup_blocks_until_every_item_ticked", async () => {
     const { api, user } = await walkTo("cleanup");
-    await screen.findByText(en.cleanup.clean);
+    await screen.findByText(en.cleanup.clean(iphone));
     const finish = screen.getByRole("button", { name: en.cleanup.finish });
     const boxes = screen.getAllByRole("checkbox");
     expect(boxes).toHaveLength(3);
@@ -353,13 +546,34 @@ describe("wizard", () => {
     expect(screen.getByText(en.done.again)).toBeInTheDocument();
   });
 
-  it("cleanup cannot finish while the computer's own cleanup has failed, and retries", async () => {
+  it("a failed cleanup shows the shell's reason and a manual route, and can still be finished", async () => {
+    const { api, user } = await walkTo("cleanup", { cleanupError: "could not remove the certificate key: keychain is locked" });
+    const alert = await screen.findByRole("alert");
+    expect(within(alert).getByText(en.cleanup.failed)).toBeInTheDocument();
+    expect(within(alert).getByText(en.cleanup.failedReason("could not remove the certificate key: keychain is locked"))).toBeInTheDocument();
+    expect(within(alert).getByText(en.cleanup.failedManual)).toBeInTheDocument();
+    expect(en.cleanup.failedManual).toMatch(/Keychain Access.*authexodus/);
+
+    // The phone-side ticks can be made regardless, but they alone do not finish.
+    const finish = screen.getByRole("button", { name: en.cleanup.finish });
+    for (const id of ["proxyOff", "profileRemoved", "authySignedIn"] as const) {
+      await user.click(screen.getByRole("checkbox", { name: new RegExp(en.cleanup.items[id].label) }));
+    }
+    expect(finish).toBeDisabled();
+
+    // Saying the key was removed by hand is the way out when Try again keeps failing.
+    await user.click(within(alert).getByRole("checkbox", { name: en.cleanup.manualDone }));
+    expect(finish).toBeEnabled();
+    await user.click(finish);
+    await screen.findByRole("heading", { level: 1 });
+    expect(api.calls.filter((c) => c.method === "finish")).toHaveLength(1);
+  });
+
+  it("Try again after a failed cleanup can succeed", async () => {
     const { user } = await walkTo("cleanup", { cleanupError: "keychain busy" });
     const alert = await screen.findByRole("alert");
-    for (const box of screen.getAllByRole("checkbox")) await user.click(box);
-    expect(screen.getByRole("button", { name: en.cleanup.finish })).toBeDisabled();
     await user.click(within(alert).getByRole("button", { name: en.common.tryAgain }));
-    await screen.findByText(en.cleanup.clean);
-    await waitFor(() => expect(screen.getByRole("button", { name: en.cleanup.finish })).toBeEnabled());
+    await screen.findByText(en.cleanup.clean(iphone));
+    expect(screen.queryByRole("alert")).not.toBeInTheDocument();
   });
 });

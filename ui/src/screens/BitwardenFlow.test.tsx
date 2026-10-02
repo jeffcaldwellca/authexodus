@@ -110,54 +110,168 @@ describe("bitwarden path", () => {
     expect(screen.getByRole("button", { name: t.runAgain })).toBeInTheDocument();
   });
 
-  it("asks for the two-step code, then signs in with it and forgets the master password", async () => {
-    const { api, user } = await walkTo("destination", { summary, proposals, loginResults: [{ kind: "badCredentials" }, { kind: "needsTwoFactor" }] });
+  async function toLogin(script: Partial<FakeScript>): Promise<Harness> {
+    const h = await walkTo("destination", { summary, proposals, ...script });
+    await h.user.click(screen.getByRole("button", { name: new RegExp(en.destination.options.bitwarden.title) }));
+    await h.user.click(screen.getByRole("button", { name: t.prepare }));
+    await screen.findByRole("heading", { level: 1, name: t.loginTitle });
+    await h.user.type(screen.getByLabelText(t.email), "sam@example.com");
+    await h.user.type(screen.getByLabelText(t.password), "master pw");
+    return h;
+  }
+  /** True when the master password is anywhere in the page: a field's value or its text. */
+  const passwordOnPage = () =>
+    [...document.querySelectorAll("input")].some((i) => i.value === "master pw") || document.body.textContent!.includes("master pw");
+  const logins = (api: Harness["api"]) => api.calls.filter((c) => c.method === "bwLogin").map((c) => c.args[0]);
+
+  it("says before sign-in which two-step methods work, and the way out for the others", async () => {
+    await toLogin({});
+    expect(screen.getByText(t.twoStepLimit)).toBeInTheDocument();
+    expect(t.twoStepLimit).toMatch(/only codes from an authenticator app work here/);
+    expect(t.twoStepLimit).toMatch(/Save a file for another app, then Bitwarden/);
+    expect(screen.getByText(t.loginLede)).toBeInTheDocument();
+    expect(t.loginLede).toMatch(/does not keep it/);
+  });
+
+  it("rejected credentials clear the master password from the form", async () => {
+    const { user } = await toLogin({ loginResults: [{ kind: "badCredentials" }] });
+    await user.click(screen.getByRole("button", { name: t.signIn }));
+    await screen.findByText(t.badCredentials);
+    expect(screen.getByLabelText(t.password)).toHaveValue("");
+    expect(passwordOnPage()).toBe(false);
+    expect(screen.getByRole("button", { name: t.signIn })).toBeDisabled();
+  });
+
+  it("the master password leaves the form during the two-step round trip and is still sent with the code", async () => {
+    const { api, user } = await toLogin({ loginResults: [{ kind: "needsTwoFactor" }] });
+    await user.click(screen.getByRole("radio", { name: t.regions.eu }));
+    await user.click(screen.getByRole("button", { name: t.signIn }));
+
+    // Asked for a code: the code field appears focused, and the password is no longer in a field.
+    const code = await screen.findByLabelText(t.twoFactor);
+    expect(code).toHaveFocus();
+    expect(screen.getByText(t.needsTwoFactor)).toBeInTheDocument();
+    expect(t.needsTwoFactor).toMatch(/6-digit code from your authenticator app/);
+    expect(screen.queryByLabelText(t.password)).not.toBeInTheDocument();
+    expect(screen.getByText(t.passwordHeld)).toBeInTheDocument();
+    expect(passwordOnPage()).toBe(false);
+    // No code typed yet: nothing to send.
+    expect(screen.getByRole("button", { name: t.signIn })).toBeDisabled();
+
+    await user.type(code, "123456");
+    await user.click(screen.getByRole("button", { name: t.signIn }));
+    await screen.findByRole("heading", { level: 1, name: t.reviewTitle });
+    expect(logins(api)).toHaveLength(2);
+    expect(logins(api)[1]).toEqual({ email: "sam@example.com", password: "master pw", region: { kind: "eu" }, twoFactorCode: "123456" });
+    expect(passwordOnPage()).toBe(false);
+  });
+
+  it("a wrong two-step code gets its own message and another try, without retyping the password", async () => {
+    const { api, user } = await toLogin({ loginResults: [{ kind: "needsTwoFactor" }, { kind: "badTwoFactorCode" }] });
+    await user.click(screen.getByRole("button", { name: t.signIn }));
+    await user.type(await screen.findByLabelText(t.twoFactor), "111111");
+    await user.click(screen.getByRole("button", { name: t.signIn }));
+
+    await screen.findByText(t.wrongTwoFactor);
+    expect(screen.queryByText(t.badCredentials)).not.toBeInTheDocument();
+    expect(screen.queryByText(t.loginFailed)).not.toBeInTheDocument();
+    const code = screen.getByLabelText(t.twoFactor);
+    expect(code).toHaveValue("");
+    expect(code).toHaveFocus();
+    expect(passwordOnPage()).toBe(false);
+
+    await user.type(code, "222222");
+    await user.click(screen.getByRole("button", { name: t.signIn }));
+    await screen.findByRole("heading", { level: 1, name: t.reviewTitle });
+    expect(logins(api)[2]).toMatchObject({ password: "master pw", twoFactorCode: "222222" });
+  });
+
+  it("the held master password is dropped when the credentials are refused after all", async () => {
+    const { api, user } = await toLogin({ loginResults: [{ kind: "needsTwoFactor" }, { kind: "badCredentials" }] });
+    await user.click(screen.getByRole("button", { name: t.signIn }));
+    await user.type(await screen.findByLabelText(t.twoFactor), "111111");
+    await user.click(screen.getByRole("button", { name: t.signIn }));
+    await screen.findByText(t.badCredentials);
+
+    // The password must be typed again: nothing was kept to send.
+    expect(screen.getByLabelText(t.password)).toHaveValue("");
+    expect(screen.queryByText(t.passwordHeld)).not.toBeInTheDocument();
+    expect(screen.queryByLabelText(t.twoFactor)).not.toBeInTheDocument();
+    expect(screen.getByRole("button", { name: t.signIn })).toBeDisabled();
+    await user.type(screen.getByLabelText(t.password), "second try");
+    await user.click(screen.getByRole("button", { name: t.signIn }));
+    await screen.findByRole("heading", { level: 1, name: t.reviewTitle });
+    expect(logins(api)[2]).toMatchObject({ password: "second try" });
+    expect(logins(api)[2]).not.toHaveProperty("twoFactorCode");
+  });
+
+  it("a sign-in that fails outright clears the password and points to the file route", async () => {
+    const { api, user } = await toLogin({});
+    api.bwLogin = async () => { throw new Error("bw: unexpected output"); };
+    await user.click(screen.getByRole("button", { name: t.signIn }));
+    await screen.findByText(t.loginFailed);
+    expect(t.loginFailed).toMatch(/Save a file for another app, then Bitwarden/);
+    expect(screen.getByLabelText(t.password)).toHaveValue("");
+    expect(passwordOnPage()).toBe(false);
+  });
+
+  it("leaving the sign-in screen mid two-step drops the held password: coming back asks for it again", async () => {
+    const { api, user } = await toLogin({ loginResults: [{ kind: "needsTwoFactor" }] });
+    await user.click(screen.getByRole("button", { name: t.signIn }));
+    await screen.findByLabelText(t.twoFactor);
+    await user.click(screen.getByRole("button", { name: en.destination.backToOptions }));
+
     await user.click(screen.getByRole("button", { name: new RegExp(en.destination.options.bitwarden.title) }));
     await user.click(screen.getByRole("button", { name: t.prepare }));
     await screen.findByRole("heading", { level: 1, name: t.loginTitle });
-    await user.type(screen.getByLabelText(t.email), "sam@example.com");
-    await user.type(screen.getByLabelText(t.password), "master pw");
-    await user.click(screen.getByRole("radio", { name: t.regions.eu }));
-
-    await user.click(screen.getByRole("button", { name: t.signIn }));
-    await screen.findByText(t.badCredentials);
-    expect(screen.getByLabelText(t.password)).toHaveValue("master pw");
-
-    await user.click(screen.getByRole("button", { name: t.signIn }));
-    await user.type(await screen.findByLabelText(t.twoFactor), "123456");
-    await user.click(screen.getByRole("button", { name: t.signIn }));
-    await screen.findByRole("heading", { level: 1, name: t.reviewTitle });
-
-    const logins = api.calls.filter((c) => c.method === "bwLogin").map((c) => c.args[0]);
-    expect(logins).toHaveLength(3);
-    expect(logins[2]).toEqual({ email: "sam@example.com", password: "master pw", region: { kind: "eu" }, twoFactorCode: "123456" });
-    expect(screen.queryByLabelText(t.password)).not.toBeInTheDocument();
+    expect(screen.getByLabelText(t.password)).toHaveValue("");
+    expect(screen.queryByLabelText(t.twoFactor)).not.toBeInTheDocument();
+    expect(logins(api)).toHaveLength(1);
   });
 
-  it("a login that already has a code cannot be chosen, and its row waits for a choice", async () => {
-    const withCode: Proposal[] = [
-      { tokenId: "gh", confidence: "high", decision: { kind: "attach", itemId: "v-gh" },
-        candidates: [
-          { itemId: "v-gh", name: "GitHub", username: "sam", hasCode: true },
-          { itemId: "v-gh2", name: "GitHub (old)", username: null, hasCode: false },
-        ] },
+  it("the master password can be shown while typing", async () => {
+    const { user } = await toLogin({});
+    const field = screen.getByLabelText(t.password);
+    expect(field).toHaveAttribute("type", "password");
+    await user.click(screen.getByRole("button", { name: t.showPassword }));
+    expect(field).toHaveAttribute("type", "text");
+  });
+
+  it("a login that already has a code is listed but cannot be chosen, and the row waits for an answer", async () => {
+    // What the core really sends when the only match already holds a code: the login is
+    // listed, nothing is chosen for the person, and the row is low confidence.
+    const taken: Proposal[] = [
+      { tokenId: "gh", confidence: "low", decision: { kind: "createNew" },
+        candidates: [{ itemId: "v-gh", name: "GitHub", username: "sam", hasCode: true }] },
     ];
-    const { api, user } = await toReview({ summary: { ...summary, tokens: [summary.tokens[0]!] }, proposals: withCode });
+    const { api, user } = await toReview({ summary: { ...summary, tokens: [summary.tokens[0]!] }, proposals: taken });
     const select = screen.getByRole("combobox", { name: t.actionFor("GitHub") });
-    // Confident or not, a match that cannot be applied is not decided for the person.
     expect(select).toHaveValue("");
-    expect(screen.getByText(t.questionHasCode)).toBeInTheDocument();
+    expect(select).toHaveAccessibleDescription(t.questionHasCode);
     expect(screen.getByRole("button", { name: t.apply })).toBeDisabled();
 
-    const taken = screen.getByRole("option", { name: t.attachHasCode("GitHub", "sam") });
-    expect(taken).toBeDisabled();
-    expect(taken.textContent).toMatch(/already has a code/);
-    expect(screen.getByRole("option", { name: t.attach("GitHub (old)", null) })).toBeEnabled();
+    const option = screen.getByRole("option", { name: t.attachHasCode("GitHub", "sam") });
+    expect(option).toBeDisabled();
+    expect(option.textContent).toMatch(/already has a code/);
 
     await user.selectOptions(select, t.createNew);
     await user.click(screen.getByRole("button", { name: t.apply }));
     await screen.findByRole("heading", { level: 1, name: t.reportTitle });
     expect(api.calls.find((c) => c.method === "bwApply")?.args[0]).toEqual([{ tokenId: "gh", decision: { kind: "createNew" } }]);
+  });
+
+  it("a row with several free logins asks which one, and the question is tied to its menu", async () => {
+    await toReview();
+    expect(screen.getByRole("combobox", { name: t.actionFor("Google") })).toHaveAccessibleDescription(t.question);
+    expect(t.question).toBe("Which Bitwarden login does this code belong to?");
+    expect(screen.getByRole("combobox", { name: t.actionFor("GitHub") })).not.toHaveAccessibleDescription();
+  });
+
+  it("the review says what was pre-filled, what happens to unmatched accounts, and what skip means", async () => {
+    await toReview();
+    expect(screen.getByText(t.reviewLede)).toBeInTheDocument();
+    expect(t.reviewLede).toMatch(/could not match become new entries in the “Authy import” folder, which you can merge in Bitwarden afterwards/);
+    expect(t.reviewLede).toMatch(/Skipped accounts stay only in Authy/);
   });
 
   it("focus moves to the heading on every stage of the Bitwarden path", async () => {

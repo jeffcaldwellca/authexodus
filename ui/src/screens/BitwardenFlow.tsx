@@ -31,6 +31,11 @@ function proposedHasCode(p: Proposal): boolean {
   return d.kind === "attach" && p.candidates.some((c) => c.itemId === d.itemId && c.hasCode);
 }
 
+/** Every login the row could go to already has a code, so none of them can be chosen. */
+function onlyTaken(p: Proposal): boolean {
+  return proposedHasCode(p) || (p.candidates.length > 0 && p.candidates.every((c) => c.hasCode));
+}
+
 /** Rows the person must answer themselves: uncertain matches, and matches that cannot be applied. */
 function needsAnswer(p: Proposal): boolean {
   return p.confidence === "low" || proposedHasCode(p);
@@ -51,8 +56,18 @@ export function BitwardenFlow({ api, tokens, onDone }: ScreenProps & { tokens: T
   const [serverUrl, setServerUrl] = useState("");
   const [code, setCode] = useState("");
   const [needsCode, setNeedsCode] = useState(false);
-  const [loginProblem, setLoginProblem] = useState<"bad" | "failed" | null>(null);
+  const [loginProblem, setLoginProblem] = useState<"bad" | "badCode" | "failed" | null>(null);
   const [busy, setBusy] = useState(false);
+  const [showPassword, setShowPassword] = useState(false);
+  // While Bitwarden waits for a two-step code, the master password has to be sent again with
+  // it. It is kept in a ref, out of React state and off the screen, and only for that long:
+  // it is dropped on success, on rejected credentials, on any failure, and when this view closes.
+  const heldPassword = useRef<string | null>(null);
+  const [holding, setHolding] = useState(false);
+  const codeInput = useRef<HTMLInputElement>(null);
+  const dropPassword = () => { heldPassword.current = null; setHolding(false); setPassword(""); };
+  useEffect(() => () => { heldPassword.current = null; }, []);
+  useEffect(() => { if (needsCode) codeInput.current?.focus(); }, [needsCode]);
 
   const [proposals, setProposals] = useState<Proposal[]>([]);
   const [choices, setChoices] = useState<Record<string, string>>({});
@@ -102,14 +117,24 @@ export function BitwardenFlow({ api, tokens, onDone }: ScreenProps & { tokens: T
     setLoginProblem(null);
     if (regionKind === "selfHosted" && !validServerUrl(serverUrl)) { setBusy(false); return; }
     const region: BwRegion = regionKind === "selfHosted" ? { kind: "selfHosted", url: serverUrl.trim() } : { kind: regionKind };
+    const secret = heldPassword.current ?? password;
     try {
-      const result = await api.bwLogin({ email, password, region, ...(needsCode && code !== "" ? { twoFactorCode: code } : {}) });
-      if (result.kind === "needsTwoFactor") {
+      const result = await api.bwLogin({ email, password: secret, region, ...(needsCode && code !== "" ? { twoFactorCode: code } : {}) });
+      if (result.kind === "needsTwoFactor" || result.kind === "badTwoFactorCode") {
+        heldPassword.current = secret;
+        setHolding(true);
+        setPassword("");
+        setCode("");
         setNeedsCode(true);
+        if (result.kind === "badTwoFactorCode") setLoginProblem("badCode");
+        codeInput.current?.focus();
       } else if (result.kind === "badCredentials") {
+        dropPassword();
+        setCode("");
+        setNeedsCode(false);
         setLoginProblem("bad");
       } else {
-        setPassword("");
+        dropPassword();
         setCode("");
         setNeedsCode(false);
         setBusy(false);
@@ -117,6 +142,9 @@ export function BitwardenFlow({ api, tokens, onDone }: ScreenProps & { tokens: T
         return;
       }
     } catch {
+      dropPassword();
+      setCode("");
+      setNeedsCode(false);
       setLoginProblem("failed");
     }
     setBusy(false);
@@ -174,17 +202,25 @@ export function BitwardenFlow({ api, tokens, onDone }: ScreenProps & { tokens: T
         footer={
           <>
             {back}
-            <button type="submit" form="bw-login" className="primary" disabled={busy || stage === "matching" || email === "" || password === "" || urlProblem}>
+            <button type="submit" form="bw-login" className="primary" disabled={busy || stage === "matching" || email === "" || (!holding && password === "") || (needsCode && code === "") || urlProblem}>
               {busy ? t.signingIn : t.signIn}
             </button>
           </>
         }
       >
+        <Callout tone="info"><p>{t.twoStepLimit}</p></Callout>
         <form id="bw-login" className="form narrow" onSubmit={signIn} noValidate>
           <label htmlFor="bw-email">{t.email}</label>
           <input id="bw-email" type="email" value={email} onChange={(e) => setEmail(e.target.value)} autoComplete="off" spellCheck={false} />
-          <label htmlFor="bw-password">{t.password}</label>
-          <input id="bw-password" type="password" value={password} onChange={(e) => setPassword(e.target.value)} autoComplete="off" />
+          {holding ? <p className="quiet-text">{t.passwordHeld}</p> : (
+            <>
+              <label htmlFor="bw-password">{t.password}</label>
+              <div className="password-row">
+                <input id="bw-password" type={showPassword ? "text" : "password"} value={password} onChange={(e) => setPassword(e.target.value)} autoComplete="off" spellCheck={false} />
+                <button type="button" className="quiet" aria-pressed={showPassword} onClick={() => setShowPassword((v) => !v)}>{t.showPassword}</button>
+              </div>
+            </>
+          )}
           <fieldset className="segmented">
             <legend>{t.region}</legend>
             <div className="segments">
@@ -209,7 +245,8 @@ export function BitwardenFlow({ api, tokens, onDone }: ScreenProps & { tokens: T
             <>
               <Callout tone="info" alert><p>{t.needsTwoFactor}</p></Callout>
               <label htmlFor="bw-code">{t.twoFactor}</label>
-              <input id="bw-code" inputMode="numeric" value={code} onChange={(e) => setCode(e.target.value)} autoComplete="off" />
+              <input ref={codeInput} id="bw-code" inputMode="numeric" value={code} onChange={(e) => setCode(e.target.value)} autoComplete="off" />
+              {loginProblem === "badCode" && <Callout tone="error" title={t.wrongTwoFactor} alert />}
             </>
           )}
           {loginProblem === "bad" && <Callout tone="error" title={t.badCredentials} alert />}
@@ -250,8 +287,8 @@ export function BitwardenFlow({ api, tokens, onDone }: ScreenProps & { tokens: T
                     {token?.username && <span className="quiet-text">{token.username}</span>}
                   </th>
                   <td>
-                    {asking && <span className="question">{p.confidence === "low" ? t.question : t.questionHasCode}</span>}
-                    <select aria-label={t.actionFor(title)} value={value} onChange={(e) => setChoices((prev) => ({ ...prev, [p.tokenId]: e.target.value }))}>
+                    {asking && <span className="question" id={`q-${p.tokenId}`}>{onlyTaken(p) ? t.questionHasCode : t.question}</span>}
+                    <select aria-label={t.actionFor(title)} aria-describedby={asking ? `q-${p.tokenId}` : undefined} value={value} onChange={(e) => setChoices((prev) => ({ ...prev, [p.tokenId]: e.target.value }))}>
                       {value === "" && <option value="" disabled>{t.choose}</option>}
                       {p.candidates.map((c) => (
                         <option key={c.itemId} value={`attach:${c.itemId}`} disabled={c.hasCode}>

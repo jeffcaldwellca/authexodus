@@ -50,6 +50,16 @@ export function Destination(props: ScreenProps) {
       <Callout tone="warn" title={t.authyTitle}>
         <p>{t.authyBody(deviceLabel(state.device))}</p>
       </Callout>
+      {cantMove > 0 && (
+        <section className="cant-move" aria-labelledby="cant-move-title">
+          <h2 id="cant-move-title">{t.cantMoveTitle(cantMove)}</h2>
+          <p className="quiet-text">{t.cantMoveLede}</p>
+          <ul>
+            {summary.native.map((n) => <li key={`native:${n.name}`}>{t.native(n.name)}</li>)}
+            {summary.invalid.map((n) => <li key={`invalid:${n.name}`}>{t.invalid(n.name)}</li>)}
+          </ul>
+        </section>
+      )}
       {summary.tokens.length > 0 && (
         <ul className="options">
           {OPTIONS.map((option) => (
@@ -64,16 +74,6 @@ export function Destination(props: ScreenProps) {
             </li>
           ))}
         </ul>
-      )}
-      {cantMove > 0 && (
-        <section className="cant-move" aria-labelledby="cant-move-title">
-          <h2 id="cant-move-title">{t.cantMoveTitle(cantMove)}</h2>
-          <p className="quiet-text">{t.cantMoveLede}</p>
-          <ul>
-            {summary.native.map((n) => <li key={`native:${n.name}`}>{t.native(n.name)}</li>)}
-            {summary.invalid.map((n) => <li key={`invalid:${n.name}`}>{t.invalid(n.name)}</li>)}
-          </ul>
-        </section>
       )}
     </Screen>
   );

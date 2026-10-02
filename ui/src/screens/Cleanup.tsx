@@ -22,6 +22,8 @@ function ItemArt({ id, device }: { id: CleanupId; device: Device }) {
 
 export function Cleanup({ api, state, dispatch }: ScreenProps) {
   const [core, setCore] = useState<"working" | "clean" | "failed">("working");
+  const [reason, setReason] = useState("");
+  const [removedByHand, setRemovedByHand] = useState(false);
   const [shown, setShown] = useState<CleanupId>("proxyOff");
   const [finishing, setFinishing] = useState(false);
   const started = useRef(false);
@@ -32,7 +34,11 @@ export function Cleanup({ api, state, dispatch }: ScreenProps) {
 
   const runCleanup = () => {
     setCore("working");
-    api.cleanup().then(() => setCore("clean")).catch(() => setCore("failed"));
+    api.cleanup().then(() => setCore("clean")).catch((err: unknown) => {
+      // The shell's own words say what could not be removed; the person needs them to act.
+      setReason(err instanceof Error ? err.message : String(err));
+      setCore("failed");
+    });
   };
   useEffect(() => {
     // The ref keeps React's development double-mount from asking the core twice.
@@ -40,6 +46,10 @@ export function Cleanup({ api, state, dispatch }: ScreenProps) {
     started.current = true;
     runCleanup();
   }, []);
+
+  // When this computer's own cleanup fails, the person can finish it by hand and say so.
+  const computerDone = core === "clean" || (core === "failed" && removedByHand);
+  const text = (id: CleanupId) => (id === "fileDeleted" && !state.exportedFile ? t.items.fileDeletedMaybe : t.items[id]);
 
   const finish = async () => {
     setFinishing(true);
@@ -58,7 +68,7 @@ export function Cleanup({ api, state, dispatch }: ScreenProps) {
       footer={
         <>
           <p className="footer-hint" aria-live="polite">{left > 0 ? t.remaining(left) : ""}</p>
-          <button type="button" className="primary" disabled={!canFinish(state) || core !== "clean" || finishing} onClick={() => void finish()}>
+          <button type="button" className="primary" disabled={!canFinish(state) || !computerDone || finishing} onClick={() => void finish()}>
             {t.finish}
           </button>
         </>
@@ -67,11 +77,17 @@ export function Cleanup({ api, state, dispatch }: ScreenProps) {
       {!state.cleanupTicks.proxyOff && <Callout tone="warn" title={t.noInternet(d)} />}
       <div aria-live="polite">
         {core === "working" && <Waiting>{t.working}</Waiting>}
-        {core === "clean" && <Callout tone="ok"><p>{t.clean}</p></Callout>}
+        {core === "clean" && <Callout tone="ok"><p>{t.clean(d)}</p></Callout>}
       </div>
       {core === "failed" && (
         <Callout tone="error" title={t.failed} alert>
+          {reason !== "" && <p>{t.failedReason(reason)}</p>}
+          <p>{t.failedManual}</p>
           <button type="button" className="secondary" onClick={runCleanup}>{en.common.tryAgain}</button>
+          <label className="scanned">
+            <input type="checkbox" checked={removedByHand} onChange={(e) => setRemovedByHand(e.target.checked)} />
+            <span>{t.manualDone}</span>
+          </label>
         </Callout>
       )}
 
@@ -98,10 +114,10 @@ export function Cleanup({ api, state, dispatch }: ScreenProps) {
                 key={id}
                 checked={state.cleanupTicks[id]}
                 onChange={(value) => { setShown(id); dispatch({ type: "setCleanup", id, value }); }}
-                label={t.items[id].label}
-                detail={t.items[id].how}
+                label={text(id).label}
+                detail={text(id).how}
                 extra={
-                  <button type="button" className="quiet small" aria-pressed={shown === id} aria-label={en.common.showPictureFor(t.items[id].label)} onClick={() => setShown(id)}>
+                  <button type="button" className="quiet small" aria-pressed={shown === id} aria-label={en.common.showPictureFor(text(id).label)} onClick={() => setShown(id)}>
                     {en.common.showPicture}
                   </button>
                 }

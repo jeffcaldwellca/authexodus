@@ -16,6 +16,14 @@ import { deviceLabel, type ScreenProps } from "./types";
 
 const t = en.certificate;
 
+/** The 32 pairs of a SHA-256 fingerprint in four short rows, which is easier to compare by eye. */
+export function fingerprintLines(fingerprint: string): string[] {
+  const pairs = fingerprint.split(":").filter(Boolean);
+  const lines: string[] = [];
+  for (let i = 0; i < pairs.length; i += 8) lines.push(pairs.slice(i, i + 8).join(":"));
+  return lines;
+}
+
 export function Certificate({ state, dispatch, proxy, onRestart, restart }: ScreenProps) {
   const device: Device = state.device ?? "iphone";
   const d = deviceLabel(state.device);
@@ -38,7 +46,7 @@ export function Certificate({ state, dispatch, proxy, onRestart, restart }: Scre
     { id: "download", text: t.steps.download, art: <DownloadPage device={device} ip={proxy.ip} port={proxy.port} highlight="download" /> },
     { id: "profile", text: t.steps.profile, art: <ProfileDownloaded device={device} /> },
     { id: "install", text: t.steps.install, art: <InstallProfile device={device} /> },
-    { id: "trust", text: t.steps.trust, art: <TrustSettings device={device} />, important: true },
+    { id: "trust", text: t.steps.trust(d), art: <TrustSettings device={device} />, important: true },
     { id: "test", text: t.steps.test, art: <DownloadPage device={device} ip={proxy.ip} port={proxy.port} highlight="test" /> },
   ] : [];
 
@@ -58,7 +66,16 @@ export function Certificate({ state, dispatch, proxy, onRestart, restart }: Scre
         </>
       }
     >
-      <ConnectionNotices d={d} refused={state.deviceRefused} restart={restart} onRestart={() => onRestart()} />
+      <ConnectionNotices d={d} state={state} restart={restart} onRestart={() => onRestart()} />
+      {proxy && (
+        <div className="fingerprint-box">
+          <p className="values-caption">{t.fingerprintLabel}</p>
+          <p className="fingerprint" data-testid="fingerprint">
+            {fingerprintLines(proxy.certFingerprint).map((line) => <span key={line}>{line}</span>)}
+          </p>
+          <p className="quiet-text">{t.fingerprintHow(d)}</p>
+        </div>
+      )}
       {/* The guide never moves on an event: the person may still be scanning the code. */}
       <Guide steps={steps} />
       {trouble === "trust" && <Trust {...help} reminder />}
