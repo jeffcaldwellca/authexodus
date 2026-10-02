@@ -2,7 +2,7 @@
 
 authexodus moves your two-step login codes out of Authy and into another authenticator app. Authy has no export button. This desktop app, which runs on a Mac, walks you through getting your codes out using an iPhone or iPad, and puts them where you want them: any authenticator through QR codes or an import file, or Bitwarden with each code attached to the login it belongs to.
 
-It is for people who have never heard of a proxy. You never open a terminal.
+It is for people who have never heard of a proxy. Using the app never needs a terminal.
 
 Status: **pre-release (v0.1, not yet tagged)**. It has not yet been checked on a real iPhone, iPad and Authy account. See [Status](#status).
 
@@ -10,18 +10,21 @@ Status: **pre-release (v0.1, not yet tagged)**. It has not yet been checked on a
 
 - A Mac (macOS first; Windows is not supported yet).
 - An **iPhone or iPad** with Authy on it. **Android cannot use this app.** Getting codes out of Authy on Android needs changes to the phone that most people should not make. If you have only Android, use the [manual guide](docs/manual-reenrolment.md), or borrow an iPhone or iPad, install Authy on it and sign in.
-- The Mac and the iPhone or iPad on the same home Wi-Fi (not a guest network).
+- The Mac and the iPhone or iPad on the same Wi-Fi, and it must be **a home or office network you control**. Do not do this on public or shared Wi-Fi (a café, hotel, guest network): for a few minutes your device installs a certificate that it fetches over that network, and someone else on the same network could interfere. The app shows the certificate's fingerprint so you can compare it with what your device shows before you trust it.
+- A phone that can receive a text message on the number your Authy account uses. Authy sends a code by text when you sign in again.
 - About 20 minutes.
 
-## Before you start: three things in Authy
+## Before you start: five checks
 
-You will delete Authy and install it again. Without these three, you can be locked out for 24 hours or lose codes. The app makes you confirm them before it starts.
+You will delete Authy and install it again. Without these five, you can be locked out for 24 hours or lose codes. The app makes you confirm each one before it starts.
 
-1. **Backups are on.** In Authy: Settings > Accounts > Authenticator Backups.
-2. **You know your backup password.** It is not your phone passcode. It unlocks your codes on a new device.
-3. **Multi-device is on.** In Authy: Settings > Devices > Allow Multi-device.
+1. **Authy on the device shows your codes.** Open it and check that your accounts are listed.
+2. **Backups are on.** In Authy, open Settings and look for Authenticator Backups (usually under Accounts).
+3. **You know your backup password.** It is the password Authy asks for on a new device, not the passcode that unlocks the screen. If you are not sure of it, stop: once Authy is deleted, your codes cannot be opened without it.
+4. **Multi-device is on.** In Authy, open Settings and look for Allow Multi-device (usually under Devices).
+5. **You can get a text message on the phone number your Authy account uses.** If that number is old or the phone is not with you, stop.
 
-If you have a spare iPad or iPhone, use that. Your everyday phone then keeps working the whole time.
+If you have a spare iPad or iPhone, use that. Your everyday phone then keeps working the whole time. Install Authy on the spare and sign in there first.
 
 ## How it works
 
@@ -35,12 +38,19 @@ The method was proven by hand on 2026-10-02 (40 accounts moved).
 
 ## What it never does
 
-- It makes no network calls, except one the first time you choose Bitwarden: it downloads Bitwarden's own command-line tool from GitHub and checks it against a fixed SHA-256 checksum. The rest of the time it uses the internet for nothing.
+- It makes no network calls of its own, except on the Bitwarden path: it downloads Bitwarden's own command-line tool from GitHub (checked against a fixed SHA-256 checksum), and that tool then talks to Bitwarden to sign in and add your codes. While your device is connected, its internet traffic passes through the app on its way out; that traffic is relayed, not read or recorded.
 - No analytics. No crash reporting. No accounts.
-- Your backup password and codes are never written to disk, unless you choose to save an import file. That file has no lock on it, and the app tells you to delete it after use. (Bitwarden's tool keeps its own session data in the app's folder while you use that path; the app wipes it at cleanup and when it quits.)
-- It reads only Authy's API address (`api.authy.com`). Every other connection from your iPhone or iPad passes through untouched and is not recorded.
-- The logs hold request paths and status codes only, never passwords, query strings, codes or bodies.
-- The certificate key is created on your Mac for each run, kept in the macOS Keychain, and destroyed at cleanup.
+- Your backup password and codes are never written to disk, unless you choose to save an import file. That file has no lock on it, and the app tells you to delete it after use. (Bitwarden's tool keeps its own session data in the app's folder while you use that path; the app wipes it at cleanup and when it quits. If the app crashes or is force-quit, it is wiped the next time the app opens.)
+- It reads only Authy's API address (`api.authy.com`). Every other connection from your iPhone or iPad is passed along and is not read or recorded.
+- The app writes no log file. Diagnostic lines (request paths and status codes only, never passwords, query strings, codes or bodies) go to the terminal, and only if you launched the app from one. See [Diagnostic output](#diagnostic-output).
+- The certificate's secret key is created on your Mac for each run, kept in the macOS Keychain, and destroyed at cleanup. If you quit before cleanup, the key stays in the Keychain so the app can finish the job: the next launch opens on the Clean up screen. If you never open the app again, the key stays there, and the certificate itself stops being valid after 7 days. You can delete it by hand: open Keychain Access, search for authexodus, and delete the item. Remove the certificate profile from your iPhone or iPad either way.
+- The app uses the certificate only to read what Authy sends. By default the certificate is also limited to Authy's addresses, so that it would be of no use for anything else; whether iOS accepts and enforces that limit is one of the things the first real-device test settles.
+
+## Bitwarden: which sign-in methods work
+
+The Bitwarden path signs in through Bitwarden's own command-line tool. If your Bitwarden account has two-step login, **only codes from an authenticator app work**. Codes sent by email, the emailed code Bitwarden uses to confirm a new device, and hardware security keys are not supported. In those cases choose **Save a file for another app**, then **Bitwarden**, and import the file in Bitwarden yourself.
+
+Accounts the app cannot match to a login become new entries in an "Authy import" folder, which you can merge in Bitwarden afterwards. A code that is already in Bitwarden is never replaced.
 
 ## What cannot be moved
 
@@ -53,6 +63,18 @@ The method was proven by hand on 2026-10-02 (40 accounts moved).
 - The method depends on Authy on iOS accepting a certificate that you install yourself. Twilio can end that at any time, for example by pinning its certificate. If it stops working, the app says so and points you to the [manual guide](docs/manual-reenrolment.md). Your codes stay in Authy.
 - Several import file formats (2FAS, 1Password, Proton Authenticator) and Google Authenticator's QR batches were written from documentation and have not yet been imported into the real apps.
 - Not affiliated with Twilio or Bitwarden. "Authy" is used only to describe what the app works with. authexodus exports your own data.
+
+## Diagnostic output
+
+For the device test, or when something goes wrong, launch the app's binary from Terminal so its diagnostic lines are visible:
+
+```
+AUTHEXODUS_LOG=debug /Applications/authexodus.app/Contents/MacOS/authexodus
+```
+
+Nothing is written to a file. Copy the lines you need from the Terminal window.
+
+`AUTHEXODUS_UNCONSTRAINED_CA=1` makes the app create a certificate that is **not** limited to Authy's addresses. It is a testing aid for one question only: whether iOS refuses the limited certificate. Do not use it otherwise. A certificate without the limit could be used to read any of the device's traffic if its key leaked, so remove the profile from the device as soon as the test is over.
 
 ## Building from source
 
