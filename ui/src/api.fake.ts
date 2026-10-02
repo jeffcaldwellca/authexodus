@@ -20,6 +20,8 @@ export type FakeScript = {
   applyResults: (ApplyReport | Error)[];
   /** Answers for successive `exportFile` calls. When empty, the file is "saved". */
   exportResults: ({ saved: string } | { cancelled: true })[];
+  /** Titles the Google transfer codes cannot carry. */
+  googleUnsupported: string[];
   /** Makes `bwPrepare` fail with this message. */
   prepareError: string | null;
   /** Makes `cleanup` fail with this message, once. */
@@ -93,6 +95,7 @@ function defaultScript(): FakeScript {
     loginResults: [],
     applyResults: [],
     exportResults: [],
+    googleUnsupported: [],
     prepareError: null,
     cleanupError: null,
     delayMs: 0,
@@ -146,13 +149,18 @@ const FILE_NAMES: Record<Destination, string> = {
 };
 
 export function createFakeApi(initial: Partial<AppState> = {}, overrides: Partial<FakeScript> = {}): FakeApi {
-  const state: AppState = { step: "welcome", device: null, resumeCleanup: false, version: "0.0.0-fake", ...initial };
+  const state: AppState = {
+    step: "welcome", device: null, resumeCleanup: false, version: "0.0.0-fake",
+    releasesUrl: "https://example.com/authexodus/releases", ...initial,
+  };
   const script: FakeScript = { ...defaultScript(), ...overrides };
   const proxyListeners = new Set<(e: ProxyEvent) => void>();
   const bwListeners = new Set<(line: string) => void>();
   const calls: FakeCall[] = [];
   let chosenIp: string | null = null;
   let unlocked = false;
+  /** A backup has passed through the proxy, so the address can no longer change quietly. */
+  let captured = false;
   /** Vault items the fake Bitwarden has already been given a code for, so re-runs add nothing twice. */
   const applied = new Set<string>();
 
@@ -201,7 +209,19 @@ export function createFakeApi(initial: Partial<AppState> = {}, overrides: Partia
     async setDevice(device: Device) { await record("setDevice", device); state.device = device; },
     async startProxy(ip?: string) {
       await record("startProxy", ip);
+      if (captured && ip !== undefined && ip !== proxyInfo().ip) {
+        throw new Error("a backup is already captured; restart the proxy to change address");
+      }
       if (ip !== undefined) chosenIp = ip;
+      // The resume marker exists from the moment the certificate is created: the first start.
+      state.resumeCleanup = true;
+      return proxyInfo();
+    },
+    async restartProxy(ip?: string) {
+      await record("restartProxy", ip);
+      if (ip !== undefined) chosenIp = ip;
+      captured = false;
+      unlocked = false;
       state.resumeCleanup = true;
       return proxyInfo();
     },
@@ -218,6 +238,7 @@ export function createFakeApi(initial: Partial<AppState> = {}, overrides: Partia
       const pages = Math.max(1, Math.ceil(script.summary.tokens.length / 10));
       return Array.from({ length: pages }, (_, i) => fakeQrSvg(`google:${i}`));
     },
+    async googleUnsupported() { await record("googleUnsupported"); return [...script.googleUnsupported]; },
     async exportFile(dest: Destination) {
       await record("exportFile", dest);
       return script.exportResults.shift() ?? { saved: `/Users/sam/Downloads/${FILE_NAMES[dest]}` };
@@ -259,7 +280,10 @@ export function createFakeApi(initial: Partial<AppState> = {}, overrides: Partia
       unlocked = false;
     },
     async finish() { await record("finish"); state.resumeCleanup = false; },
-    emitProxyEvent(e) { proxyListeners.forEach((l) => l(e)); },
+    emitProxyEvent(e) {
+      if (e.kind === "backupCaptured" && e.count > 0) captured = true;
+      proxyListeners.forEach((l) => l(e));
+    },
     emitBwProgress: emitBw,
   };
 }
