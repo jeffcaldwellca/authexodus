@@ -15,10 +15,13 @@
 //!
 //! * It will not connect to this computer, the local network or any other private, link-local
 //!   or special-purpose address on a peer's behalf (see [`special_purpose`]).
-//! * The first peer to complete a TLS handshake for an intercepted host becomes "the device".
-//!   From then on no other peer may use the intercepted hosts, so only the device's traffic
-//!   can reach the captured backup. Tunnels and plain HTTP stay open to everyone, so a stray
-//!   peer cannot lock the real device out of anything but Authy before it gets there first.
+//! * The first peer that is not this computer to complete a TLS handshake for an intercepted
+//!   host becomes "the device". From then on no other peer may use the intercepted hosts, so
+//!   only the device's traffic can reach the captured backup; a second device that tries is
+//!   refused and reported as `DeviceRefused`. Tunnels and plain HTTP stay open to everyone, so
+//!   a stray peer cannot lock the real device out of anything but Authy before it gets there
+//!   first. This computer talking to its own proxy is served until there is a device, but it
+//!   can never become the device, so it can never lock the iPhone or iPad out.
 //! * Connections are capped, idle tunnels are closed, and outbound dials time out.
 
 use std::collections::{HashMap, HashSet};
@@ -72,6 +75,11 @@ const AUTHY_PORT: u16 = 443;
 /// For an outbound connection: name lookup and TCP connect together, and separately the TLS
 /// handshake with Authy.
 const DIAL_TIMEOUT: Duration = Duration::from_secs(15);
+/// One address of a name gets this long to answer before the next one is tried, so an address
+/// that swallows packets (a broken IPv6 route) cannot use up the whole of [`DIAL_TIMEOUT`].
+const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
+/// At most one [`ProxyEvent::DeviceRefused`] in this long.
+const REFUSED_EVERY: Duration = Duration::from_secs(2);
 const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(30);
 /// A blind tunnel that carries no bytes in either direction for this long is closed.
 const TUNNEL_IDLE: Duration = Duration::from_secs(10 * 60);
@@ -123,7 +131,8 @@ pub enum ProxyEvent {
     /// opening a connection (a port scanner) does not count. Sent once.
     DeviceConnected,
     /// The first completed TLS handshake for an intercepted host: the peer that made it trusts
-    /// the root, and is from now on the only peer allowed on the intercepted hosts. Sent once.
+    /// the root. Unless that peer is this computer itself, it is from now on "the device", the
+    /// only peer allowed on the intercepted hosts. Sent once.
     TrustWorking,
     /// A peer was shown our certificate for an intercepted host and answered with a TLS alert
     /// that says it does not accept it (unknown issuer, bad certificate and the like). A
@@ -134,6 +143,10 @@ pub enum ProxyEvent {
     /// Authy answered with a 4xx or 5xx. `path` has no query string, and its all-digit
     /// segments (account and device ids) are replaced by `:id`.
     AuthyError { status: u16, path: String },
+    /// A device other than the accepted one asked for an intercepted host and was refused.
+    /// Usually the same iPhone or iPad under a new address (it rejoined the Wi-Fi), which only
+    /// a restarted proxy will accept. Sent at most once every two seconds.
+    DeviceRefused,
 }
 
 /// For tests only: where Authy "is", and the root that signed that stand-in's certificate.
@@ -152,6 +165,9 @@ pub struct TestUpstream {
     root_cert_der: Vec<u8>,
     /// Source port of a connection to the proxy -> the peer address to treat it as.
     peers: Arc<Mutex<HashMap<u16, IpAddr>>>,
+    /// The port of every connection the proxy opened for [`AUTHY_HOST`], as it asked for it
+    /// (before the stand-in's address was substituted).
+    authy_ports: Arc<Mutex<Vec<u16>>>,
     max_connections: usize,
     tunnel_idle: Duration,
 }
@@ -164,6 +180,7 @@ impl TestUpstream {
             addr,
             root_cert_der,
             peers: Arc::default(),
+            authy_ports: Arc::default(),
             max_connections: MAX_CONNECTIONS,
             tunnel_idle: TUNNEL_IDLE,
         }
@@ -178,6 +195,15 @@ impl TestUpstream {
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
             .insert(source_port, peer);
+    }
+
+    /// The port the proxy asked for each time it opened a connection for [`AUTHY_HOST`]: what
+    /// it would have dialled had the stand-in not been substituted. Clones share the record.
+    pub fn authy_ports_dialled(&self) -> Vec<u16> {
+        self.authy_ports
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clone()
     }
 
     /// Serve at most this many connections at once (the default is the production limit).
@@ -258,6 +284,7 @@ pub async fn start(
 ) -> Result<ProxyHandle, ProxyError> {
     let dial = Dial {
         authy_at: cfg.upstream.as_ref().map(|u| u.addr),
+        authy_ports: cfg.upstream.as_ref().map(|u| Arc::clone(&u.authy_ports)),
         unrestricted: cfg.upstream.is_some(),
         own: Arc::default(),
     };
@@ -289,7 +316,9 @@ pub async fn start(
         events,
         backup: Mutex::new(CapturedBackup::default()),
         device_connected: Once::default(),
+        trust_working: Once::default(),
         device: Mutex::new(None),
+        refused: Throttle::new(REFUSED_EVERY),
         pretend_peers,
         tunnel_idle,
         stop: stop_rx,
@@ -338,8 +367,11 @@ struct Shared {
     events: mpsc::UnboundedSender<ProxyEvent>,
     backup: Mutex<CapturedBackup>,
     device_connected: Once,
-    /// The peer that first completed a TLS handshake for an intercepted host.
+    trust_working: Once,
+    /// The first peer other than this computer to complete a TLS handshake for an intercepted
+    /// host.
     device: Mutex<Option<IpAddr>>,
+    refused: Throttle,
     /// Tests only: source port -> pretended peer address.
     pretend_peers: Option<Arc<Mutex<HashMap<u16, IpAddr>>>>,
     tunnel_idle: Duration,
@@ -372,6 +404,16 @@ impl Shared {
     fn may_intercept(&self, peer: IpAddr) -> bool {
         self.lock_device()
             .is_none_or(|device| device == peer.to_canonical())
+    }
+
+    /// A peer was turned away from an intercepted host because another peer is the device.
+    /// Reported when the peer is a device itself (not this computer), and not too often. The
+    /// log line names neither the peer nor the host.
+    fn note_refused(&self, peer: IpAddr, local: IpAddr) {
+        if is_device(peer, local) && self.refused.ready() {
+            tracing::info!("refused a second device on an intercepted host");
+            self.emit(ProxyEvent::DeviceRefused);
+        }
     }
 
     /// The address the proxy treats this connection as coming from.
@@ -417,6 +459,31 @@ impl Once {
     }
 }
 
+/// True at most once in every `every`.
+struct Throttle {
+    every: Duration,
+    last: Mutex<Option<Instant>>,
+}
+
+impl Throttle {
+    fn new(every: Duration) -> Throttle {
+        Throttle {
+            every,
+            last: Mutex::new(None),
+        }
+    }
+
+    fn ready(&self) -> bool {
+        let now = Instant::now();
+        let mut last = self.last.lock().unwrap_or_else(PoisonError::into_inner);
+        if last.is_some_and(|last| now.duration_since(last) < self.every) {
+            return false;
+        }
+        *last = Some(now);
+        true
+    }
+}
+
 /// Is this peer the iPhone or iPad, rather than this computer talking to itself? Anything that
 /// is not loopback and is not the very address it connected to counts as a device.
 fn is_device(peer: IpAddr, local: IpAddr) -> bool {
@@ -433,17 +500,23 @@ enum Claim {
     Is,
     /// Another peer is the device. This one is turned away.
     Other,
+    /// There is no device yet and this peer is this computer itself: it is served, but it
+    /// does not become the device.
+    NotADevice,
 }
 
-/// The first peer to complete a handshake becomes the device and stays it.
-fn claim_device(device: &mut Option<IpAddr>, peer: IpAddr) -> Claim {
-    let peer = peer.to_canonical();
+/// The first peer to complete a handshake becomes the device and stays it, unless that peer
+/// is this computer talking to its own proxy (see [`is_device`]): that never takes the slot,
+/// so it cannot lock the iPhone or iPad out. `local` is the address the peer connected to.
+fn claim_device(device: &mut Option<IpAddr>, peer: IpAddr, local: IpAddr) -> Claim {
+    let canonical = peer.to_canonical();
     match *device {
-        None => {
-            *device = Some(peer);
+        None if is_device(peer, local) => {
+            *device = Some(canonical);
             Claim::Became
         }
-        Some(device) if device == peer => Claim::Is,
+        None => Claim::NotADevice,
+        Some(device) if device == canonical => Claim::Is,
         Some(_) => Claim::Other,
     }
 }
@@ -679,6 +752,7 @@ async fn connect(conn: Conn, req: Request<Incoming>) -> Response<ProxyBody> {
     if let Some(which) = intercepted(&host) {
         if !conn.shared.may_intercept(conn.peer()) {
             // Someone else is the device. Authy is theirs alone.
+            conn.shared.note_refused(conn.peer(), conn.local.ip());
             return plain(StatusCode::FORBIDDEN);
         }
         tokio::spawn(intercept(conn, req, which));
@@ -844,11 +918,14 @@ async fn intercept(conn: Conn, req: Request<Incoming>, connect_host: Intercepted
         }
         Some(Err(_)) | None => return, // stalled, or the proxy stopped
     };
-    let claim = claim_device(&mut shared.lock_device(), conn.peer());
-    match claim {
-        Claim::Became => shared.emit(ProxyEvent::TrustWorking),
-        Claim::Is => {}
-        Claim::Other => return, // lost a race with the device; see `connect`
+    let claim = claim_device(&mut shared.lock_device(), conn.peer(), conn.local.ip());
+    if claim == Claim::Other {
+        // Lost a race with the device; see `connect`.
+        shared.note_refused(conn.peer(), conn.local.ip());
+        return;
+    }
+    if shared.trust_working.first() {
+        shared.emit(ProxyEvent::TrustWorking);
     }
 
     let link = AuthyLink::default();
@@ -877,6 +954,10 @@ async fn intercepted_request(
     let res = if method == Method::CONNECT {
         // A proxy request inside the decrypted stream goes nowhere.
         plain(StatusCode::METHOD_NOT_ALLOWED)
+    } else if !conn.shared.may_intercept(conn.peer()) {
+        // A connection this computer opened before there was a device: the device has
+        // arrived since, and the intercepted hosts are now its alone.
+        plain(StatusCode::FORBIDDEN)
     } else {
         match which {
             Intercepted::Check if method == Method::GET || method == Method::HEAD => {
@@ -1071,6 +1152,8 @@ impl<T: Unpin> Body for Holding<T> {
 struct Dial {
     /// Test upstream: where connections for [`AUTHY_HOST`] really go.
     authy_at: Option<SocketAddr>,
+    /// Test upstream: the port asked for on each connection for [`AUTHY_HOST`].
+    authy_ports: Option<Arc<Mutex<Vec<u16>>>>,
     /// Test upstream: no destination is refused (test servers live on loopback).
     unrestricted: bool,
     /// Addresses of this computer's own interfaces, as far as the proxy knows them.
@@ -1103,34 +1186,61 @@ impl Dial {
                 .contains(&ip)
     }
 
-    /// Resolve and connect, within [`DIAL_TIMEOUT`] overall. Every resolved address is checked
-    /// and only a checked address is dialled, so a name cannot smuggle in a refused address.
+    /// Resolve and connect, within [`DIAL_TIMEOUT`] overall and [`CONNECT_TIMEOUT`] for each
+    /// address. Every resolved address is checked and only a checked address is dialled, so a
+    /// name cannot smuggle in a refused address.
     async fn connect(&self, host: &str, port: u16) -> io::Result<TcpStream> {
-        tokio::time::timeout(DIAL_TIMEOUT, self.connect_unbounded(host, port))
-            .await
-            .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "connect timed out"))?
+        within_dial_timeout(self.connect_unbounded(host, port)).await
     }
 
     async fn connect_unbounded(&self, host: &str, port: u16) -> io::Result<TcpStream> {
         let host = bare_host(host);
         if host.eq_ignore_ascii_case(AUTHY_HOST) {
+            if let Some(ports) = &self.authy_ports {
+                ports
+                    .lock()
+                    .unwrap_or_else(PoisonError::into_inner)
+                    .push(port);
+            }
             if let Some(addr) = self.authy_at {
-                return connect_to(addr).await;
+                return first_reachable([addr], |_| true, connect_to).await;
             }
         }
-        let mut last = io::Error::new(io::ErrorKind::NotFound, "no address");
-        for addr in tokio::net::lookup_host((host, port)).await? {
-            if !self.allows(addr.ip()) {
-                last = io::Error::new(io::ErrorKind::PermissionDenied, "destination refused");
-                continue;
-            }
-            match connect_to(addr).await {
-                Ok(stream) => return Ok(stream),
-                Err(e) => last = e,
-            }
-        }
-        Err(last)
+        let addrs = tokio::net::lookup_host((host, port)).await?;
+        first_reachable(addrs, |ip| self.allows(ip), connect_to).await
     }
+}
+
+async fn within_dial_timeout<T>(dial: impl Future<Output = io::Result<T>>) -> io::Result<T> {
+    tokio::time::timeout(DIAL_TIMEOUT, dial)
+        .await
+        .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "connect timed out"))?
+}
+
+/// Try each allowed address in turn, giving each [`CONNECT_TIMEOUT`], and return the first
+/// connection. The error is the last one met: `PermissionDenied` for an address that is not
+/// allowed, `TimedOut` for one that did not answer, `NotFound` when there was no address.
+async fn first_reachable<T, F>(
+    addrs: impl IntoIterator<Item = SocketAddr>,
+    allowed: impl Fn(IpAddr) -> bool,
+    connect: impl Fn(SocketAddr) -> F,
+) -> io::Result<T>
+where
+    F: Future<Output = io::Result<T>>,
+{
+    let mut last = io::Error::new(io::ErrorKind::NotFound, "no address");
+    for addr in addrs {
+        if !allowed(addr.ip()) {
+            last = io::Error::new(io::ErrorKind::PermissionDenied, "destination refused");
+            continue;
+        }
+        match tokio::time::timeout(CONNECT_TIMEOUT, connect(addr)).await {
+            Ok(Ok(stream)) => return Ok(stream),
+            Ok(Err(e)) => last = e,
+            Err(_) => last = io::Error::new(io::ErrorKind::TimedOut, "connect timed out"),
+        }
+    }
+    Err(last)
 }
 
 /// Addresses that are never a legitimate destination for a device's traffic through this
@@ -1394,17 +1504,111 @@ mod tests {
 
     #[test]
     fn the_first_peer_to_complete_a_handshake_is_the_device_for_good() {
+        let local = ip("192.168.1.20");
         let mut device = None;
-        assert_eq!(claim_device(&mut device, ip("192.168.1.57")), Claim::Became);
-        assert_eq!(claim_device(&mut device, ip("192.168.1.57")), Claim::Is);
+        let mut claim = |peer: &str| claim_device(&mut device, ip(peer), local);
+        assert_eq!(claim("192.168.1.57"), Claim::Became);
+        assert_eq!(claim("192.168.1.57"), Claim::Is);
         assert_eq!(
-            claim_device(&mut device, ip("::ffff:192.168.1.57")),
+            claim("::ffff:192.168.1.57"),
             Claim::Is,
             "the same peer over a mapped address"
         );
-        assert_eq!(claim_device(&mut device, ip("192.168.1.99")), Claim::Other);
-        assert_eq!(claim_device(&mut device, ip("127.0.0.1")), Claim::Other);
+        assert_eq!(claim("192.168.1.99"), Claim::Other);
+        assert_eq!(claim("127.0.0.1"), Claim::Other);
+        assert_eq!(claim("192.168.1.20"), Claim::Other);
         assert_eq!(device, Some(ip("192.168.1.57")), "never replaced");
+    }
+
+    #[test]
+    fn this_computer_never_becomes_the_device() {
+        let local = ip("192.168.1.20");
+        let mut device = None;
+        for own in [
+            "127.0.0.1",
+            "::1",
+            "::ffff:127.0.0.1",
+            "192.168.1.20",
+            "::ffff:192.168.1.20",
+        ] {
+            assert_eq!(
+                claim_device(&mut device, ip(own), local),
+                Claim::NotADevice,
+                "{own}"
+            );
+            assert_eq!(device, None, "{own} did not take the slot");
+        }
+        // The iPhone or iPad arrives afterwards and is not locked out.
+        assert_eq!(
+            claim_device(&mut device, ip("192.168.1.57"), local),
+            Claim::Became
+        );
+        assert_eq!(
+            claim_device(&mut device, ip("127.0.0.1"), local),
+            Claim::Other,
+            "and from then on this computer is turned away like anyone else"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_refusal_is_reported_at_most_once_in_two_seconds() {
+        let throttle = Throttle::new(REFUSED_EVERY);
+        assert_eq!(REFUSED_EVERY, Duration::from_secs(2));
+        assert!(throttle.ready());
+        assert!(!throttle.ready());
+        tokio::time::advance(Duration::from_millis(1999)).await;
+        assert!(!throttle.ready());
+        tokio::time::advance(Duration::from_millis(1)).await;
+        assert!(throttle.ready());
+        assert!(!throttle.ready());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_blackholed_address_does_not_starve_the_next_one() {
+        let blackhole: SocketAddr = "[2001:db8::1]:443".parse().unwrap();
+        let good: SocketAddr = "203.0.113.9:443".parse().unwrap();
+        // An address that swallows packets never answers; the good one answers at once.
+        let connect = move |addr: SocketAddr| async move {
+            if addr == good {
+                Ok(addr)
+            } else {
+                std::future::pending::<io::Result<SocketAddr>>().await
+            }
+        };
+
+        let started = Instant::now();
+        let reached =
+            within_dial_timeout(first_reachable([blackhole, good], |_| true, connect)).await;
+        assert_eq!(reached.unwrap(), good, "the second address is still tried");
+        assert_eq!(started.elapsed(), CONNECT_TIMEOUT);
+        assert_eq!(CONNECT_TIMEOUT, Duration::from_secs(5));
+
+        // Two dead addresses still leave time for a third.
+        let other_blackhole: SocketAddr = "[2001:db8::2]:443".parse().unwrap();
+        let reached = within_dial_timeout(first_reachable(
+            [blackhole, other_blackhole, good],
+            |_| true,
+            connect,
+        ))
+        .await;
+        assert_eq!(reached.unwrap(), good);
+
+        // Nothing answers: the overall budget still ends it.
+        let started = Instant::now();
+        let none = within_dial_timeout(first_reachable(
+            std::iter::repeat_n(blackhole, 10),
+            |_| true,
+            connect,
+        ))
+        .await;
+        assert_eq!(none.unwrap_err().kind(), io::ErrorKind::TimedOut);
+        assert_eq!(started.elapsed(), DIAL_TIMEOUT);
+
+        // A refused address is never dialled, and says so when nothing else worked.
+        let refused = first_reachable([good], |_| false, connect).await;
+        assert_eq!(refused.unwrap_err().kind(), io::ErrorKind::PermissionDenied);
+        let empty = first_reachable([], |_| true, connect).await;
+        assert_eq!(empty.unwrap_err().kind(), io::ErrorKind::NotFound);
     }
 
     #[test]
@@ -1524,6 +1728,7 @@ mod tests {
     fn production_refuses_loopback_destinations() {
         let production = Dial {
             authy_at: None,
+            authy_ports: None,
             unrestricted: false,
             own: Arc::default(),
         };
@@ -1603,6 +1808,7 @@ mod tests {
 
         let test = Dial {
             authy_at: None,
+            authy_ports: None,
             unrestricted: true,
             own: Arc::default(),
         };

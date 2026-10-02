@@ -128,7 +128,9 @@ fn step_for(event: &ProxyEventDto) -> Option<Step> {
         ProxyEventDto::DeviceConnected => Some(Step::Certificate),
         ProxyEventDto::TrustWorking => Some(Step::Authy),
         ProxyEventDto::BackupCaptured { .. } => Some(Step::Unlock),
-        ProxyEventDto::TlsRejected | ProxyEventDto::AuthyError { .. } => None,
+        ProxyEventDto::TlsRejected
+        | ProxyEventDto::AuthyError { .. }
+        | ProxyEventDto::DeviceRefused => None,
     }
 }
 
@@ -933,6 +935,7 @@ mod tests {
         );
         assert_eq!(j(ProxyEvent::TrustWorking), r#"{"kind":"trustWorking"}"#);
         assert_eq!(j(ProxyEvent::TlsRejected), r#"{"kind":"tlsRejected"}"#);
+        assert_eq!(j(ProxyEvent::DeviceRefused), r#"{"kind":"deviceRefused"}"#);
         assert_eq!(
             j(ProxyEvent::BackupCaptured { count: 4 }),
             r#"{"kind":"backupCaptured","count":4}"#

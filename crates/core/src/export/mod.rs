@@ -15,7 +15,7 @@ pub mod onepassword;
 pub mod plain;
 pub mod twofas;
 
-pub use google::google_migration_qrs;
+pub use google::{google_migration_qrs, google_unsupported};
 
 /// Everything except RFC 3986 unreserved characters is percent-encoded, so a name with
 /// `,` `"` `+` `:` `&` `/` emoji or a newline survives inside an otpauth label or query value.

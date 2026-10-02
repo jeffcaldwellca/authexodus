@@ -69,6 +69,7 @@ pub enum ProxyEventDto {
     TlsRejected,
     BackupCaptured { count: usize },
     AuthyError { status: u16, path: String },
+    DeviceRefused,
 }
 
 impl From<&ProxyEvent> for ProxyEventDto {
@@ -82,6 +83,7 @@ impl From<&ProxyEvent> for ProxyEventDto {
                 status: *status,
                 path: path.clone(),
             },
+            ProxyEvent::DeviceRefused => ProxyEventDto::DeviceRefused,
         }
     }
 }

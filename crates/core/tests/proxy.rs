@@ -1669,7 +1669,11 @@ async fn a_second_peer_cannot_replace_the_captured_backup() {
         let (status, _) = connect_on(rig.connect_as(STRAY).await, host, 443).await;
         assert_eq!(status, "HTTP/1.1 403 Forbidden", "{host}");
     }
-    assert_eq!(rig.drain().await, []);
+    assert_eq!(
+        rig.drain().await,
+        [ProxyEvent::DeviceRefused],
+        "two refusals in a moment are reported once"
+    );
     assert_eq!(rig.handle.backup().tokens.len(), 3);
     assert_eq!(rig.handle.backup().tokens[0].unique_id, "5000");
     assert_eq!(
@@ -1713,6 +1717,62 @@ async fn authy_is_reached_on_its_own_port_whatever_the_connect_says() {
     assert!(head.starts_with("HTTP/1.1 200"), "{head}");
     assert_eq!(body, br#"{"success":true}"#);
     assert_eq!(rig.drain().await, [ProxyEvent::TrustWorking]);
+    // What the proxy would have dialled without a stand-in: Authy's own port, not the 8443
+    // the device named.
+    assert_eq!(
+        rig.upstream.as_ref().unwrap().authy_ports_dialled(),
+        [443],
+        "Authy is dialled on 443 whatever the CONNECT said"
+    );
+    rig.handle.shutdown().await;
+}
+
+#[tokio::test]
+async fn this_computer_cannot_take_the_device_slot() {
+    const PHONE: &str = "192.168.1.57";
+    const OTHER: &str = "192.168.1.99";
+    let mut rig = rig().await;
+    let ca = rig.ca_der.clone();
+
+    // Something on this computer (loopback) loads the check page through its own proxy and
+    // trusts the root. It is served, but it is not the device.
+    let (head, _) = raw_https(rig.proxy, CHECK_HOST, 443, &[&ca], "GET", "/").await;
+    assert!(head.starts_with("HTTP/1.1 200"), "{head}");
+    assert_eq!(rig.drain().await, [ProxyEvent::TrustWorking]);
+
+    // The phone arrives afterwards. It is not locked out: it becomes the device.
+    let (status, tcp) = connect_on(rig.connect_as(PHONE).await, AUTHY_HOST, 443).await;
+    assert_eq!(status, "HTTP/1.1 200 OK", "the phone is not locked out");
+    let (head, _) = https_over(
+        tcp,
+        AUTHY_HOST,
+        &[&ca],
+        "GET",
+        "/json/users/1/authenticator_tokens",
+    )
+    .await;
+    assert!(head.starts_with("HTTP/1.1 200"), "{head}");
+    assert_eq!(
+        rig.wait_for(|e| matches!(e, ProxyEvent::BackupCaptured { .. }))
+            .await,
+        [
+            ProxyEvent::DeviceConnected,
+            ProxyEvent::BackupCaptured { count: 3 }
+        ],
+        "trust was already announced, once"
+    );
+
+    // Now that there is a device, this computer is turned away like anyone else, silently:
+    // it is not "another device".
+    let (status, _) = connect_via(rig.proxy, AUTHY_HOST, 443).await;
+    assert_eq!(status, "HTTP/1.1 403 Forbidden");
+    assert_eq!(rig.drain().await, []);
+
+    // Another device is turned away too, and that is reported.
+    let (status, _) = connect_on(rig.connect_as(OTHER).await, AUTHY_HOST, 443).await;
+    assert_eq!(status, "HTTP/1.1 403 Forbidden");
+    assert_eq!(rig.drain().await, [ProxyEvent::DeviceRefused]);
+    assert_eq!(rig.handle.backup().tokens.len(), 3);
     rig.handle.shutdown().await;
 }
 

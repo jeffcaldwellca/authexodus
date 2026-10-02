@@ -1,7 +1,6 @@
-use authexodus_core::export::google::{
-    google_unsupported, migration_urls, DigitCount, MigrationPayload, OtpType,
-};
-use authexodus_core::export::google_migration_qrs;
+use authexodus_core::export::google::{migration_urls, DigitCount, MigrationPayload, OtpType};
+// Both are re-exported at `export::`, where the shell takes them from.
+use authexodus_core::export::{google_migration_qrs, google_unsupported};
 use authexodus_core::types::{Secret, Token};
 use base64::Engine;
 use data_encoding::BASE32_NOPAD;
