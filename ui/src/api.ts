@@ -1,10 +1,11 @@
 export type Device = "iphone" | "ipad";
 export type Step = "welcome" | "connect" | "certificate" | "authy" | "unlock" | "destination" | "verify" | "cleanup" | "done";
-export type AppState = { step: Step; device: Device | null; resumeCleanup: boolean; version: string };
+export type AppState = { step: Step; device: Device | null; resumeCleanup: boolean; version: string; releasesUrl: string };
 export type ProxyInfo = { addresses: { ip: string; label: string }[]; ip: string; port: number; certUrl: string; certQrSvg: string; checkUrl: string };
 export type ProxyEvent =
   | { kind: "deviceConnected" } | { kind: "trustWorking" } | { kind: "tlsRejected" }
-  | { kind: "backupCaptured"; count: number } | { kind: "authyError"; status: number; path: string };
+  | { kind: "backupCaptured"; count: number } | { kind: "authyError"; status: number; path: string }
+  | { kind: "deviceRefused" };                               // another device tried to reach Authy after one was accepted
 export type TokenView = { id: string; title: string; username: string | null };
 export type UnlockSummary = { tokens: TokenView[]; invalid: { name: string; reason: "notBase32" | "tooShort" }[]; native: { name: string }[] };
 export type Destination = "bitwarden" | "onePassword" | "twoFas" | "aegis" | "googleAuthenticator" | "protonAuthenticator" | "plainText";
@@ -20,11 +21,13 @@ export type ApplyReport = { attached: number; created: number; skipped: number; 
 export interface Api {
   getState(): Promise<AppState>;
   setDevice(device: Device): Promise<void>;
-  startProxy(ip?: string): Promise<ProxyInfo>;
+  startProxy(ip?: string): Promise<ProxyInfo>;             // idempotent; rejects a different address once a backup is captured
+  restartProxy(ip?: string): Promise<ProxyInfo>;           // explicit start-over: discards the capture, forgets the accepted device
   onProxyEvent(cb: (e: ProxyEvent) => void): () => void;
   unlock(password: string): Promise<UnlockSummary | { error: "wrongPassword" }>;
   tokenQr(id: string): Promise<string>;                      // SVG
-  googleMigrationQrs(): Promise<string[]>;                   // SVGs, 10 tokens each
+  googleMigrationQrs(): Promise<string[]>;                   // SVGs, at most 10 tokens each
+  googleUnsupported(): Promise<string[]>;                    // titles the Google QR cannot carry
   exportFile(dest: Destination): Promise<{ saved: string } | { cancelled: true }>;  // native save dialog
   liveCodes(): Promise<LiveCode[]>;
   bwPrepare(): Promise<void>;                                // download + verify the CLI
