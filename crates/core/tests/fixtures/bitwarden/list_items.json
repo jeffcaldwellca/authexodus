@@ -1,0 +1,11 @@
+[
+  {"object":"item","id":"11111111-0000-4000-8000-000000000001","organizationId":null,"folderId":null,"type":1,"reprompt":0,"name":"Acme Storefront","notes":null,"favorite":false,
+   "login":{"uris":[{"match":null,"uri":"https://admin.acmestore.example/login"},{"match":null,"uri":"acmestore.example/account"}],"username":"owner@acme.example","password":"not-a-real-password","totp":"otpauth://totp/Acme?secret=JBSWY3DPEHPK3PXP"},
+   "collectionIds":[],"revisionDate":"2026-01-01T00:00:00.000Z"},
+  {"object":"item","id":"11111111-0000-4000-8000-000000000002","folderId":"f1","type":1,"name":"Router","notes":null,
+   "login":{"uris":[{"match":null,"uri":"192.168.0.1"},{"match":null,"uri":"http://10.0.0.1:8080/admin"}],"username":"","password":"x","totp":null}},
+  {"object":"item","id":"11111111-0000-4000-8000-000000000003","type":1,"name":"No Username","login":{"password":"x"}},
+  {"object":"item","id":"11111111-0000-4000-8000-000000000004","type":3,"name":"A Card","card":{"number":"0000"}},
+  {"object":"item","id":"11111111-0000-4000-8000-000000000005","type":2,"name":"A Note","secureNote":{"type":0}},
+  {"object":"item","id":"11111111-0000-4000-8000-000000000006","type":1,"name":"Blank Code","login":{"uris":[{"uri":null},{"uri":""}],"username":"  pat@example.test  ","totp":""}}
+]
