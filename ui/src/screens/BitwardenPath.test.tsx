@@ -75,14 +75,23 @@ describe("the download", () => {
     expect(screen.getByText(en.common.untested(t.name))).toBeInTheDocument();
   });
 
-  it("shows the progress lines as they arrive, from the first one", async () => {
-    const { api, user } = await toIntro({ hold: { bwPrepare: true }, prepareProgress: ["Fetching the tool", "Checking it", "Unpacking it"] });
+  it("shows how far the download is, from the very first line, one line at a time", async () => {
+    const { api, user } = await toIntro({ hold: { bwPrepare: true }, prepareProgress: ["Downloading… 0 of 44 MB"] });
     await user.click(screen.getByRole("button", { name: t.prepare }));
-    const log = await screen.findByRole("log", { name: t.progressLabel });
-    await waitFor(() => expect(within(log).getAllByRole("listitem").map((li) => li.textContent)).toEqual(["Fetching the tool", "Checking it", "Unpacking it"]));
+    // The first line was sent the moment the download began: it must not be missed.
+    const line = await screen.findByRole("status", { name: t.progressLabel });
+    await waitFor(() => expect(line).toHaveTextContent("Downloading… 0 of 44 MB"));
     expect(screen.getByText(t.preparing)).toBeInTheDocument();
+    // The download reports again and again: the line is replaced, not piled up.
+    act(() => api.emitBwProgress("Downloading… 21 of 44 MB"));
+    expect(line).toHaveTextContent(/^Downloading… 21 of 44 MB$/);
+    act(() => api.emitBwProgress("Checking the download…"));
+    expect(line).toHaveTextContent(/^Checking the download…$/);
     act(() => api.release("bwPrepare"));
     await screen.findByRole("heading", { level: 1, name: t.loginTitle });
+    // Nothing is still listening once the download is over.
+    act(() => api.emitBwProgress("late line"));
+    expect(screen.queryByText("late line")).not.toBeInTheDocument();
   });
 
   it("can be cancelled, and then says so instead of reporting a failure", async () => {
@@ -113,12 +122,14 @@ describe("the download", () => {
   });
 
   it("a download that fails says to check the connection, with the shell's reason", async () => {
-    const { user } = await toIntro({ failures: { bwPrepare: [new ApiError("bw_download_failed", "github.com could not be reached.")] } });
+    const sentence = "The Bitwarden tool could not be downloaded. Check this computer's internet connection and try again.";
+    const { user } = await toIntro({ failures: { bwPrepare: [new ApiError("bw_download_failed", sentence)] } });
     await user.click(screen.getByRole("button", { name: t.prepare }));
     const alert = await screen.findByRole("alert");
     expect(within(alert).getByText(by.bw_download_failed.title(iphone))).toBeInTheDocument();
-    expect(within(alert).getByText("github.com could not be reached.")).toBeInTheDocument();
-    expect(within(alert).getByText(by.bw_download_failed.advice(iphone))).toBeInTheDocument();
+    expect(within(alert).getByText(sentence)).toBeInTheDocument();
+    // The shell's sentence already says what to do; the screen does not say it a second time.
+    expect(alert.textContent!.match(/internet connection/g)).toHaveLength(1);
     // Trying again works.
     await user.click(screen.getByRole("button", { name: t.prepare }));
     await screen.findByRole("heading", { level: 1, name: t.loginTitle });
@@ -153,13 +164,26 @@ describe("sign-in rejections", () => {
   });
 
   it("Bitwarden being out of reach is the one case that mentions the internet connection", async () => {
-    const h = await toLogin({ failures: { bwLogin: [new ApiError("bw_unreachable", "Bitwarden's server did not answer.")] } });
+    const sentence = "Bitwarden's server could not be reached, or it had a problem. Check this computer's internet connection, wait a moment, and try again.";
+    const h = await toLogin({ failures: { bwLogin: [new ApiError("bw_unreachable", sentence)] } });
     await typeLogin(h);
     await h.user.click(screen.getByRole("button", { name: t.signIn }));
     const alert = await screen.findByRole("alert");
     expect(within(alert).getByText(by.bw_unreachable.title(iphone))).toBeInTheDocument();
-    expect(within(alert).getByText("Bitwarden's server did not answer.")).toBeInTheDocument();
-    expect(by.bw_unreachable.advice(iphone)).toMatch(/internet connection/);
+    expect(within(alert).getByText(sentence)).toBeInTheDocument();
+    expect(alert.textContent!.match(/internet connection/g)).toHaveLength(1);
+  });
+
+  it("a problem the Bitwarden tool reports keeps the screen's own title and the shell's sentence", async () => {
+    const sentence = "The Bitwarden tool reported a problem while signing in. Check what you typed and try again.";
+    const h = await toLogin({ failures: { bwLogin: [new ApiError("bw_failed", sentence)] } });
+    await typeLogin(h);
+    await h.user.click(screen.getByRole("button", { name: t.signIn }));
+    const alert = await screen.findByRole("alert");
+    expect(within(alert).getByText(t.loginFailed)).toBeInTheDocument();
+    expect(within(alert).getByText(sentence)).toBeInTheDocument();
+    // The catch-all advice belongs to a rejection with no code, not to one the shell explained.
+    expect(within(alert).queryByText(t.loginFailedAdvice)).not.toBeInTheDocument();
   });
 
   it("a sign-in in progress can be cancelled, and the password is dropped", async () => {
@@ -273,7 +297,7 @@ describe("sign-in with an API key", () => {
     await h.user.type(screen.getByLabelText(t.password), "master pw");
     await h.user.click(screen.getByRole("button", { name: t.signIn }));
     const alert = await screen.findByRole("alert");
-    expect(within(alert).getByText(by.bw_failed.title(iphone))).toBeInTheDocument();
+    expect(within(alert).getByText(t.loginFailed)).toBeInTheDocument();
     expect(within(alert).getByText("Bitwarden's tool stopped unexpectedly.")).toBeInTheDocument();
     expect(secretsOnPage("master pw", clientId, clientSecret)).toBe(false);
   });
@@ -434,6 +458,53 @@ describe("attaching a code to a login by hand", () => {
     await user.click(within(alert).getByRole("button", { name: en.common.tryAgain }));
     expect(await within(dialog).findByRole("list", { name: t.picker.listLabel })).toBeInTheDocument();
     expect(within(dialog).queryByRole("alert")).not.toBeInTheDocument();
+  });
+});
+
+describe("an apply the shell refuses", () => {
+  it("says why in the shell's words, does not claim anything stopped part-way, and lets the choices be changed", async () => {
+    const sentence = "The same Bitwarden login was chosen for two accounts, and a login can hold only one code. Nothing was changed.";
+    const { api, user } = await toReview({ failures: { bwApply: [new ApiError("bw_failed", sentence)] } });
+    await user.selectOptions(screen.getByRole("combobox", { name: t.actionFor("Google") }), t.skip);
+    await user.click(screen.getByRole("button", { name: t.apply }));
+
+    await screen.findByRole("heading", { level: 1, name: t.reportStoppedTitle });
+    const alert = screen.getByRole("alert");
+    expect(within(alert).getByText(t.applyRejected)).toBeInTheDocument();
+    expect(within(alert).getByText(sentence)).toBeInTheDocument();
+    expect(screen.queryByText(en.failures.bitwardenServer.title)).not.toBeInTheDocument();
+    expect(screen.queryByText(en.failures.bitwardenServer.body)).not.toBeInTheDocument();
+
+    await user.click(within(alert).getByRole("button", { name: t.backToReview }));
+    await screen.findByRole("heading", { level: 1, name: t.reviewTitle });
+    // Back on the matches with every choice as it was.
+    expect(screen.getByRole("combobox", { name: t.actionFor("Google") })).toHaveValue("skip");
+    expect(screen.getByRole("combobox", { name: t.actionFor("GitHub") })).toHaveValue("attach:v-gh");
+    await user.click(screen.getByRole("button", { name: t.apply }));
+    await screen.findByRole("heading", { level: 1, name: t.reportTitle });
+    expect(api.calls.filter((c) => c.method === "bwApply")).toHaveLength(2);
+  });
+
+  it("a login chosen on one row cannot be chosen again from another row's menu", async () => {
+    // Both accounts are offered the same login, as happens when two accounts share a name.
+    const shared = { itemId: "v-shared", name: "Shared login", username: "sam", hasCode: false };
+    const twice: Proposal[] = [
+      { tokenId: "gh", confidence: "low", decision: { kind: "createNew" }, candidates: [shared] },
+      { tokenId: "go", confidence: "low", decision: { kind: "createNew" }, candidates: [shared] },
+    ];
+    const { api, user } = await toReview({ summary: { ...summary, tokens: summary.tokens.slice(0, 2) }, proposals: twice, vault: [shared] });
+    const github = screen.getByRole("combobox", { name: t.actionFor("GitHub") });
+    const google = screen.getByRole("combobox", { name: t.actionFor("Google") });
+    await user.selectOptions(github, t.attach("Shared login", "sam"));
+
+    const taken = within(google).getByRole("option", { name: t.attachTaken("Shared login", "sam", "GitHub") });
+    expect(taken).toBeDisabled();
+    expect(within(github).getByRole("option", { name: t.attach("Shared login", "sam") })).toBeEnabled();
+    await user.selectOptions(google, t.createNew);
+    await user.click(screen.getByRole("button", { name: t.apply }));
+    await screen.findByRole("heading", { level: 1, name: t.reportTitle });
+    const sent = api.calls.find((c) => c.method === "bwApply")?.args[0] as { decision: { kind: string; itemId?: string } }[];
+    expect(sent.filter((x) => x.decision.itemId === "v-shared")).toHaveLength(1);
   });
 });
 

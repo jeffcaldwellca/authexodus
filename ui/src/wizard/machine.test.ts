@@ -334,6 +334,12 @@ describe("wizard machine", () => {
       expect(load({ deviceConnected: true, trustWorking: true, captured: 12 })).toMatchObject({ step: "unlock", captured: 12, reachedAuthy: true });
     });
 
+    it("a capture holding only accounts that cannot move counts none, and is still the unlock step", () => {
+      // The shell's count is of movable accounts; its step says a backup is waiting.
+      expect(load({ deviceConnected: true, trustWorking: true, captured: 0 }, { step: "unlock" })).toMatchObject({ step: "unlock", captured: 0 });
+      expect(load({ deviceConnected: true, trustWorking: true, captured: 0 }, { step: "authy" }).step).toBe("authy");
+    });
+
     it("an unlocked backup is the destination step, with the names and the summary", () => {
       const s = load({ deviceConnected: true, trustWorking: true, captured: 3, summary: full });
       expect(s).toMatchObject({ step: "destination", summary: full, cantMove: { native: ["Twitch"], invalid: ["Old VPN"] }, moved: false });

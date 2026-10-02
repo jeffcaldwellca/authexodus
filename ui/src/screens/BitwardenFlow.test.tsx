@@ -106,7 +106,12 @@ describe("bitwarden path", () => {
     const { user } = await toReview({ applyResults: [new Error("session expired")] });
     await user.selectOptions(screen.getByRole("combobox", { name: t.actionFor("Google") }), t.skip);
     await user.click(screen.getByRole("button", { name: t.apply }));
-    await screen.findByText(en.failures.bitwardenServer.detail("session expired"));
+    // Refused outright, with no code: the raw reason is shown, not a claim that it stopped part-way.
+    const alert = await screen.findByRole("alert");
+    expect(within(alert).getByText(t.applyRejected)).toBeInTheDocument();
+    expect(within(alert).getByText(en.problems.reason("session expired"))).toBeInTheDocument();
+    expect(screen.getByRole("heading", { level: 1, name: t.reportStoppedTitle })).toBeInTheDocument();
+    expect(screen.queryByText(en.failures.bitwardenServer.title)).not.toBeInTheDocument();
     expect(screen.getByRole("button", { name: t.runAgain })).toBeInTheDocument();
   });
 

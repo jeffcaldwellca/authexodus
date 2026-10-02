@@ -11,57 +11,57 @@ const KEYCHAIN_BY_HAND = "open Keychain Access on this Mac, search for authexodu
 const plural = (n: number, one: string, many: string) => `${n} ${n === 1 ? one : many}`;
 
 /**
- * What to say for each code the shell can reject with: a title, and what to do next (empty
- * when the shell's own sentence says it all). Both are given the device's name.
+ * What the screen adds for each code the shell can reject with. The shell's own sentence is
+ * always shown as well, and it already says what went wrong and usually what to do, so this
+ * table stays short:
+ *
+ * - `title` names the problem. Empty means the screen's own title is used (what it was trying
+ *   to do), because the code covers too many different things to name here.
+ * - `advice` is only what the sentence cannot know: why the rule exists, or where on this
+ *   screen to go next. Empty means the sentence says it all.
  */
 const PROBLEMS: Record<ErrorCode, { title: (d: string) => string; advice: (d: string) => string }> = {
   address_changed: {
     title: (d: string) => `This Mac's network address changed. Your ${d} can no longer reach it.`,
-    advice: (d: string) => `Restart the connection, then type the new Server and Port on your ${d}.`,
+    advice: () => "",
   },
   address_not_private: {
     title: () => "That address is not on a home or office network.",
-    advice: () => "This app only listens on the kind of address a home or office router hands out, so that nobody outside your network can reach it. Choose another address, or join your home Wi-Fi and try again.",
+    advice: () => "This app only listens on the kind of address a home or office router hands out, so that nobody outside your network can reach it.",
   },
   no_private_address: {
     title: () => "This Mac is not on a home or office network.",
-    advice: () => "This app only listens on the kind of address a home or office router hands out. Join your home or office Wi-Fi on this Mac, switch off any VPN, then try again.",
+    advice: () => "This app only listens on the kind of address a home or office router hands out, so that nobody outside your network can reach it. A VPN on this Mac can hide that address: switch it off and try again.",
   },
   listen_failed: {
     title: (d: string) => `This computer could not start listening for your ${d}.`,
-    advice: () => "Another program may already be using the connection this app needs. Make sure no other copy of authexodus is open, then try again.",
+    advice: () => "",
   },
   keychain_failed: {
     title: () => "The Mac's Keychain would not store the certificate's secret key.",
-    advice: () => `If macOS asks for permission to use the Keychain, choose Allow. If it keeps failing, an old item may be in the way: ${KEYCHAIN_BY_HAND}, then try again.`,
+    advice: () => "If macOS asks for permission to use the Keychain, choose Allow.",
   },
   capture_would_be_lost: {
     title: () => "The address can't change without restarting the connection.",
-    advice: () => "A backup is already captured, and a restart discards it.",
+    advice: () => "",
   },
   bad_email: { title: () => "Check the email address.", advice: () => "" },
   bad_server_url: { title: () => "Check the server address.", advice: () => "" },
-  bw_download_failed: {
-    title: () => "The download did not work.",
-    advice: () => "Check this computer's internet connection and try again.",
-  },
+  bw_download_failed: { title: () => "The download did not work.", advice: () => "" },
   bw_checksum_mismatch: {
     title: () => "The download did not match what Bitwarden published.",
     advice: () => "Nothing was run. Try again later; if it keeps happening, use Save a file instead.",
   },
-  bw_unreachable: {
-    title: () => "Bitwarden could not be reached.",
-    advice: () => "Check this computer's internet connection, and the server address if you use your own server, then try again.",
-  },
+  bw_unreachable: { title: () => "Bitwarden could not be reached.", advice: () => "" },
   bw_session_expired: {
     title: () => "Bitwarden signed you out. Sign in again and your choices will still be here.",
     advice: () => "",
   },
   bw_vault_read_failed: {
-    title: () => "You are signed in, but your vault could not be read.",
-    advice: () => "Nothing in Bitwarden has been changed. Try again.",
+    title: () => "Your Bitwarden vault could not be read.",
+    advice: () => "Nothing in Bitwarden has been changed.",
   },
-  bw_failed: { title: () => "Bitwarden reported a problem.", advice: () => "" },
+  bw_failed: { title: () => "", advice: () => "" },
   not_unlocked: {
     title: () => "Your codes are not unlocked any more.",
     advice: () => "Unlock them again with your Authy backup password.",
@@ -70,22 +70,10 @@ const PROBLEMS: Record<ErrorCode, { title: (d: string) => string; advice: (d: st
     title: () => "There is no captured backup to unlock.",
     advice: (d: string) => `Capture it again: that restarts the connection, and you then close and open Authy on your ${d}.`,
   },
-  export_failed: {
-    title: () => "The codes could not be put into this form.",
-    advice: () => "Try again, or go back and choose another way to move them.",
-  },
-  cleanup_keychain_failed: {
-    title: () => "This computer could not finish cleaning up.",
-    advice: () => `You can finish it by hand: ${KEYCHAIN_BY_HAND}.`,
-  },
-  cleanup_failed: {
-    title: () => "This computer could not finish cleaning up.",
-    advice: () => "Try again. If it keeps failing, quit authexodus and open it again: it opens on the clean-up steps and tries once more.",
-  },
-  internal: {
-    title: () => "Something went wrong inside the app.",
-    advice: () => "Try again. If it keeps happening, quit authexodus and open it again.",
-  },
+  export_failed: { title: () => "", advice: () => "" },
+  cleanup_keychain_failed: { title: () => "This computer could not finish cleaning up.", advice: () => "" },
+  cleanup_failed: { title: () => "This computer could not finish cleaning up.", advice: () => "" },
+  internal: { title: () => "", advice: () => "" },
 };
 
 export const en = {
@@ -457,6 +445,8 @@ export const en = {
     attach: (name: string, username: string | null) => (username ? `Add to ${name} (${username})` : `Add to ${name}`),
     attachHasCode: (name: string, username: string | null) =>
       `${username ? `${name} (${username})` : name}: already has a code`,
+    attachTaken: (name: string, username: string | null, title: string) =>
+      `${username ? `${name} (${username})` : name}: already chosen for ${title}`,
     createNew: "Create a new login in the “Authy import” folder",
     skip: "Skip this account",
     actionFor: (title: string) => `What to do with ${title}`,
@@ -481,6 +471,11 @@ export const en = {
 
     reportTitle: "Bitwarden is updated",
     reportPartialTitle: "Bitwarden is partly updated",
+    reportStoppedTitle: "Bitwarden did not finish",
+    applyRejected: "Bitwarden could not be updated.",
+    backToReview: "Change the choices",
+    prepareFailed: "The download did not work.",
+    vaultFailed: "Your Bitwarden vault could not be read.",
     attached: (n: number) => `Added a code to ${plural(n, "login", "logins")}.`,
     created: (n: number) => `Created ${plural(n, "new entry", "new entries")} in the “Authy import” folder.`,
     skipped: (n: number) => `Skipped ${plural(n, "account", "accounts")} (${n === 1 ? "this stays" : "these stay"} only in Authy).`,
@@ -513,12 +508,12 @@ export const en = {
     clean: (d: string) => `This computer is clean: the connection is stopped and the certificate's secret key is destroyed, so the certificate on your ${d} is useless.`,
     failed: "This computer could not finish cleaning up.",
     failedReason: (reason: string) => `The reason given: ${reason}`,
-    failedManual: `You can finish it by hand: ${KEYCHAIN_BY_HAND}. Carry on with the steps below either way.`,
+    carryOn: "Carry on with the steps below either way.",
     manualDone: "I deleted the authexodus item in Keychain Access",
     failedOther: "Try again. If it keeps failing, carry on with the steps below, then quit authexodus and open it again: it opens on this screen and tries once more.",
     otherDone: "I have tried again and want to carry on",
     finishFailed: "The app could not finish.",
-    finishFailedKeychain: `The certificate's secret key is still in the Keychain. Remove it by hand, then press Finish again: ${KEYCHAIN_BY_HAND}.`,
+    finishFailedKeychain: "The certificate's secret key is still in the Keychain. Remove it by hand, then press Finish again.",
     finishFailedOther: "Nothing on this screen is lost. Press Finish again. If it keeps failing, quit authexodus and open it again: it opens on this screen.",
     noCertificate: (d: string) => `No certificate was installed on your ${d}, so there is no profile to remove.`,
     unconstrained: "This certificate was not limited to Authy, so removing it matters even more.",
@@ -660,6 +655,10 @@ export const en = {
       body: (d: string) => `Nothing is lost. Use the password that unlocks Authy on your ${d}: the one Authy is asking for right now.`,
       kept: "What you typed is still in the box, so you can check it and try again.",
     },
+    addressChanged: {
+      title: (d: string) => `This Mac's network address changed. Your ${d} can no longer reach it.`,
+      body: (d: string) => `Restart the connection, then type the new Server and Port on your ${d}.`,
+    },
     emptyBackup: {
       title: "Authy sent no accounts",
       body: "Authy answered, but its list was empty. Backups are probably turned off for your Authy account, so there is nothing for a newly installed Authy to download.",
@@ -683,10 +682,11 @@ export const en = {
     },
   },
 
-  // What to say for each code the shell can reject with. The shell's own sentence is shown
-  // under the title as the detail; these add the title and what to do next.
+  // What to say for each code the shell can reject with: see PROBLEMS, above.
   problems: {
     reason: (message: string) => `The reason given: ${message}`,
+    // Shown for the two Keychain codes whenever the shell's sentence does not itself say how.
+    keychainByHand: `To remove it by hand: ${KEYCHAIN_BY_HAND}.`,
     byCode: PROBLEMS,
   },
 

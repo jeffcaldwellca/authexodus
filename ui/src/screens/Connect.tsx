@@ -34,6 +34,12 @@ export function Connect({ api, state, dispatch, proxy, proxyError, addressReject
   const d = deviceLabel(state.device);
   const help = { d, ip: proxy?.ip, port: proxy?.port };
 
+  const restartButton = (
+    <button type="button" className="secondary" disabled={restart === "busy"} onClick={() => onRestart()}>
+      {restart === "busy" ? en.common.restarting : en.common.restart}
+    </button>
+  );
+
   const steps: GuideStep[] = proxy ? [
     { id: "wifi", text: t.steps.wifi[device], art: <WifiList device={device} step="open" /> },
     { id: "info", text: t.steps.info, art: <WifiList device={device} step="info" /> },
@@ -67,10 +73,16 @@ export function Connect({ api, state, dispatch, proxy, proxyError, addressReject
           </button>
         </Callout>
       )}
-      {addressError && <Problem error={addressError.error} d={d} title={t.addressFailed(addressError.ip)} />}
+      {addressError && (
+        <Problem error={addressError.error} d={d} title={t.addressFailed(addressError.ip)}>
+          {addressError.error.code === "address_changed" && restartButton}
+        </Problem>
+      )}
       {proxyError && (
         <Problem error={proxyError} d={d} title={t.startFailed(d)}>
-          <button type="button" className="secondary" onClick={onRetry}>{en.common.tryAgain}</button>
+          {/* An address that is gone will not come back by asking again: only a restart moves on. */}
+          {proxyError.code === "address_changed" ? restartButton
+            : <button type="button" className="secondary" onClick={onRetry}>{en.common.tryAgain}</button>}
         </Problem>
       )}
       {!proxy && !proxyError && <Waiting>{t.starting}</Waiting>}

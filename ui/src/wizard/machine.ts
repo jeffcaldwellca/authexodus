@@ -233,7 +233,9 @@ function onLoaded(s: WizardState, app: AppState): WizardState {
         unsure: true,
       };
     }
-    if (snap.captured > 0) return { ...live, ...trusted, step: "unlock", captured: snap.captured };
+    // The count is of accounts that can be moved. A capture holding only Authy's own
+    // accounts counts none, yet is still a backup to unlock: the shell's step says so.
+    if (snap.captured > 0 || app.step === "unlock") return { ...live, ...trusted, step: "unlock", captured: snap.captured };
     if (snap.trustWorking) return { ...live, ...trusted, step: "authy" };
     if (snap.deviceConnected) return { ...live, step: "certificate", reachedCertificate: true };
     return { ...live, step: "connect" };

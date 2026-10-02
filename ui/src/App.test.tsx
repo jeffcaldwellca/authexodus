@@ -554,8 +554,10 @@ describe("wizard", () => {
     const alert = await screen.findByRole("alert");
     expect(within(alert).getByText(en.cleanup.failed)).toBeInTheDocument();
     expect(within(alert).getByText(en.cleanup.failedReason("could not remove the certificate key: keychain is locked"))).toBeInTheDocument();
-    expect(within(alert).getByText(en.cleanup.failedManual)).toBeInTheDocument();
-    expect(en.cleanup.failedManual).toMatch(/Keychain Access.*authexodus/);
+    // The shell's words here do not say how to remove the item, so the screen does.
+    expect(within(alert).getByText(en.problems.keychainByHand)).toBeInTheDocument();
+    expect(en.problems.keychainByHand).toMatch(/Keychain Access.*authexodus/);
+    expect(within(alert).getByText(en.cleanup.carryOn)).toBeInTheDocument();
 
     // The phone-side ticks can be made regardless, but they alone do not finish.
     const finish = screen.getByRole("button", { name: en.cleanup.finish });

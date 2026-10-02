@@ -7,6 +7,7 @@ import type { Device } from "../api";
 import { asApiError, type ApiError } from "../api.errors";
 import { Callout, Screen, Tick, Waiting } from "../components/ui";
 import { AuthyAccounts, DeviceManagement, ProxyForm, TrashFile } from "../device/scenes";
+import { aboutKeychain, keychainRoute } from "../failures/Problem";
 import { en } from "../strings/en";
 import { canFinish, cantMoveCount, cleanupItems, type CleanupId } from "../wizard/machine";
 import { deviceLabel, type ScreenProps } from "./types";
@@ -20,11 +21,6 @@ function ItemArt({ id, device }: { id: CleanupId; device: Device }) {
     case "authySignedIn": return <AuthyAccounts device={device} />;
     case "fileDeleted": return <TrashFile />;
   }
-}
-
-/** The key is still in the Keychain: the one failure the person can finish by hand. */
-function keychain(error: ApiError): boolean {
-  return error.code === "cleanup_keychain_failed" || error.code === "keychain_failed";
 }
 
 export function Cleanup({ api, state, dispatch, certConstrained }: ScreenProps) {
@@ -98,18 +94,20 @@ export function Cleanup({ api, state, dispatch, certConstrained }: ScreenProps) 
       {core === "failed" && failure && (
         <Callout tone="error" title={t.failed} alert>
           {reasonOf(failure)}
-          <p>{keychain(failure) ? t.failedManual : t.failedOther}</p>
+          {keychainRoute(failure) !== null && <p>{keychainRoute(failure)}</p>}
+          <p>{aboutKeychain(failure) ? t.carryOn : t.failedOther}</p>
           <button type="button" className="secondary" onClick={runCleanup}>{en.common.tryAgain}</button>
           <label className="scanned">
             <input type="checkbox" checked={removedByHand} onChange={(e) => setRemovedByHand(e.target.checked)} />
-            <span>{keychain(failure) ? t.manualDone : t.otherDone}</span>
+            <span>{aboutKeychain(failure) ? t.manualDone : t.otherDone}</span>
           </label>
         </Callout>
       )}
       {finishError && (
         <Callout tone="error" title={t.finishFailed} alert>
           {reasonOf(finishError)}
-          <p>{keychain(finishError) ? t.finishFailedKeychain : t.finishFailedOther}</p>
+          <p>{aboutKeychain(finishError) ? t.finishFailedKeychain : t.finishFailedOther}</p>
+          {keychainRoute(finishError) !== null && <p>{keychainRoute(finishError)}</p>}
         </Callout>
       )}
 

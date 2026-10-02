@@ -308,11 +308,12 @@ export function BitwardenFlow({ api, state, tokens, onDone, onLocked }: ScreenPr
         {stage === "preparing" && (
           <>
             <Waiting>{t.preparing}</Waiting>
-            <ProgressLog lines={progress} />
+            {/* The download reports how far it is many times over: only the latest line is shown. */}
+            <p className="progress-log" role="status" aria-label={t.progressLabel}>{progress.at(-1) ?? ""}</p>
           </>
         )}
         {prepareCancelled && <Callout tone="info"><p role="status">{t.prepareCancelled}</p></Callout>}
-        {prepareError && <Problem error={prepareError} d={d} title={en.problems.byCode.bw_download_failed.title(d)} />}
+        {prepareError && <Problem error={prepareError} d={d} title={t.prepareFailed} />}
       </Screen>
     );
   }
@@ -414,7 +415,7 @@ export function BitwardenFlow({ api, state, tokens, onDone, onLocked }: ScreenPr
           )}
         </form>
         {vaultError && (
-          <Problem error={vaultError} d={d} title={en.problems.byCode.bw_vault_read_failed.title(d)}>
+          <Problem error={vaultError} d={d} title={t.vaultFailed}>
             {vaultError.code === "not_unlocked"
               ? <button type="button" className="secondary" onClick={onLocked}>{en.common.unlockAgain}</button>
               : <button type="button" className="secondary" onClick={() => void match()}>{en.common.tryAgain}</button>}
@@ -461,11 +462,16 @@ export function BitwardenFlow({ api, state, tokens, onDone, onLocked }: ScreenPr
                     {asking && <span className="question" id={`q-${p.tokenId}`}>{onlyTaken(p) ? t.questionHasCode : t.question}</span>}
                     <select aria-label={t.actionFor(title)} aria-describedby={asking ? `q-${p.tokenId}` : undefined} value={value} onChange={(e) => setChoices((prev) => ({ ...prev, [p.tokenId]: e.target.value }))}>
                       {value === "" && <option value="" disabled>{t.choose}</option>}
-                      {options.map((c) => (
-                        <option key={c.itemId} value={`attach:${c.itemId}`} disabled={c.hasCode}>
-                          {c.hasCode ? t.attachHasCode(c.name, c.username) : t.attach(c.name, c.username)}
-                        </option>
-                      ))}
+                      {options.map((c) => {
+                        // A login holds one code: one that another row has is not offered twice.
+                        const other = c.hasCode ? null : takenBy(c.itemId, p.tokenId);
+                        return (
+                          <option key={c.itemId} value={`attach:${c.itemId}`} disabled={c.hasCode || other !== null}>
+                            {c.hasCode ? t.attachHasCode(c.name, c.username)
+                              : other !== null ? t.attachTaken(c.name, c.username, other) : t.attach(c.name, c.username)}
+                          </option>
+                        );
+                      })}
                       <option value="createNew">{t.createNew}</option>
                       <option value="skip">{t.skip}</option>
                     </select>
@@ -509,23 +515,31 @@ export function BitwardenFlow({ api, state, tokens, onDone, onLocked }: ScreenPr
 
   const sessionEnded = applyError?.code === "bw_session_expired";
   const locked = applyError?.code === "not_unlocked";
-  const failed = applyError?.message ?? report?.failed ?? null;
+  // Stopped part-way: the shell answered with what it had done and why it stopped.
+  const partial = report?.failed ?? null;
   return (
     <Screen
       focusKey={stage}
-      title={failed !== null ? t.reportPartialTitle : t.reportTitle}
+      title={applyError ? t.reportStoppedTitle : partial !== null ? t.reportPartialTitle : t.reportTitle}
       footer={
         <>
           {back}
           {sessionEnded ? <button type="button" className="primary" onClick={signInAgain}>{t.signInAgain}</button>
             : locked ? <button type="button" className="primary" onClick={onLocked}>{en.common.unlockAgain}</button>
-            : failed !== null ? <button type="button" className="primary" onClick={() => void apply()}>{t.runAgain}</button>
+            : applyError || partial !== null ? <button type="button" className="primary" onClick={() => void apply()}>{t.runAgain}</button>
             : <button type="button" className="primary" onClick={() => onDone(true)}>{en.common.done}</button>}
         </>
       }
     >
-      {applyError && (sessionEnded || locked) && <Problem error={applyError} d={d} />}
-      {failed !== null && !sessionEnded && !locked && <BitwardenServer message={failed} />}
+      {/* Refused outright: the shell's sentence says why. The choices may be what needs changing. */}
+      {applyError && (
+        <Problem error={applyError} d={d} title={t.applyRejected}>
+          {!sessionEnded && !locked && (
+            <button type="button" className="secondary" onClick={() => setStage("review")}>{t.backToReview}</button>
+          )}
+        </Problem>
+      )}
+      {partial !== null && <BitwardenServer message={partial} />}
       {report && (
         <>
           {report.attached + report.created + report.skipped > 0 && (
@@ -583,7 +597,7 @@ function LoginPicker({ title, d, logins, error, whyNot, onChoose, onRetry, onLoc
         <input id="bw-login-search" type="text" value={query} onChange={(e) => setQuery(e.target.value)} autoComplete="off" spellCheck={false} />
       </div>
       {error && (
-        <Problem error={error} d={d} title={en.problems.byCode.bw_vault_read_failed.title(d)}>
+        <Problem error={error} d={d} title={t.vaultFailed}>
           {error.code === "not_unlocked"
             ? <button type="button" className="secondary" onClick={onLocked}>{en.common.unlockAgain}</button>
             : <button type="button" className="secondary" onClick={onRetry}>{en.common.tryAgain}</button>}

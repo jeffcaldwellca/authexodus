@@ -11,7 +11,7 @@ import { Problem } from "./Problem";
 export type RestartState = "idle" | "busy" | "failed";
 
 const t = en.failures.restart;
-const moved = en.problems.byCode.address_changed;
+const moved = en.failures.addressChanged;
 
 export function ConnectionNotices({ d, state, restart, restartError, onRestart }: {
   d: string; state: WizardState; restart: RestartState; restartError: ApiError | null; onRestart: () => void;
@@ -37,7 +37,7 @@ export function ConnectionNotices({ d, state, restart, restartError, onRestart }
       )}
       {state.addressChanged && (
         <Callout tone="error" title={moved.title(d)} alert>
-          <p>{moved.advice(d)}</p>
+          <p>{moved.body(d)}</p>
           {restartButton}
         </Callout>
       )}
