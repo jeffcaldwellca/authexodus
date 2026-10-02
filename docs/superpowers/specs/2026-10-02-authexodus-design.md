@@ -105,11 +105,12 @@ the same token list.
 
 ### Authy-native tokens
 
-Tokens Authy issues itself (7 digits, 10 seconds) arrive in a separate
-response. The app attempts to migrate them to destinations that accept that
-format, and lists any it could not move with instructions to re-enrol by hand.
-Whether the captured response always contains a usable seed is unverified;
-this is settled by a spike before the feature is promised in the UI.
+Tokens Authy issues itself (7 digits, 10 seconds) arrive in a separate `apps`
+response. Observed on 2026-10-02: each entry carries a `secret_seed` (32 hex
+characters, unencrypted) and `digits: 7`. The app migrates them to destinations
+that accept that format, and lists any it could not move with instructions to
+re-enrol by hand. That a code generated from this seed matches Authy's is still
+to be confirmed by the spike below.
 
 ### Invalid tokens
 
@@ -166,8 +167,9 @@ Each has its own plain-language screen with what to try:
 1. **Name-constrained root on iOS:** does iOS accept and enforce a
    user-installed root limited to `authy.com`? If not, fall back to an
    unconstrained root and say so in the cleanup screen.
-2. **Authy-native seeds:** does the captured `apps` response contain a usable
-   seed?
+2. **Authy-native seeds:** the `apps` response does contain a seed. Confirm
+   the derivation (seed encoding, 7 digits, 10 seconds) yields the same code
+   Authy shows.
 3. **Rust proxy crate:** confirm the chosen crate can intercept one host and
    blind-tunnel the rest.
 
