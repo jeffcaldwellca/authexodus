@@ -290,6 +290,7 @@ version = "0.1.0"
 dependencies = [
  "aes",
  "async-trait",
+ "authexodus-core",
  "base64 0.22.1",
  "bytes",
  "cbc",

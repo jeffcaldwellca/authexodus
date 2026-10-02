@@ -10,7 +10,18 @@
 //! handshake with the device is ours, so a refused certificate is seen as `TlsRejected`; and
 //! the tunnel and plain-HTTP paths contain no logging, so tunnelled hosts never reach a log.
 //! `hudsucker` is used only for `decode_response`. The device is offered HTTP/1.1 only.
+//!
+//! The proxy listens on a shared network, so it assumes strangers can connect to it:
+//!
+//! * It will not connect to this computer, the local network or any other private, link-local
+//!   or special-purpose address on a peer's behalf (see [`special_purpose`]).
+//! * The first peer to complete a TLS handshake for an intercepted host becomes "the device".
+//!   From then on no other peer may use the intercepted hosts, so only the device's traffic
+//!   can reach the captured backup. Tunnels and plain HTTP stay open to everyone, so a stray
+//!   peer cannot lock the real device out of anything but Authy before it gets there first.
+//! * Connections are capped, idle tunnels are closed, and outbound dials time out.
 
+use std::collections::{HashMap, HashSet};
 use std::convert::Infallible;
 use std::future::Future;
 use std::io;
@@ -37,11 +48,12 @@ use hyper_rustls::ConfigBuilderExt;
 use hyper_util::rt::{TokioIo, TokioTimer};
 use rustls::crypto::aws_lc_rs;
 use rustls::pki_types::{CertificateDer, ServerName};
-use rustls::{ClientConfig, RootCertStore, ServerConfig};
-use tokio::io::{AsyncRead, AsyncWrite};
+use rustls::{AlertDescription, ClientConfig, RootCertStore, ServerConfig};
+use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 use tokio::net::{TcpListener, TcpStream};
-use tokio::sync::{mpsc, watch};
+use tokio::sync::{mpsc, watch, OwnedSemaphorePermit, Semaphore};
 use tokio::task::JoinHandle;
+use tokio::time::Instant;
 use tokio_rustls::{LazyConfigAcceptor, TlsConnector};
 
 use crate::ca::{Authority, CaError};
@@ -55,8 +67,16 @@ pub const AUTHY_HOST: &str = "api.authy.com";
 /// can vouch for it.
 pub const CHECK_HOST: &str = "authexodus-check.api.authy.com";
 
-const CONNECT_TIMEOUT: Duration = Duration::from_secs(20);
+/// Authy is always reached on this port, whatever port the device's CONNECT named.
+const AUTHY_PORT: u16 = 443;
+/// For an outbound connection: name lookup and TCP connect together, and separately the TLS
+/// handshake with Authy.
+const DIAL_TIMEOUT: Duration = Duration::from_secs(15);
 const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(30);
+/// A blind tunnel that carries no bytes in either direction for this long is closed.
+const TUNNEL_IDLE: Duration = Duration::from_secs(10 * 60);
+/// Connections served at once, tunnels included. Further ones wait in the listen queue.
+const MAX_CONNECTIONS: usize = 256;
 const DRAIN_TIMEOUT: Duration = Duration::from_secs(5);
 /// A response larger than this is passed through but not searched for the backup.
 const CAPTURE_LIMIT: usize = 16 * 1024 * 1024;
@@ -98,29 +118,79 @@ const CHECK_PAGE: &str = concat!(
 /// What the proxy noticed. The wizard advances on these.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ProxyEvent {
-    /// The first connection from something other than this computer.
+    /// The first time something other than this computer uses the proxy as a proxy: a CONNECT,
+    /// an absolute-form request, or a request for the proxy's own `/` or `/cert`. Merely
+    /// opening a connection (a port scanner) does not count. Sent once.
     DeviceConnected,
-    /// The first completed TLS handshake for an intercepted host: the device trusts the root.
+    /// The first completed TLS handshake for an intercepted host: the peer that made it trusts
+    /// the root, and is from now on the only peer allowed on the intercepted hosts. Sent once.
     TrustWorking,
-    /// The device saw our certificate for an intercepted host and aborted the handshake.
-    /// Sent every time it happens.
+    /// A peer was shown our certificate for an intercepted host and answered with a TLS alert
+    /// that says it does not accept it (unknown issuer, bad certificate and the like). A
+    /// connection that merely drops during the handshake is not reported. Sent every time.
     TlsRejected,
     /// The captured backup grew. `count` is the number of encrypted tokens now held.
     BackupCaptured { count: usize },
-    /// Authy answered with a 4xx or 5xx. `path` has no query string.
+    /// Authy answered with a 4xx or 5xx. `path` has no query string, and its all-digit
+    /// segments (account and device ids) are replaced by `:id`.
     AuthyError { status: u16, path: String },
 }
 
 /// For tests only: where Authy "is", and the root that signed that stand-in's certificate.
 ///
-/// With a test upstream, connections for [`AUTHY_HOST`] are dialled at `addr` instead of the
-/// real host, and the stand-in's certificate (which must name `api.authy.com`) is verified
-/// against `root_cert_der` alone. A test upstream also lifts the rule that the proxy refuses
-/// loopback destinations, because test servers live on loopback. Production passes `None`.
+/// With a test upstream, connections for [`AUTHY_HOST`] are dialled at the stand-in instead of
+/// the real host, the stand-in's certificate (which must name `api.authy.com`) is verified
+/// against the given root alone, and the proxy's destination rules are lifted, because test
+/// servers live on loopback.
+///
+/// It can only be built with the cargo feature `test-upstream`. Without that feature there is
+/// no constructor and the fields are private, so production code can only ever write
+/// `upstream: None`.
 #[derive(Debug, Clone)]
 pub struct TestUpstream {
-    pub addr: SocketAddr,
-    pub root_cert_der: Vec<u8>,
+    addr: SocketAddr,
+    root_cert_der: Vec<u8>,
+    /// Source port of a connection to the proxy -> the peer address to treat it as.
+    peers: Arc<Mutex<HashMap<u16, IpAddr>>>,
+    max_connections: usize,
+    tunnel_idle: Duration,
+}
+
+#[cfg(any(test, feature = "test-upstream"))]
+impl TestUpstream {
+    /// `addr` is the stand-in for Authy; `root_cert_der` signed its certificate.
+    pub fn new(addr: SocketAddr, root_cert_der: Vec<u8>) -> TestUpstream {
+        TestUpstream {
+            addr,
+            root_cert_der,
+            peers: Arc::default(),
+            max_connections: MAX_CONNECTIONS,
+            tunnel_idle: TUNNEL_IDLE,
+        }
+    }
+
+    /// Treat the connection to the proxy that comes from local port `source_port` as if it
+    /// came from `peer`. Tests run on one loopback address; this lets them be several
+    /// devices. Clones share the mapping, so it can be called after the proxy has started,
+    /// any time before that connection's first request.
+    pub fn pretend_peer(&self, source_port: u16, peer: IpAddr) {
+        self.peers
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .insert(source_port, peer);
+    }
+
+    /// Serve at most this many connections at once (the default is the production limit).
+    pub fn with_max_connections(mut self, max: usize) -> TestUpstream {
+        self.max_connections = max;
+        self
+    }
+
+    /// Close blind tunnels idle for this long (the default is the production limit).
+    pub fn with_tunnel_idle(mut self, idle: Duration) -> TestUpstream {
+        self.tunnel_idle = idle;
+        self
+    }
 }
 
 pub struct ProxyConfig {
@@ -129,7 +199,7 @@ pub struct ProxyConfig {
     pub listen_ip: IpAddr,
     /// Tried first. If it cannot be bound, any free port is used: see [`ProxyHandle::port`].
     pub preferred_port: u16,
-    /// `None` in production.
+    /// `None` in production. A value can only be built with the `test-upstream` feature.
     pub upstream: Option<TestUpstream>,
 }
 
@@ -163,6 +233,14 @@ impl ProxyHandle {
         self.shared.lock_backup().clone()
     }
 
+    /// Tell the proxy about addresses that belong to this computer, so it refuses to connect
+    /// to them on a peer's behalf. The listen address, every address a connection arrives on,
+    /// and all private and link-local ranges are refused already; this is for a public
+    /// address on another interface. Takes effect for connections opened from now on.
+    pub fn add_local_addresses(&self, addrs: impl IntoIterator<Item = IpAddr>) {
+        self.shared.dial.add_own(addrs);
+    }
+
     /// Stop listening, close every connection and tunnel, and wait for them to end.
     pub async fn shutdown(mut self) {
         let _ = self.stop.send(true);
@@ -180,10 +258,18 @@ pub async fn start(
 ) -> Result<ProxyHandle, ProxyError> {
     let dial = Dial {
         authy_at: cfg.upstream.as_ref().map(|u| u.addr),
-        allow_loopback: cfg.upstream.is_some(),
+        unrestricted: cfg.upstream.is_some(),
+        own: Arc::default(),
     };
+    dial.add_own([cfg.listen_ip]);
     let test_root = cfg.upstream.as_ref().map(|u| u.root_cert_der.as_slice());
     let tls = upstream_tls(test_root)?;
+    let max_connections = cfg
+        .upstream
+        .as_ref()
+        .map_or(MAX_CONNECTIONS, |u| u.max_connections);
+    let tunnel_idle = cfg.upstream.as_ref().map_or(TUNNEL_IDLE, |u| u.tunnel_idle);
+    let pretend_peers = cfg.upstream.as_ref().map(|u| Arc::clone(&u.peers));
     let leaf_authy = ca.leaf_server_config(AUTHY_HOST)?;
     let leaf_check = ca.leaf_server_config(CHECK_HOST)?;
 
@@ -202,11 +288,18 @@ pub async fn start(
         dial,
         events,
         backup: Mutex::new(CapturedBackup::default()),
-        device: Once::default(),
-        trust: Once::default(),
+        device_connected: Once::default(),
+        device: Mutex::new(None),
+        pretend_peers,
+        tunnel_idle,
         stop: stop_rx,
     });
-    let accept = tokio::spawn(accept_loop(listener, Arc::clone(&shared), alive_tx));
+    let accept = tokio::spawn(accept_loop(
+        listener,
+        Arc::clone(&shared),
+        alive_tx,
+        Arc::new(Semaphore::new(max_connections)),
+    ));
 
     Ok(ProxyHandle {
         port,
@@ -244,8 +337,12 @@ struct Shared {
     dial: Dial,
     events: mpsc::UnboundedSender<ProxyEvent>,
     backup: Mutex<CapturedBackup>,
-    device: Once,
-    trust: Once,
+    device_connected: Once,
+    /// The peer that first completed a TLS handshake for an intercepted host.
+    device: Mutex<Option<IpAddr>>,
+    /// Tests only: source port -> pretended peer address.
+    pretend_peers: Option<Arc<Mutex<HashMap<u16, IpAddr>>>>,
+    tunnel_idle: Duration,
     stop: watch::Receiver<bool>,
 }
 
@@ -259,10 +356,36 @@ impl Shared {
         self.backup.lock().unwrap_or_else(PoisonError::into_inner)
     }
 
-    fn note_peer(&self, peer: IpAddr, local: IpAddr) {
-        if is_device(peer, local) && self.device.first() {
+    /// A peer has used the proxy as a proxy. Announce the first one that is not this computer.
+    fn note_proxy_use(&self, peer: IpAddr, local: IpAddr) {
+        if is_device(peer, local) && self.device_connected.first() {
             self.emit(ProxyEvent::DeviceConnected);
         }
+    }
+
+    fn lock_device(&self) -> std::sync::MutexGuard<'_, Option<IpAddr>> {
+        self.device.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+
+    /// May this peer open a connection to an intercepted host? Anyone, until there is a
+    /// device; then only the device.
+    fn may_intercept(&self, peer: IpAddr) -> bool {
+        self.lock_device()
+            .is_none_or(|device| device == peer.to_canonical())
+    }
+
+    /// The address the proxy treats this connection as coming from.
+    fn peer_of(&self, peer: SocketAddr) -> IpAddr {
+        self.pretend_peers
+            .as_ref()
+            .and_then(|map| {
+                map.lock()
+                    .unwrap_or_else(PoisonError::into_inner)
+                    .get(&peer.port())
+                    .copied()
+            })
+            .unwrap_or(peer.ip())
+            .to_canonical()
     }
 
     /// Resolves when the proxy is told to stop, or its handle is dropped.
@@ -301,17 +424,68 @@ fn is_device(peer: IpAddr, local: IpAddr) -> bool {
     !peer.is_loopback() && peer != local.to_canonical()
 }
 
+/// The outcome of a completed TLS handshake for an intercepted host.
+#[derive(Debug, PartialEq, Eq)]
+enum Claim {
+    /// There was no device yet: this peer is now it.
+    Became,
+    /// This peer already is the device.
+    Is,
+    /// Another peer is the device. This one is turned away.
+    Other,
+}
+
+/// The first peer to complete a handshake becomes the device and stays it.
+fn claim_device(device: &mut Option<IpAddr>, peer: IpAddr) -> Claim {
+    let peer = peer.to_canonical();
+    match *device {
+        None => {
+            *device = Some(peer);
+            Claim::Became
+        }
+        Some(device) if device == peer => Claim::Is,
+        Some(_) => Claim::Other,
+    }
+}
+
 /// One accepted connection's context. Every task that outlives the request holds a clone, and
-/// through `alive` keeps [`ProxyHandle::shutdown`] waiting until it has ended.
+/// through `_alive` keeps [`ProxyHandle::shutdown`] waiting until it has ended. The connection
+/// counts against [`MAX_CONNECTIONS`] until the last clone is gone, which for a tunnel is when
+/// the tunnel closes.
 #[derive(Clone)]
 struct Conn {
     shared: Arc<Shared>,
+    peer: SocketAddr,
     local: SocketAddr,
-    alive: mpsc::Sender<()>,
+    _alive: mpsc::Sender<()>,
+    _slot: Arc<OwnedSemaphorePermit>,
 }
 
-async fn accept_loop(listener: TcpListener, shared: Arc<Shared>, alive: mpsc::Sender<()>) {
+impl Conn {
+    fn peer(&self) -> IpAddr {
+        self.shared.peer_of(self.peer)
+    }
+
+    fn note_proxy_use(&self) {
+        self.shared.note_proxy_use(self.peer(), self.local.ip());
+    }
+}
+
+async fn accept_loop(
+    listener: TcpListener,
+    shared: Arc<Shared>,
+    alive: mpsc::Sender<()>,
+    slots: Arc<Semaphore>,
+) {
     loop {
+        // Wait for a free slot before accepting, so the excess queues in the kernel.
+        let slot = match shared
+            .unless_stopped(Arc::clone(&slots).acquire_owned())
+            .await
+        {
+            Some(Ok(slot)) => slot,
+            Some(Err(_)) | None => return,
+        };
         let accepted = match shared.unless_stopped(listener.accept()).await {
             None => return,
             Some(accepted) => accepted,
@@ -328,12 +502,15 @@ async fn accept_loop(listener: TcpListener, shared: Arc<Shared>, alive: mpsc::Se
             continue;
         };
         let _ = tcp.set_nodelay(true);
-        shared.note_peer(peer.ip(), local.ip());
+        // Whatever address a peer reached us on is this computer's.
+        shared.dial.add_own([local.ip()]);
 
         let conn = Conn {
             shared: Arc::clone(&shared),
+            peer,
             local,
-            alive: alive.clone(),
+            _alive: alive.clone(),
+            _slot: Arc::new(slot),
         };
         tokio::spawn(async move {
             let shared = Arc::clone(&conn.shared);
@@ -355,12 +532,17 @@ async fn accept_loop(listener: TcpListener, shared: Arc<Shared>, alive: mpsc::Se
 
 async fn route(conn: Conn, req: Request<Incoming>) -> Response<ProxyBody> {
     if req.method() == Method::CONNECT {
+        conn.note_proxy_use();
         return connect(conn, req).await;
     }
     let Some(authority) = req.uri().authority() else {
         // Origin form: the request was sent straight to us.
+        if matches!(req.uri().path(), "/" | "/cert") {
+            conn.note_proxy_use();
+        }
         return own_page(&conn.shared, req.method(), req.uri().path());
     };
+    conn.note_proxy_use();
     if req.uri().scheme_str() != Some("http") {
         return plain(StatusCode::BAD_REQUEST);
     }
@@ -495,13 +677,17 @@ async fn connect(conn: Conn, req: Request<Incoming>) -> Response<ProxyBody> {
     let port = authority.port_u16().unwrap_or(443);
 
     if let Some(which) = intercepted(&host) {
-        tokio::spawn(intercept(conn, req, which, port));
+        if !conn.shared.may_intercept(conn.peer()) {
+            // Someone else is the device. Authy is theirs alone.
+            return plain(StatusCode::FORBIDDEN);
+        }
+        tokio::spawn(intercept(conn, req, which));
         return plain(StatusCode::OK);
     }
 
     // Everything below is the blind tunnel. It must not log, emit events or keep anything.
     let shared = Arc::clone(&conn.shared);
-    let mut server = match shared
+    let server = match shared
         .unless_stopped(shared.dial.connect(&host, port))
         .await
     {
@@ -512,20 +698,110 @@ async fn connect(conn: Conn, req: Request<Incoming>) -> Response<ProxyBody> {
         Some(Err(_)) | None => return plain(StatusCode::BAD_GATEWAY),
     };
     tokio::spawn(async move {
-        let _alive = conn.alive;
+        let _conn = conn; // holds the connection's slot until the tunnel closes
         let Ok(upgraded) = hyper::upgrade::on(req).await else {
             return;
         };
         let mut device = TokioIo::new(upgraded);
-        let _ = shared
-            .unless_stopped(tokio::io::copy_bidirectional(&mut device, &mut server))
-            .await;
+        // Every byte of the tunnel, in either direction, is a read or a write on `server`.
+        let activity = Arc::new(Mutex::new(Instant::now()));
+        let mut server = Watched {
+            inner: server,
+            activity: Arc::clone(&activity),
+        };
+        let copying = tokio::io::copy_bidirectional(&mut device, &mut server);
+        tokio::select! {
+            _ = shared.unless_stopped(copying) => {}
+            _ = idle_for(&activity, shared.tunnel_idle) => {}
+        }
     });
     plain(StatusCode::OK)
 }
 
+/// A stream that notes when bytes last moved through it.
+struct Watched<T> {
+    inner: T,
+    activity: Arc<Mutex<Instant>>,
+}
+
+impl<T> Watched<T> {
+    fn touch(&self) {
+        *self.activity.lock().unwrap_or_else(PoisonError::into_inner) = Instant::now();
+    }
+}
+
+impl<T: AsyncRead + Unpin> AsyncRead for Watched<T> {
+    fn poll_read(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &mut ReadBuf<'_>,
+    ) -> Poll<io::Result<()>> {
+        let before = buf.filled().len();
+        let polled = Pin::new(&mut self.inner).poll_read(cx, buf);
+        if buf.filled().len() > before {
+            self.touch();
+        }
+        polled
+    }
+}
+
+impl<T: AsyncWrite + Unpin> AsyncWrite for Watched<T> {
+    fn poll_write(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &[u8],
+    ) -> Poll<io::Result<usize>> {
+        let polled = Pin::new(&mut self.inner).poll_write(cx, buf);
+        if matches!(polled, Poll::Ready(Ok(n)) if n > 0) {
+            self.touch();
+        }
+        polled
+    }
+
+    fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        Pin::new(&mut self.inner).poll_flush(cx)
+    }
+
+    fn poll_shutdown(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        Pin::new(&mut self.inner).poll_shutdown(cx)
+    }
+}
+
+/// Resolves once `limit` has passed since the last recorded activity.
+async fn idle_for(activity: &Mutex<Instant>, limit: Duration) {
+    loop {
+        let deadline = *activity.lock().unwrap_or_else(PoisonError::into_inner) + limit;
+        if Instant::now() >= deadline {
+            return;
+        }
+        tokio::time::sleep_until(deadline).await;
+    }
+}
+
+/// Did the peer answer our certificate with an alert that says it does not accept it? That is
+/// what a device without the root installed, or without full trust switched on, sends. An
+/// end of stream, a reset, or any other failure says nothing about trust.
+fn certificate_refused(error: &io::Error) -> bool {
+    let alert = error
+        .get_ref()
+        .and_then(|inner| inner.downcast_ref::<rustls::Error>());
+    matches!(
+        alert,
+        Some(rustls::Error::AlertReceived(
+            AlertDescription::BadCertificate
+                | AlertDescription::UnsupportedCertificate
+                | AlertDescription::CertificateRevoked
+                | AlertDescription::CertificateExpired
+                | AlertDescription::CertificateUnknown
+                | AlertDescription::UnknownCA
+                | AlertDescription::AccessDenied
+                | AlertDescription::DecryptError
+        ))
+    )
+}
+
 /// Terminate TLS for an intercepted host and serve the requests inside it.
-async fn intercept(conn: Conn, req: Request<Incoming>, connect_host: Intercepted, port: u16) {
+async fn intercept(conn: Conn, req: Request<Incoming>, connect_host: Intercepted) {
     let shared = Arc::clone(&conn.shared);
     let Ok(upgraded) = hyper::upgrade::on(req).await else {
         return;
@@ -559,22 +835,27 @@ async fn intercept(conn: Conn, req: Request<Incoming>, connect_host: Intercepted
     {
         Some(Ok(Ok(tls))) => tls,
         Some(Ok(Err(error))) => {
-            // The device was shown our certificate and ended the handshake.
-            tracing::info!(%error, "TLS handshake for an intercepted host was rejected");
-            shared.emit(ProxyEvent::TlsRejected);
+            let refused = certificate_refused(&error);
+            tracing::info!(%error, refused, "TLS handshake for an intercepted host failed");
+            if refused {
+                shared.emit(ProxyEvent::TlsRejected);
+            }
             return;
         }
         Some(Err(_)) | None => return, // stalled, or the proxy stopped
     };
-    if shared.trust.first() {
-        shared.emit(ProxyEvent::TrustWorking);
+    let claim = claim_device(&mut shared.lock_device(), conn.peer());
+    match claim {
+        Claim::Became => shared.emit(ProxyEvent::TrustWorking),
+        Claim::Is => {}
+        Claim::Other => return, // lost a race with the device; see `connect`
     }
 
     let link = AuthyLink::default();
     let service = service_fn(move |req| {
         let conn = conn.clone();
         let link = Arc::clone(&link);
-        async move { Ok::<_, Infallible>(intercepted_request(conn, which, port, link, req).await) }
+        async move { Ok::<_, Infallible>(intercepted_request(conn, which, link, req).await) }
     });
     let serving = server::Builder::new()
         .timer(TokioTimer::new())
@@ -584,28 +865,49 @@ async fn intercept(conn: Conn, req: Request<Incoming>, connect_host: Intercepted
 }
 
 /// One decrypted request. Only here and for the proxy's own pages is a request logged: method,
-/// path without its query string, status.
+/// path without its query string and with ids redacted, status.
 async fn intercepted_request(
     conn: Conn,
     which: Intercepted,
-    port: u16,
     link: AuthyLink,
     req: Request<Incoming>,
 ) -> Response<ProxyBody> {
     let method = req.method().clone();
-    let path = req.uri().path().to_owned();
-    let res = match which {
-        Intercepted::Check if method == Method::GET || method == Method::HEAD => html(CHECK_PAGE),
-        Intercepted::Check => plain(StatusCode::METHOD_NOT_ALLOWED),
-        Intercepted::Authy => forward_authy(&conn, port, &link, &path, req).await,
+    let path = redact_ids(req.uri().path());
+    let res = if method == Method::CONNECT {
+        // A proxy request inside the decrypted stream goes nowhere.
+        plain(StatusCode::METHOD_NOT_ALLOWED)
+    } else {
+        match which {
+            Intercepted::Check if method == Method::GET || method == Method::HEAD => {
+                html(CHECK_PAGE)
+            }
+            Intercepted::Check => plain(StatusCode::METHOD_NOT_ALLOWED),
+            Intercepted::Authy => forward_authy(&conn, &link, &path, req).await,
+        }
     };
     tracing::info!(%method, %path, status = res.status().as_u16(), "intercepted request");
     res
 }
 
+/// A path with every all-digit segment replaced by `:id`. Authy's paths carry the account id
+/// and device id; neither belongs in a log or an event.
+fn redact_ids(path: &str) -> String {
+    path.split('/')
+        .map(|segment| {
+            if !segment.is_empty() && segment.bytes().all(|b| b.is_ascii_digit()) {
+                ":id"
+            } else {
+                segment
+            }
+        })
+        .collect::<Vec<_>>()
+        .join("/")
+}
+
+/// `path` is the redacted path, for the event; the request itself is forwarded as it came.
 async fn forward_authy(
     conn: &Conn,
-    port: u16,
     link: &AuthyLink,
     path: &str,
     req: Request<Incoming>,
@@ -623,7 +925,7 @@ async fn forward_authy(
         }
         let mut sender = match reusable {
             Some(sender) => sender,
-            None => match open(conn, AUTHY_HOST, port, true).await {
+            None => match open(conn, AUTHY_HOST, AUTHY_PORT, true).await {
                 Ok(sender) => sender,
                 Err(_) => return plain(StatusCode::BAD_GATEWAY),
             },
@@ -769,21 +1071,50 @@ impl<T: Unpin> Body for Holding<T> {
 struct Dial {
     /// Test upstream: where connections for [`AUTHY_HOST`] really go.
     authy_at: Option<SocketAddr>,
-    /// Production refuses loopback destinations, so a device on the network cannot use the
-    /// proxy to reach services that listen only on this computer.
-    allow_loopback: bool,
+    /// Test upstream: no destination is refused (test servers live on loopback).
+    unrestricted: bool,
+    /// Addresses of this computer's own interfaces, as far as the proxy knows them.
+    own: Arc<Mutex<HashSet<IpAddr>>>,
 }
 
 impl Dial {
-    fn allows(&self, ip: IpAddr) -> bool {
-        let ip = ip.to_canonical();
-        self.allow_loopback || !(ip.is_loopback() || ip.is_unspecified())
+    fn add_own(&self, addrs: impl IntoIterator<Item = IpAddr>) {
+        let mut own = self.own.lock().unwrap_or_else(PoisonError::into_inner);
+        own.extend(
+            addrs
+                .into_iter()
+                .map(|ip| ip.to_canonical())
+                .filter(|ip| !ip.is_unspecified()),
+        );
     }
 
+    /// May the proxy connect to `ip` on a peer's behalf? Only to public addresses that are not
+    /// this computer's own.
+    fn allows(&self, ip: IpAddr) -> bool {
+        if self.unrestricted {
+            return true;
+        }
+        let ip = ip.to_canonical();
+        !special_purpose(ip)
+            && !self
+                .own
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .contains(&ip)
+    }
+
+    /// Resolve and connect, within [`DIAL_TIMEOUT`] overall. Every resolved address is checked
+    /// and only a checked address is dialled, so a name cannot smuggle in a refused address.
     async fn connect(&self, host: &str, port: u16) -> io::Result<TcpStream> {
+        tokio::time::timeout(DIAL_TIMEOUT, self.connect_unbounded(host, port))
+            .await
+            .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "connect timed out"))?
+    }
+
+    async fn connect_unbounded(&self, host: &str, port: u16) -> io::Result<TcpStream> {
         let host = bare_host(host);
-        if let Some(addr) = self.authy_at {
-            if host.eq_ignore_ascii_case(AUTHY_HOST) {
+        if host.eq_ignore_ascii_case(AUTHY_HOST) {
+            if let Some(addr) = self.authy_at {
                 return connect_to(addr).await;
             }
         }
@@ -802,10 +1133,41 @@ impl Dial {
     }
 }
 
+/// Addresses that are never a legitimate destination for a device's traffic through this
+/// proxy, because they name this computer, its local network, or no host at all: loopback,
+/// unspecified, link-local, private (RFC 1918), carrier-grade NAT (100.64.0.0/10), unique
+/// local (fc00::/7), multicast, broadcast and reserved space, and IPv6 forms that embed an
+/// IPv4 address. Expects a canonical address (an IPv4-mapped one already unwrapped).
+fn special_purpose(ip: IpAddr) -> bool {
+    match ip {
+        IpAddr::V4(v4) => {
+            let [a, b, ..] = v4.octets();
+            v4.is_loopback()
+                || v4.is_unspecified()
+                || a == 0
+                || v4.is_link_local()
+                || v4.is_private()
+                || (a == 100 && (b & 0xc0) == 64)
+                || v4.is_multicast()
+                || a >= 240 // reserved, and 255.255.255.255
+        }
+        IpAddr::V6(v6) => {
+            let segments = v6.segments();
+            v6.is_loopback()
+                || v6.is_unspecified()
+                || (segments[0] & 0xffc0) == 0xfe80
+                || (segments[0] & 0xfe00) == 0xfc00
+                || v6.is_multicast()
+                // ::a.b.c.d (deprecated "IPv4-compatible") and anything else under ::/96
+                || segments[..6] == [0; 6]
+                // an IPv4-mapped address that was not unwrapped
+                || v6.to_ipv4_mapped().is_some()
+        }
+    }
+}
+
 async fn connect_to(addr: SocketAddr) -> io::Result<TcpStream> {
-    let stream = tokio::time::timeout(CONNECT_TIMEOUT, TcpStream::connect(addr))
-        .await
-        .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "connect timed out"))??;
+    let stream = TcpStream::connect(addr).await?;
     let _ = stream.set_nodelay(true);
     Ok(stream)
 }
@@ -820,7 +1182,7 @@ async fn open(conn: &Conn, host: &str, port: u16, tls: bool) -> io::Result<Sende
     }
     let name = ServerName::try_from(bare_host(host).to_owned())
         .map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e))?;
-    let stream = tokio::time::timeout(CONNECT_TIMEOUT, shared.tls.connect(name, tcp))
+    let stream = tokio::time::timeout(DIAL_TIMEOUT, shared.tls.connect(name, tcp))
         .await
         .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "TLS handshake timed out"))??;
     handshake(conn, stream).await
@@ -1012,20 +1374,120 @@ mod tests {
         .unwrap();
         let local = ip("192.168.1.20");
 
-        handle.shared.note_peer(ip("127.0.0.1"), ip("127.0.0.1"));
-        handle.shared.note_peer(local, local);
+        handle
+            .shared
+            .note_proxy_use(ip("127.0.0.1"), ip("127.0.0.1"));
+        handle.shared.note_proxy_use(local, local);
         assert!(events.try_recv().is_err(), "this computer is not a device");
 
-        handle.shared.note_peer(ip("192.168.1.57"), local);
+        handle.shared.note_proxy_use(ip("192.168.1.57"), local);
         assert_eq!(events.try_recv(), Ok(ProxyEvent::DeviceConnected));
 
-        handle.shared.note_peer(ip("192.168.1.57"), local);
-        handle.shared.note_peer(ip("192.168.1.99"), local);
+        handle.shared.note_proxy_use(ip("192.168.1.57"), local);
+        handle.shared.note_proxy_use(ip("192.168.1.99"), local);
         assert!(
             events.try_recv().is_err(),
             "only the first one is announced"
         );
         handle.shutdown().await;
+    }
+
+    #[test]
+    fn the_first_peer_to_complete_a_handshake_is_the_device_for_good() {
+        let mut device = None;
+        assert_eq!(claim_device(&mut device, ip("192.168.1.57")), Claim::Became);
+        assert_eq!(claim_device(&mut device, ip("192.168.1.57")), Claim::Is);
+        assert_eq!(
+            claim_device(&mut device, ip("::ffff:192.168.1.57")),
+            Claim::Is,
+            "the same peer over a mapped address"
+        );
+        assert_eq!(claim_device(&mut device, ip("192.168.1.99")), Claim::Other);
+        assert_eq!(claim_device(&mut device, ip("127.0.0.1")), Claim::Other);
+        assert_eq!(device, Some(ip("192.168.1.57")), "never replaced");
+    }
+
+    #[test]
+    fn only_certificate_alerts_count_as_a_rejection() {
+        let alert = |description| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                rustls::Error::AlertReceived(description),
+            )
+        };
+        for refused in [
+            AlertDescription::BadCertificate,
+            AlertDescription::UnknownCA,
+            AlertDescription::CertificateUnknown,
+            AlertDescription::UnsupportedCertificate,
+            AlertDescription::CertificateExpired,
+            AlertDescription::CertificateRevoked,
+            AlertDescription::AccessDenied,
+            AlertDescription::DecryptError,
+        ] {
+            assert!(certificate_refused(&alert(refused)), "{refused:?}");
+        }
+        for benign in [
+            AlertDescription::CloseNotify,
+            AlertDescription::UserCanceled,
+            AlertDescription::HandshakeFailure,
+            AlertDescription::ProtocolVersion,
+            AlertDescription::NoApplicationProtocol,
+            AlertDescription::InternalError,
+        ] {
+            assert!(!certificate_refused(&alert(benign)), "{benign:?}");
+        }
+        for kind in [
+            io::ErrorKind::UnexpectedEof,
+            io::ErrorKind::ConnectionReset,
+            io::ErrorKind::BrokenPipe,
+            io::ErrorKind::TimedOut,
+        ] {
+            assert!(!certificate_refused(&io::Error::from(kind)), "{kind:?}");
+        }
+        let ours = io::Error::new(
+            io::ErrorKind::InvalidData,
+            rustls::Error::NoApplicationProtocol,
+        );
+        assert!(!certificate_refused(&ours), "our own failure, not an alert");
+    }
+
+    #[test]
+    fn numeric_path_segments_are_redacted() {
+        assert_eq!(
+            redact_ids("/json/users/10000001/devices/20000002/apps"),
+            "/json/users/:id/devices/:id/apps"
+        );
+        assert_eq!(
+            redact_ids("/json/users/1/authenticator_tokens"),
+            "/json/users/:id/authenticator_tokens"
+        );
+        assert_eq!(redact_ids("/"), "/");
+        assert_eq!(redact_ids("/json/v2/ios/7"), "/json/v2/ios/:id");
+        assert_eq!(redact_ids("/a//b/12a/"), "/a//b/12a/");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn idle_timer_restarts_on_activity() {
+        let activity = Mutex::new(Instant::now());
+        let limit = Duration::from_secs(600);
+        let idle = idle_for(&activity, limit);
+        tokio::pin!(idle);
+
+        // Nine minutes of silence, then a byte: the clock starts again.
+        assert!(tokio::time::timeout(Duration::from_secs(540), &mut idle)
+            .await
+            .is_err());
+        *activity.lock().unwrap() = Instant::now();
+        assert!(
+            tokio::time::timeout(Duration::from_secs(599), &mut idle)
+                .await
+                .is_err(),
+            "still open 599 s after the last byte"
+        );
+        tokio::time::timeout(Duration::from_secs(2), &mut idle)
+            .await
+            .expect("closed ten minutes after the last byte");
     }
 
     #[test]
@@ -1062,29 +1524,87 @@ mod tests {
     fn production_refuses_loopback_destinations() {
         let production = Dial {
             authy_at: None,
-            allow_loopback: false,
+            unrestricted: false,
+            own: Arc::default(),
         };
-        for refused in [
+        let refused = [
+            // loopback and unspecified
             "127.0.0.1",
             "127.1.2.3",
             "::1",
             "0.0.0.0",
+            "0.1.2.3",
             "::",
-            "::ffff:127.0.0.1",
-        ] {
-            assert!(!production.allows(ip(refused)), "{refused}");
-        }
-        for allowed in [
-            "192.168.1.1",
+            // link-local, including the cloud metadata address
+            "169.254.169.254",
+            "169.254.0.1",
+            "fe80::1",
+            "febf::1",
+            // RFC 1918
             "10.0.0.1",
-            "93.184.216.34",
-            "2606:4700::1111",
-        ] {
-            assert!(production.allows(ip(allowed)), "{allowed}");
+            "10.255.255.255",
+            "172.16.0.1",
+            "172.31.255.254",
+            "192.168.0.1",
+            "192.168.1.20",
+            // carrier-grade NAT
+            "100.64.0.1",
+            "100.127.255.254",
+            // unique local
+            "fc00::1",
+            "fd12:3456:789a::1",
+            // multicast, broadcast, reserved
+            "224.0.0.251",
+            "239.255.255.250",
+            "255.255.255.255",
+            "240.0.0.1",
+            "ff02::1",
+            "ff05::2",
+            // IPv4 inside IPv6
+            "::ffff:127.0.0.1",
+            "::ffff:10.0.0.1",
+            "::ffff:192.168.1.1",
+            "::ffff:169.254.169.254",
+            "::ffff:100.64.0.1",
+            "::ffff:224.0.0.1",
+            "::10.0.0.1",
+            "::127.0.0.1",
+        ];
+        for address in refused {
+            assert!(!production.allows(ip(address)), "{address}");
         }
+        let allowed = [
+            "93.184.216.34",
+            "1.1.1.1",
+            "100.63.255.255",
+            "100.128.0.1",
+            "172.15.255.255",
+            "172.32.0.1",
+            "169.253.0.1",
+            "192.167.1.1",
+            "223.255.255.254",
+            "2606:4700::1111",
+            "2001:db8::1",
+            "::ffff:93.184.216.34",
+        ];
+        for address in allowed {
+            assert!(production.allows(ip(address)), "{address}");
+        }
+
+        // This computer's own addresses, however public.
+        production.add_own([ip("203.0.113.7"), ip("2001:db8::7"), ip("0.0.0.0")]);
+        assert!(!production.allows(ip("203.0.113.7")));
+        assert!(!production.allows(ip("::ffff:203.0.113.7")));
+        assert!(!production.allows(ip("2001:db8::7")));
+        assert!(
+            production.allows(ip("203.0.113.8")),
+            "its neighbour is fine"
+        );
+
         let test = Dial {
             authy_at: None,
-            allow_loopback: true,
+            unrestricted: true,
+            own: Arc::default(),
         };
         assert!(test.allows(ip("127.0.0.1")));
     }

@@ -7,6 +7,11 @@ license.workspace = true
 authors.workspace = true
 rust-version.workspace = true
 
+[features]
+# Makes `proxy::TestUpstream` constructible: a stand-in for Authy with its own trust root, which
+# also lifts the proxy's destination rules. For tests only; never enable it in a shipped build.
+test-upstream = []
+
 [dependencies]
 # async runtime and plumbing
 tokio = { version = "1", features = ["full"] }
@@ -53,6 +58,9 @@ reqwest = { version = "0.13", default-features = false, features = ["rustls"] }
 zip = { version = "2", default-features = false, features = ["deflate"] }
 
 [dev-dependencies]
+# The crate's own integration tests need `test-upstream`. A dev-dependency on itself switches
+# the feature on whenever tests are built, and never for a normal build.
+authexodus-core = { path = ".", features = ["test-upstream"] }
 tempfile = "3"
 x509-parser = "0.18"
 reqwest = { version = "0.13", default-features = false, features = ["rustls"] }
