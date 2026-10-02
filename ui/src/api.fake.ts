@@ -24,6 +24,12 @@ export type FakeScript = {
   googleUnsupported: string[];
   /** Makes `bwPrepare` fail with this message. */
   prepareError: string | null;
+  /** Makes the next `restartProxy` calls fail with these messages, in order. */
+  restartErrors: string[];
+  /** Runs inside `restartProxy` before it answers, e.g. to emit events from the "new proxy". */
+  beforeRestartResolves: (() => void) | null;
+  /** Makes `liveCodes` fail with this message. */
+  liveCodesError: string | null;
   /** Makes `cleanup` fail with this message, once. */
   cleanupError: string | null;
   /** Artificial delay on every call, so the dev build shows its waiting states. */
@@ -46,6 +52,8 @@ export type FakeApi = Api & {
 };
 
 export const FAKE_PASSWORD = "correct horse";
+/** Shaped like the real thing: 32 upper-case hex pairs joined by ":". */
+export const FAKE_FINGERPRINT = Array.from({ length: 32 }, (_, i) => ((i * 37 + 11) % 256).toString(16).toUpperCase().padStart(2, "0")).join(":");
 
 const TOKENS: TokenView[] = [
   { id: "t1", title: "GitHub", username: "sam.rivera" },
@@ -68,7 +76,9 @@ const PROPOSALS: Proposal[] = [
     ] },
   { tokenId: "t3", confidence: "high", decision: { kind: "attach", itemId: "v4" },
     candidates: [{ itemId: "v4", name: "Amazon", username: "sam.rivera@example.com", hasCode: false }] },
-  { tokenId: "t4", confidence: "high", decision: { kind: "attach", itemId: "v5" },
+  // The core never proposes attaching to a login that already has a code. When the only
+  // match has one, it lists the login, makes no choice, and marks the row low confidence.
+  { tokenId: "t4", confidence: "low", decision: { kind: "createNew" },
     candidates: [{ itemId: "v5", name: "Dropbox", username: "sam.rivera@example.com", hasCode: true }] },
   { tokenId: "t5", confidence: "low", decision: { kind: "attach", itemId: "v6" },
     candidates: [
@@ -97,6 +107,9 @@ function defaultScript(): FakeScript {
     exportResults: [],
     googleUnsupported: [],
     prepareError: null,
+    restartErrors: [],
+    beforeRestartResolves: null,
+    liveCodesError: null,
     cleanupError: null,
     delayMs: 0,
     now: () => Date.now(),
@@ -178,6 +191,7 @@ export function createFakeApi(initial: Partial<AppState> = {}, overrides: Partia
       certUrl: `http://${ip}:${script.port}/`,
       certQrSvg: fakeQrSvg(`cert:${ip}:${script.port}`),
       checkUrl: "https://authexodus-check.api.authy.com/",
+      certFingerprint: FAKE_FINGERPRINT,
     };
   }
 
@@ -219,7 +233,13 @@ export function createFakeApi(initial: Partial<AppState> = {}, overrides: Partia
     },
     async restartProxy(ip?: string) {
       await record("restartProxy", ip);
-      if (ip !== undefined) chosenIp = ip;
+      const failure = script.restartErrors.shift();
+      if (failure !== undefined) throw new Error(failure);
+      if (ip !== undefined && !script.addresses.some((a) => a.ip === ip)) {
+        throw new Error("That address is not one of this computer's network addresses.");
+      }
+      chosenIp = ip ?? null;
+      script.beforeRestartResolves?.();
       captured = false;
       unlocked = false;
       state.resumeCleanup = true;
@@ -245,6 +265,7 @@ export function createFakeApi(initial: Partial<AppState> = {}, overrides: Partia
     },
     async liveCodes(): Promise<LiveCode[]> {
       await record("liveCodes");
+      if (script.liveCodesError) throw new Error(script.liveCodesError);
       if (!unlocked) return [];
       const seconds = Math.floor(script.now() / 1000);
       const window = Math.floor(seconds / 30);

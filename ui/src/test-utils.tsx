@@ -20,16 +20,12 @@ export async function tickAllChecks(user: UserEvent) {
   for (const box of screen.getAllByRole("checkbox")) await user.click(box);
 }
 
-/** Walks every QR code to the end, which is one of the ways of having "moved" the codes. */
+/** Scans (ticks) the first QR code and goes back, which is one way of having "moved" codes. */
 export async function moveByQr(user: UserEvent) {
   await user.click(screen.getByRole("button", { name: new RegExp(en.destination.options.qr.title) }));
   await screen.findByRole("heading", { level: 1, name: en.destination.qr.title });
-  for (;;) {
-    const next = screen.queryByRole("button", { name: en.common.next });
-    if (!next) break;
-    await user.click(next);
-  }
-  await user.click(screen.getByRole("button", { name: en.common.done }));
+  await user.click(await screen.findByRole("checkbox", { name: en.destination.qr.scanned }));
+  await user.click(screen.getByRole("button", { name: en.destination.backToOptions }));
   await screen.findByRole("heading", { level: 1, name: en.destination.title });
 }
 

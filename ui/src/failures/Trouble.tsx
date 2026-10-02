@@ -48,7 +48,7 @@ export function Trouble({ children, d, mentionAuthy, onAbandon, onRestart }: {
         </Dialog>
       )}
       {mode === "confirm" && (
-        <StopConfirm mentionAuthy={mentionAuthy} onCancel={() => setMode("closed")} onConfirm={() => { setMode("closed"); onAbandon(); }} />
+        <StopConfirm d={d} mentionAuthy={mentionAuthy} onCancel={() => setMode("closed")} onConfirm={() => { setMode("closed"); onAbandon(); }} />
       )}
     </>
   );

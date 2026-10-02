@@ -17,11 +17,13 @@ export type ConnectProps = ScreenProps & {
   proxyError: boolean;
   /** An address the shell refused to switch to without a restart. */
   addressRejected: string | null;
+  /** A restart landed on a different address or port than the device was set to. */
+  addressChanged: boolean;
   onPickAddress: (ip: string) => void;
   onRetry: () => void;
 };
 
-export function Connect({ state, dispatch, proxy, proxyError, addressRejected, onPickAddress, onRetry, onRestart, restart }: ConnectProps) {
+export function Connect({ state, dispatch, proxy, proxyError, addressRejected, addressChanged, onPickAddress, onRetry, onRestart, restart }: ConnectProps) {
   const device: Device = state.device ?? "iphone";
   const d = deviceLabel(state.device);
   const help = { d, ip: proxy?.ip, port: proxy?.port };
@@ -49,7 +51,8 @@ export function Connect({ state, dispatch, proxy, proxyError, addressRejected, o
         </>
       }
     >
-      <ConnectionNotices d={d} refused={state.deviceRefused} restart={restart} onRestart={() => onRestart()} />
+      <ConnectionNotices d={d} state={state} restart={restart} onRestart={() => onRestart()} />
+      {addressChanged && <Callout tone="warn" title={t.addressChanged(d)} alert />}
       {addressRejected && (
         <Callout tone="warn" title={t.addressRejected(addressRejected)} alert>
           <button type="button" className="secondary" disabled={restart === "busy"} onClick={() => onRestart(addressRejected)}>
@@ -83,8 +86,8 @@ export function Connect({ state, dispatch, proxy, proxyError, addressRejected, o
               </label>
             )}
           </div>
+          <Callout tone="info"><p>{t.firewall}</p></Callout>
           <Guide steps={steps} />
-          <p className="quiet-text">{t.firewall}</p>
         </>
       )}
     </Screen>

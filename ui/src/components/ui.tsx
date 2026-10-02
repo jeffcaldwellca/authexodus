@@ -13,8 +13,8 @@ export function Screen({ title, lede, children, footer, status, focusKey }: {
   return (
     <>
       <div className="screen-body">
-        {status}
         <h1 ref={heading} tabIndex={-1}>{title}</h1>
+        {status}
         {lede && <p className="lede">{lede}</p>}
         {children}
       </div>

@@ -4,7 +4,7 @@ import { useState } from "react";
 import type { Device } from "../api";
 import { Callout, Guide, Screen, Waiting, type GuideStep } from "../components/ui";
 import { AuthyPrompt } from "../device/scenes";
-import { Attestation } from "../failures/Attestation";
+import { AuthyProblem } from "../failures/AuthyProblem";
 import { ConnectionNotices } from "../failures/ConnectionNotices";
 import { MethodBroken } from "../failures/MethodBroken";
 import { StopConfirm } from "../failures/StopConfirm";
@@ -40,7 +40,7 @@ export function Authy({ state, dispatch, proxy, onRestart, restart }: ScreenProp
       footer={
         <>
           <Trouble d={d} mentionAuthy onAbandon={abandon} onRestart={() => onRestart()}>
-            <Attestation {...help} collapsible />
+            <AuthyProblem {...help} collapsible />
             <Vpn {...help} collapsible />
             <Trust {...help} collapsible />
           </Trouble>
@@ -48,14 +48,15 @@ export function Authy({ state, dispatch, proxy, onRestart, restart }: ScreenProp
         </>
       }
     >
-      <ConnectionNotices d={d} refused={state.deviceRefused} restart={restart} onRestart={() => onRestart()} />
-      {trouble === "attestation" && <Attestation {...help} />}
+      <ConnectionNotices d={d} state={state} restart={restart} onRestart={() => onRestart()} />
+      {state.restarts === 0 && <Callout tone="warn" title={t.lastCheck.title}><p>{t.lastCheck.body}</p></Callout>}
+      {trouble === "authyError" && <AuthyProblem {...help} status={state.authyError?.status} />}
       {trouble === "methodBroken" && (
         <MethodBroken {...help}>
           <button type="button" className="secondary" onClick={() => setConfirming(true)}>{en.common.stopAndCleanUp}</button>
         </MethodBroken>
       )}
-      {confirming && <StopConfirm mentionAuthy onCancel={() => setConfirming(false)} onConfirm={abandon} />}
+      {confirming && <StopConfirm d={d} mentionAuthy onCancel={() => setConfirming(false)} onConfirm={abandon} />}
       <Guide steps={steps} />
     </Screen>
   );

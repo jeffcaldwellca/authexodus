@@ -1,6 +1,6 @@
 # Moving your accounts by hand
 
-Use this guide if authexodus does not work for you, if you use an Android phone, or if you only have a few accounts. You move one account at a time. It is slow but it always works, and it needs nothing from Authy except that it keeps running until you finish.
+Use this guide if authexodus does not work for you, if you use an Android phone, or if you only have a few accounts. You move one account at a time. It is slow, but it works for any account that lets you change its authenticator app, and it needs nothing from Authy except that it keeps running until you finish.
 
 ## Before you start
 

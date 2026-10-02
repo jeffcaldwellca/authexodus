@@ -17,6 +17,8 @@ function CheckArt({ id, device }: { id: CheckId; device: Device }) {
     case "backups": return <AuthyBackups device={device} />;
     case "password": return <AuthyPrompt device={device} stop={false} />;
     case "multiDevice": return <AuthyDevices device={device} />;
+    // Nothing in Authy to point at: the check is about the phone number itself.
+    case "sms": return null;
   }
 }
 
@@ -48,6 +50,7 @@ export function Welcome({ api, state, dispatch }: ScreenProps) {
         </>
       }
     >
+      <Callout tone="info"><p>{t.network}</p></Callout>
       <div className="welcome-top">
         <div>
           <h2>{t.planTitle}</h2>
@@ -77,7 +80,7 @@ export function Welcome({ api, state, dispatch }: ScreenProps) {
       ) : (
         <>
           <h2>{t.checksTitle}</h2>
-          <p className="quiet-text">{t.checksWhy}</p>
+          <Callout tone="warn"><p>{t.checksWhy}</p></Callout>
           <div className="ticks two-up">
             {CHECK_IDS.map((id) => (
               <Tick
@@ -86,14 +89,14 @@ export function Welcome({ api, state, dispatch }: ScreenProps) {
                 onChange={(value) => dispatch({ type: "setCheck", id, value })}
                 label={labelFor(id)}
                 detail={t.checks[id].where}
-                extra={
+                extra={id === "sms" ? undefined : (
                   <>
-                    <button type="button" className="quiet small" aria-expanded={shown === id} aria-label={en.common.showPictureFor(labelFor(id))} onClick={() => setShown(shown === id ? null : id)}>
+                    <button type="button" className="quiet small" aria-expanded={shown === id} aria-label={shown === id ? en.common.hidePictureFor(labelFor(id)) : en.common.showPictureFor(labelFor(id))} onClick={() => setShown(shown === id ? null : id)}>
                       {shown === id ? en.common.hidePicture : en.common.showPicture}
                     </button>
                     {shown === id && <div className="guide-figure"><CheckArt id={id} device={state.device ?? "iphone"} /></div>}
                   </>
-                }
+                )}
               />
             ))}
           </div>

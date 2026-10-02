@@ -27,7 +27,10 @@ export function App({ api, devTools }: { api: Api; devTools?: ReactNode }) {
   const [proxyError, setProxyError] = useState(false);
   const [addressRejected, setAddressRejected] = useState<string | null>(null);
   const [restart, setRestart] = useState<RestartState>("idle");
+  const [addressChanged, setAddressChanged] = useState(false);
   const proxyAsked = useRef(false);
+  const proxyNow = useRef<ProxyInfo | null>(null);
+  proxyNow.current = proxy;
 
   useEffect(() => {
     let live = true;
@@ -46,18 +49,31 @@ export function App({ api, devTools }: { api: Api; devTools?: ReactNode }) {
   // The shell refuses a new address once a backup is captured; the way through is a restart.
   const pickAddress = useCallback((ip: string) => {
     setAddressRejected(null);
+    setAddressChanged(false);
     api.startProxy(ip).then(setProxy).catch(() => setAddressRejected(ip));
   }, [api]);
 
   const restartProxy = useCallback((ip?: string) => {
+    const before = proxyNow.current;
+    // Unless a new address was asked for, stay on the one the device is already set to.
+    const keep = ip ?? before?.ip;
     setRestart("busy");
-    api.restartProxy(ip)
+    // Reset progress now, not when the shell answers: events from the new proxy can arrive
+    // first, and they must land on the reset state instead of being wiped by it.
+    dispatch({ type: "restarting" });
+    api.restartProxy(keep)
+      .catch((err: unknown) => {
+        // The address the device was using is gone (this computer's address changed):
+        // fall back once to whatever address the shell picks.
+        if (ip !== undefined || keep === undefined) throw err;
+        return api.restartProxy();
+      })
       .then((info) => {
         setProxy(info);
         setProxyError(false);
         setAddressRejected(null);
+        setAddressChanged(before !== null && ip === undefined && (info.ip !== before.ip || info.port !== before.port));
         setRestart("idle");
-        dispatch({ type: "restarted" });
       })
       .catch(() => setRestart("failed"));
   }, [api]);
@@ -105,11 +121,14 @@ export function App({ api, devTools }: { api: Api; devTools?: ReactNode }) {
       </nav>
       {/* `key` remounts the screen on each step, which moves focus to its heading. */}
       <main className="main" key={state.step}>
+        {loaded === "ready" && state.step !== "done" && (
+          <p className="step-of">{en.common.stepOf(position + 1, RAIL.length, en.rail.steps[state.step])}</p>
+        )}
         {loaded === "loading" && <p className="loading" role="status">{en.common.loading}</p>}
         {loaded === "failed" && <div className="screen-body"><Callout tone="error" title={en.common.loadFailed} alert /></div>}
         {loaded === "ready" && state.step === "welcome" && <Welcome {...props} />}
         {loaded === "ready" && state.step === "connect" && (
-          <Connect {...props} proxyError={proxyError} addressRejected={addressRejected} onPickAddress={pickAddress} onRetry={startProxy} />
+          <Connect {...props} proxyError={proxyError} addressRejected={addressRejected} addressChanged={addressChanged} onPickAddress={pickAddress} onRetry={startProxy} />
         )}
         {loaded === "ready" && state.step === "certificate" && <Certificate {...props} />}
         {loaded === "ready" && state.step === "authy" && <Authy {...props} />}
