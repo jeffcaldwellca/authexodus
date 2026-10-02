@@ -22,4 +22,30 @@ describe("api.fake", () => {
     api.emitProxyEvent({ kind: "trustWorking" });
     expect(seen).toEqual([{ kind: "deviceConnected" }]);
   });
+
+  it("unlocks only with the exact scripted password", async () => {
+    const api = createFakeApi({}, { password: " pass word " });
+    expect(await api.unlock("pass word")).toEqual({ error: "wrongPassword" });
+    expect(await api.liveCodes()).toEqual([]);
+    const summary = await api.unlock(" pass word ");
+    expect("tokens" in summary && summary.tokens.length).toBeGreaterThan(0);
+    expect((await api.liveCodes()).every((c) => /^\d{6}$/.test(c.code))).toBe(true);
+  });
+
+  it("a second apply adds nothing twice and never attaches to a login that has a code", async () => {
+    const api = createFakeApi();
+    const decisions = (await api.bwPropose()).map((p) => ({ tokenId: p.tokenId, decision: p.decision }));
+    const first = await api.bwApply(decisions);
+    expect(first).toMatchObject({ attached: 5, created: 2, kept: ["Dropbox"], failed: null });
+    expect(await api.bwApply(decisions)).toMatchObject({ attached: 0, created: 0 });
+  });
+
+  it("starting the proxy leaves a run to clean up until finish", async () => {
+    const api = createFakeApi();
+    const info = await api.startProxy("10.0.0.12");
+    expect(info).toMatchObject({ ip: "10.0.0.12", certUrl: "http://10.0.0.12:8080/" });
+    expect((await api.getState()).resumeCleanup).toBe(true);
+    await api.finish();
+    expect((await api.getState()).resumeCleanup).toBe(false);
+  });
 });
