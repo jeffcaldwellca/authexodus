@@ -25,7 +25,14 @@ The checks cannot all be done in one pass, because some need a thing switched of
 
 **Run 2, on the iPad: the clean run.** Start to finish with no experiments, exactly as a first-time person would do it. This is the run that says whether the app works.
 
+**Keep the Mac plugged in, with its lid open, for the whole of each run.** The app stops the Mac from going to sleep by itself, but closing the lid still puts it to sleep, and a sleeping Mac cuts the device off from the internet and breaks Authy's sign-in. Leave the app's window open too.
+
 **Bitwarden: use a THROWAWAY vault.** The maintainer's real vault already had its codes moved by hand, so running the match against it would create duplicates. Make a new free Bitwarden account, add six to ten logins by hand with names that match some of your Authy accounts (and one that already has an authenticator key), and use that.
+
+A brand-new vault with nothing else set up **cannot sign in with a password alone**: Bitwarden emails a code to every new device, and the app cannot enter it. The vault needs EITHER authenticator-app two-step login OR an API key. Both are experiments, so set up both before you start:
+
+- **Experiment A, authenticator-app two-step login.** In the web vault: Settings → Security → Two-step login → Authenticator app. Put its key into any authenticator you have to hand (not Authy). Used in "The Bitwarden path", first sign-in.
+- **Experiment B, API key.** In the web vault: Settings → Security → Keys → View API key. Copy the `client_id` and `client_secret` somewhere you can paste from. For this experiment switch the authenticator-app two-step login OFF again (or make a second throwaway vault that never had it), so that a password sign-in is refused and the app has to ask for the key.
 
 **Test the built release app, not `pnpm tauri dev`.** Unlocking 40 accounts is slow in a debug build and would look like a hang.
 
@@ -35,7 +42,7 @@ The checks cannot all be done in one pass, because some need a thing switched of
 AUTHEXODUS_LOG=debug /path/to/authexodus.app/Contents/MacOS/authexodus 2>&1 | tee ~/Desktop/authexodus-run1.log
 ```
 
-Use `authexodus-run2.log` for the iPad run. The app itself writes no log file; this is the only record. The lines hold request paths and status codes, never passwords or codes, but read the file before you share it.
+Use `authexodus-run2.log` for the iPad run. The app itself writes no log file; this is the only record. The lines hold request paths, status codes, this Mac's and the device's network addresses and the certificate's fingerprint, never passwords or codes, but read the file before you share it.
 
 **Whenever a secure connection fails** (the Test page does not load, Authy will not sign in, the app shows "The certificate isn't trusted yet" when trust is on), copy the ten or so log lines around that moment into Notes. This is how we learn whether iOS refuses the limited certificate.
 
@@ -44,11 +51,13 @@ Use `authexodus-run2.log` for the iPad run. The app itself writes no log file; t
 You need:
 
 - [ ] A Mac with the built release app (`.app` or `.dmg`) from the commit being tagged. Version and commit: ______
+- [ ] The Mac is plugged in and its lid is open. It stays that way until Clean up is finished.
 - [ ] An iPhone and an iPad. Authy is installed and signed in on both, with real accounts in it.
 - [ ] The phone that receives text messages for your Authy number, with you and working.
 - [ ] The Mac and both devices on the same home or office Wi-Fi that you control. Not a guest, café or hotel network.
 - [ ] A second authenticator app to move codes into. For the file tests you also need the apps listed in "Export formats".
-- [ ] The throwaway Bitwarden vault described above. Its email: ______
+- [ ] The throwaway Bitwarden vault described above, with Experiment A and Experiment B both prepared. Its email: ______
+- [ ] Optional: a second Authy account whose backups are switched off, on a spare device, for the empty-backup check. Skip that check if you have none.
 - [ ] An Android phone or tablet, only for the Aegis test (Aegis is Android-only).
 - [ ] Keychain Access open on the Mac (Applications > Utilities > Keychain Access), search box set to `authexodus`.
 - [ ] Finder open at `~/Library/Application Support/dev.somecorp.authexodus` (Finder > Go > Go to Folder). It may not exist yet.
@@ -83,6 +92,8 @@ This is the first time the app has ever run in a real window. Everything else de
 - [ ] The window is NOT blank or white. If it is blank, the content-security policy (`tauri.conf.json`) or the capability file (`src-tauri/capabilities/default.json`) is blocking the screen. Stop and record what you see and the Terminal lines: ______
 - [ ] The text is styled. Under the steps list it says `Version 0.1.0`, then **New versions are published at** and an address.
 - [ ] Terminal shows diagnostic lines as the app starts. First few lines: ______
+- [ ] **The icon.** In the Dock, and in Finder (Applications, icon view and list view), the app shows its own icon: a teal tile with a white door frame and a yellow arrow leaving it. It is not a flat blue square and not the generic app icon. Readable at the small list-view size: yes / no
+- [ ] **A second copy cannot be opened.** With the app running, open it again (double-click it in Finder, and also run the Terminal command a second time in another window). No second window appears and the first one keeps working. What happened: ______
 
 ## Safety check (Welcome)
 
@@ -101,7 +112,10 @@ This is the first time the app has ever run in a real window. Everything else de
 ## Connect
 
 - [ ] **[Provoke P1: firewall.]** When the Connect screen opens, macOS asks whether authexodus may accept incoming network connections. Exact wording of the prompt and of its two buttons ("Deny" or "Don't Allow"?): ______ Choose the one that does **not** allow it.
+- [ ] **Local network permission (macOS 15 and later).** macOS may ask whether authexodus may find and connect to devices on your local network. Did it ask: yes / no. Exact wording of the prompt and its buttons: ______ Choose Allow. If you chose not to allow it, the device cannot reach the app and nothing on screen says why: record what you saw, then allow it in System Settings > Privacy & Security > Local Network.
 - [ ] Keychain: macOS may also ask for permission to use the Keychain. Exact wording: ______
+- [ ] **App says**, in a strip above the heading, "Keep this window open and this Mac awake and plugged in until you finish. Do not close the lid: a sleeping Mac cuts your iPhone off from the internet." It stays there on every step up to and including Check codes.
+- [ ] Under the heading there is a small control, "Using an iPad instead?". Press it: the heading, the steps and the drawings change to the iPad's. Press "Using an iPhone instead?" to go back.
 - [ ] In Keychain Access, a new item appears for authexodus (service `dev.somecorp.authexodus`, account `ca`). Kind and keychain: ______
 - [ ] In the Finder folder, `session.json` now exists. The folder is owner-only (`ls -ld` shows `drwx------`): ______
 - [ ] The screen says **Connect your iPhone to this computer** and shows Server and Port. Write them down, you need them later: Server ______ Port ______
@@ -138,6 +152,17 @@ This is the first time the app has ever run in a real window. Everything else de
 - [ ] Go back to the Safari page and tap **Test**. The page says **Certificate is trusted**. If it does not, this is open question (a): copy the Terminal lines and go to "If the limited certificate is refused" below.
 - [ ] The app moves on by itself to Reinstall Authy.
 
+## Before deleting Authy: reload, and the Mac's own address
+
+- [ ] **Reload recovery (only if a reload is possible).** Right-click an empty part of the window. If the menu offers Reload, choose it. If it does not, write "no reload offered" and skip this check: ______
+  - [ ] The app comes back on **Reinstall Authy**, not on the Safety check, and says "The window was reloaded, and you are back where you were. Do not redo anything you have already done on your iPhone."
+  - [ ] The Terminal shows no second start of the proxy, and the iPhone's proxy still works: Safari on the iPhone loads a page.
+  - [ ] Nothing in Keychain Access changed (the item's modification time is the same).
+- [ ] **The Mac's address changes.** On the Mac, turn Wi-Fi off and on (if the router hands back the same address, join a different network and come back, or unplug Ethernet, so the address really changes). Mac's address before ______ and after ______.
+  - [ ] Within a few seconds **App says** "This Mac's network address changed. Your iPhone can no longer reach it." with a **Restart the connection** button. Time it took: ______ If the address did not change, the app should say nothing.
+  - [ ] Press **Restart the connection**. The app goes to Connect, shows the NEW Server and Port inside a yellow outline, and says "This computer's address has changed. Update Server and Port on your iPhone to the ones shown here."
+  - [ ] Type the new Server and Port on the iPhone, open the Test page. The app moves forward by itself.
+
 ## Before deleting Authy: two more experiments
 
 - [ ] **[Provoke P5: a second device.]** Set the iPad's Wi-Fi proxy to the same Server and Port and open Safari or Authy on it. The iPhone keeps working. The app shows **Authy can't connect? Another device was turned away**. Is the text understandable? ______ Set the iPad's proxy back to Off. Do NOT press Restart for this one; note whether the panel stays: ______
@@ -152,6 +177,9 @@ This is the first time the app has ever run in a real window. Everything else de
 ## Reinstall Authy
 
 - [ ] **App says** (first time only) **You are about to delete Authy**, listing what you confirmed.
+- [ ] Open **Having trouble?** and read the list. It now includes **Authy sent no accounts** and **This method no longer works with Authy**, each of which opens to show what to do. Close it.
+- [ ] **Still waiting? (only if it happens.)** If three minutes pass on this screen with nothing captured, the app shows **Still waiting?** pointing at Having trouble? and offering Restart the connection. Did it appear: yes / no / the backup arrived first.
+- [ ] **Empty backup (optional: only with a second Authy account whose backups are switched off).** On a short extra run, sign that account in on the device at this step. Instead of waiting for ever, the app shows **Authy sent no accounts**, says backups are probably turned off, and lists how to turn them on. Shown: yes / no / not tested. Stop and clean up afterwards.
 - [ ] **[Provoke P7: stop, then cancel.]** Open **Having trouble?**, choose **Stop and clean up**. A box asks **Stop and clean up?** and says what is lost, what you would redo, and to finish signing in to Authy. Choose **Keep going**. You are still on Reinstall Authy.
 - [ ] On the iPhone: touch and hold the Authy icon and delete the app. Real wording of the menu items: ______
 - [ ] Install Authy from the App Store. Open it.
@@ -165,6 +193,7 @@ This is the first time the app has ever run in a real window. Everything else de
 
 - [ ] **[Provoke P8.]** Type a wrong password first. **App says** "That password is not right." and keeps what you typed in the box.
 - [ ] **App says** "Can't find the password? Keep trying here: nothing is lost by a wrong try. …"
+- [ ] There is a fold-out, "Fewer accounts than you expected?", with a **Capture again** button. Open it and read it; do NOT press the button unless the count is really too low (it restarts the connection and discards the capture). If you did press it, what happened: ______
 - [ ] Type the correct backup password and press Unlock. Time it took to unlock: ______ (a release build should take seconds, not minutes).
 - [ ] If your password has a space at the start or end, or a non-English character, it still works. Only test this if your real password has one.
 
@@ -174,6 +203,7 @@ This is the first time the app has ever run in a real window. Everything else de
 - [ ] The screen says "N accounts are ready to move".
 - [ ] Any Authy-native 7-digit account (for example Twitch) is listed under "can't be moved", ABOVE the four choices. Count: ______
 - [ ] **Check the codes** is disabled, and the screen says why: "Check the codes is switched off until something has been moved: …".
+- [ ] The foot of the screen also offers **Back to Unlock** (until something is moved) and **Stop and clean up**. Press Back to Unlock: the Unlock screen returns with the same captured count. Unlock again.
 - [ ] Do the sections "Export formats" and "The Bitwarden path" below, then come back.
 - [ ] After one code is scanned and ticked (or a file saved, or Bitwarden applied), Check the codes becomes available.
 
@@ -265,20 +295,23 @@ AUTHEXODUS_UNCONSTRAINED_CA=1 AUTHEXODUS_LOG=debug /path/to/authexodus.app/Conte
 - [ ] **Stop and clean up for real, mid-run.** On a short extra run, at Certificate choose Having trouble? > Stop and clean up > Stop and clean up. The app goes to **Put everything back**. Before switching the proxy off, try to load a web page on the device: it has no internet (the app says so at the top). Switch the proxy off: it loads. Finish. The last screen says **Cleaned up. Nothing was moved** and shows how to move an account by hand.
 - [ ] **Bitwarden wrong master password.** "Bitwarden did not accept that email and master password. Type both again." appears and the password box is empty.
 - [ ] **Bitwarden wrong two-step code.** With two-step login on the throwaway vault (authenticator app), type a wrong code: "Bitwarden did not accept that code. Wait for a new one and try again." The master password is not asked for again.
-- [ ] **Bitwarden new-device email check.** On a vault with NO two-step login, Bitwarden may email a code to confirm a new device. What the app shows, word for word: ______ (Expected: a clear message that points to "Save a file for another app, then Bitwarden", not a freeze.)
+- [ ] **Bitwarden new-device email check.** Covered by Experiment B in "The Bitwarden path": on a vault with NO two-step login the app must ask for an API key, not freeze and not ask for a two-step code you do not have.
+- [ ] **Stop before any device connects.** On a short extra run, at Connect (before the device is pointed at the proxy) choose Having trouble? > Stop and clean up. Clean up asks only for the proxy to be off, and says "No certificate was installed on your iPhone, so there is no profile to remove."
 - [ ] **Network pulled during the Bitwarden apply.** Start Apply with many accounts. Turn the Mac's Wi-Fi off partway. The app shows **Bitwarden is partly updated** with **Run again**. Turn Wi-Fi on, press Run again. It finishes and nothing is added twice.
 
 ## Export formats to import for real
 
 For each: save or scan, import into the real app, then open two imported accounts and compare their codes with Authy. Tick only when the two codes match. Several formats were written from documentation without ever being tried.
 
+After each file is saved, the app shows that app's import steps under the button, titled like "Next: get it into Bitwarden", ending with a line that says whether the format has been tested with the real app. For every app below, also record whether those steps matched the real menus: where the app's wording says "look for", write down the real path.
+
 - [ ] **QR codes, one by one** ("Scan into any app"). Scan three accounts, ticking "I scanned this code into my new app" for each. Codes match.
 - [ ] **Google Authenticator** (QR batches). The app says to open the menu and look for Transfer accounts, then Import accounts. Real path in the current Google Authenticator: ______ (UNVERIFIED: the format was written from memory and never scanned.) Scan every code with a real camera, including a FULL code of 10 accounts: does a 10-account code scan from the screen at normal distance? ______ Number of codes shown: ______ Accounts imported: ______ Any account listed under "not in these codes": ______
-- [ ] **Bitwarden file** (CSV). Bitwarden web vault > Tools > Import data > "Bitwarden (csv)". File `authy-bitwarden-import.csv`. Codes match.
+- [ ] **Bitwarden file** (CSV). Bitwarden web vault > Tools > Import data > "Bitwarden (csv)". File `authy-bitwarden-import.csv`. Codes match. The app's steps name that format: yes / no
 - [ ] **1Password** (CSV `authy-1password-import.csv`). UNVERIFIED: only the "one-time password" column name is confirmed. Does 1Password import and attach a one-time password to each item? yes / no. Error: ______
-- [ ] **2FAS** (`authy-2fas-backup.2fas`). UNVERIFIED: the format is guessed from third-party samples. Imports, and codes match? yes / no: ______
+- [ ] **2FAS** (`authy-2fas-backup.2fas`). UNVERIFIED: the format is guessed from third-party samples. The app's steps say to AirDrop the file to the iPhone or iPad and save it to Files. That works: yes / no. Imports, and codes match? yes / no: ______ Real path to 2FAS's import: ______
 - [ ] **Aegis** (`authy-aegis-import.json`). Needs Android with Aegis. Import, compare two codes. Android model: ______
-- [ ] **Proton Authenticator** (`authy-proton-authenticator-import.json`). PARTLY VERIFIED: Aegis-style JSON in the hope Proton accepts it. yes / no: ______
+- [ ] **Proton Authenticator** (`authy-proton-authenticator-import.json`). PARTLY VERIFIED: Aegis-style JSON in the hope Proton accepts it. The app's steps say to choose Aegis as the source. Choosing Aegis in Proton's import works: yes / no: ______ Real path to Proton's import: ______
 - [ ] **Plain text** (`authy-otpauth-uris.txt`). One `otpauth://` line per account. Make a QR from one line or paste it into an app that takes such links; codes match.
 
 For every file saved:
@@ -295,19 +328,28 @@ For every file saved:
 Use the THROWAWAY vault. Choose "Bitwarden, matched to your logins".
 
 - [ ] **App says** that it downloads Bitwarden's own command-line tool and checks that it is genuine, and "Apart from this download, the app only uses the internet when Bitwarden's tool talks to Bitwarden."
-- [ ] Click **Download and continue**. The app shows "Downloading Bitwarden's tool and checking it…" and then moves to **Sign in to Bitwarden**. Time taken: ______ (It downloads release `cli-v2026.9.1` from github.com and checks a fixed checksum; there is no separate "checked" message.)
-- [ ] Before you type anything, the sign-in screen says that only authenticator-app codes work for two-step login, and to use "Save a file for another app, then Bitwarden" otherwise.
+- [ ] Before the download, the screen has a box titled **Some accounts need an API key to sign in here**, and says the path is not yet tested with a real Bitwarden vault.
+- [ ] **Cancel during the download.** Click **Download and continue**, and at once click **Cancel**. **App says** "The download was cancelled." and stays on the same screen, with no error. In the app data folder no half-downloaded file is left behind: ______
+- [ ] Click **Download and continue** again. The app shows "Downloading Bitwarden's tool and checking it…" with progress lines appearing under it, and then moves to **Sign in to Bitwarden**. Time taken: ______ Progress lines seen: ______ (It downloads release `cli-v2026.9.1` from github.com and checks a fixed checksum.)
+- [ ] Before you type anything, the sign-in screen says that only authenticator-app codes work for a two-step code, and offers "Sign in with an API key instead" as well as the file route.
 - [ ] Region: "bitwarden.com", "bitwarden.eu" or "My own server" (an address starting `https://`). Which you used: ______
-- [ ] With an authenticator app as two-step login: **App says** "Bitwarden needs your two-step login code. Enter the 6-digit code from your authenticator app and sign in again." The master password box is gone while it waits. Enter the code. It signs in.
+- [ ] **Experiment A.** With an authenticator app as two-step login: **App says** "Bitwarden needs your two-step login code. Enter the 6-digit code from your authenticator app and sign in again." The master password box is gone while it waits. Enter the code. It signs in.
+- [ ] **Attach by hand.** In the match table every row has **Choose a different login…**. Press it on a row the app got wrong (or on any row). A panel lists every login in the vault with a search box. Search for part of a name: the list narrows. The login you gave an authenticator key by hand shows "already has a code" and cannot be chosen; a login already chosen on another row says which account has it and cannot be chosen either. Choose a free one: the panel closes and the row shows "Add to …" with that login. Do it once with the keyboard only (Tab, type, Tab, Return; Escape closes without changing the row).
 - [ ] The match table lists every account on the left and an action on the right. Check at least five rows: each is attached to the login you would pick, or offered as **Create a new login in the “Authy import” folder**. Any wrong attach: ______
 - [ ] An account with a common name that could be two logins is shown as a question ("Which Bitwarden login does this code belong to?"), not decided for you.
 - [ ] The login you gave an authenticator key by hand is listed as "already has a code", cannot be chosen, and its row waits for your answer.
-- [ ] Press **Apply to Bitwarden**. Progress shows. The report says how many codes were added, how many logins were created and how many were skipped.
+- [ ] Press **Apply to Bitwarden**. Progress shows, from the first account to the last. The report says how many codes were added, how many entries were created and how many accounts were skipped ("these stay only in Authy").
 - [ ] In Bitwarden, open three attached logins. Each has a code, and it matches Authy.
 - [ ] A new folder **Authy import** exists with the created logins.
-- [ ] Run it a second time: **Back to the choices**, Bitwarden again, sign in, apply again. It adds nothing and creates no duplicates.
+- [ ] Run it a second time: **Back to the choices**, Bitwarden again, sign in, apply again. It adds nothing and creates no duplicates. This time the report has a separate list, **Already in Bitwarden**, with one line for each code that was already there, and those are NOT counted as skipped.
+- [ ] **Experiment B, the API key.** Switch the vault's two-step login off (or use the second throwaway vault). **Back to the choices**, Bitwarden again, and sign in with email and master password only.
+  - [ ] **App says** "Bitwarden wants to confirm this sign-in by email or with a security key, which this app cannot do. Sign in with an API key instead." and shows a form for `client_id`, `client_secret` and the master password. What the app showed if not that, word for word: ______
+  - [ ] The form says where the key is: "In Bitwarden's web vault look under Settings → Security → Keys for “View API key”. It shows two values: client_id and client_secret. Copy each one here." Is that the real path in today's web vault? ______
+  - [ ] The master password box is empty again (what you typed for the first try was not kept). Paste both values, type the master password, and sign in. It signs in and reaches the match table: yes / no. Terminal lines if not: ______
+  - [ ] On a fresh visit to the sign-in screen, the link "Sign in with an API key instead" opens the same form without a failed try first.
+- [ ] **Signed out part-way (optional).** With the match table open, go to the web vault and choose Settings → Security → Deauthorize sessions. Back in the app press Apply. **App says** "Bitwarden signed you out. Sign in again and your choices will still be here." with **Sign in again**. Sign in: you are back on the match table with every choice as you left it. Tested: yes / no / could not provoke it.
 - [ ] The login that already had a code still has its old code.
-- [ ] After the Bitwarden step, in the app data folder, `bw-data` is gone. (`bw-cli`, the downloaded tool, stays on purpose.)
+- [ ] After the Bitwarden step, in the app data folder, `bw-data` is gone once you leave the Bitwarden screens for Clean up. (`bw-cli`, the downloaded tool, stays until Clean up finishes.)
 
 ## Clean up
 
@@ -322,8 +364,11 @@ Do this at the end of EVERY run, including runs that failed.
 - [ ] Authy on the device is signed in and shows all your accounts and codes. Tick **Authy is signed in and shows my codes**.
 - [ ] If you saved a file: delete it and empty the Trash. Tick **I deleted the file I saved**.
 - [ ] In Keychain Access, the authexodus item is gone (Cmd-R refreshes the search).
-- [ ] Click **Finish**. The last screen says **All done** (or **Cleaned up. Nothing was moved** if nothing was moved). If some accounts could not move, it says how many still live only in Authy.
-- [ ] In `~/Library/Application Support/dev.somecorp.authexodus` nothing from the run is left: no `session.json`, no `bw-data`. (`bw-cli` is expected after the Bitwarden path.) Anything else: ______
+- [ ] If some accounts could not move, Clean up lists them by name under "still only in Authy".
+- [ ] Click **Finish**. The last screen says **All done** (or **Cleaned up. Nothing was moved** if nothing was moved). If some accounts could not move, it says how many still live only in Authy and lists them by name.
+- [ ] The last screen offers **Start again from the beginning** and says that the app has forgotten your codes, so moving them to another app means a whole new run. (Do not press it now unless you are starting the next run.)
+- [ ] Confirm nothing is left under `~/Library/Application Support/dev.somecorp.authexodus` after finishing: `ls -la` on that folder shows no `session.json`, no `bw-data` and no `bw-cli`. What it shows: ______
+- [ ] What macOS keeps on its own account (expected, and none of it holds codes): `~/Library/WebKit/dev.somecorp.authexodus` and `~/Library/Caches/dev.somecorp.authexodus`. Present: ______
 - [ ] In Terminal, `find ~ -name "*.authexodus-tmp" 2>/dev/null` prints nothing.
 - [ ] Quit the app and open it again. It opens on Welcome, not on Clean up.
 - [ ] The Mac is no longer listening: `lsof -iTCP:<the Port you wrote down> -sTCP:LISTEN` prints nothing.
@@ -335,7 +380,7 @@ Do this at the end of EVERY run, including runs that failed.
 - [ ] **Keyboard only.** From Welcome to Connect using only Tab, Space and Return. Every control is reachable and the focus ring is always visible. Problems: ______
 - [ ] **VoiceOver** (Cmd-F5). On each screen change the heading is read, then the status line under it ("Your iPhone is connected."). "Captured N accounts" is announced. Problems: ______
 - [ ] **Dark mode.** Switch macOS to Dark. Every screen from Welcome to Clean up is readable; the device drawings follow. Problems: ______
-- [ ] **Small window.** Drag the window down to about 720 by 560. The step list disappears and a line such as "Step 3 of 8: Certificate" appears above the heading. Nothing is cut off; long screens scroll. Problems: ______
+- [ ] **Small window.** Drag the window down to about 720 by 560. The step list disappears and a line such as "Step 3 of 8: Certificate" appears above the heading. The version and the releases address are still on screen, in a strip along the bottom. Nothing is cut off; long screens scroll. Problems: ______
 
 ## Record
 

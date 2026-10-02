@@ -64,6 +64,28 @@ describe("documents", () => {
       en.done.titleNothingMoved,
       en.common.stepOf(3, 8, en.rail.steps.certificate),
       en.certName,
+      // Added with the completeness fixes.
+      en.common.keepOpen(iphone),
+      en.common.switchDevice(en.deviceName.ipad),
+      en.common.reloaded(iphone),
+      en.problems.byCode.address_changed.title(iphone),
+      en.failures.emptyBackup.title,
+      en.authy.stillWaiting.title,
+      en.unlock.recapture.action,
+      en.destination.backToUnlock,
+      en.destination.file.guideTitle(en.destination.file.apps.bitwarden),
+      en.bitwarden.introKeyTitle,
+      en.bitwarden.prepareCancelled,
+      en.bitwarden.useApiKey,
+      en.bitwarden.apiKey.needed,
+      en.bitwarden.apiKey.where,
+      en.bitwarden.chooseOther,
+      en.bitwarden.picker.hasCode,
+      en.bitwarden.keptTitle,
+      en.problems.byCode.bw_session_expired.title(iphone),
+      en.bitwarden.signInAgain,
+      en.cleanup.noCertificate(iphone),
+      en.done.startAgain,
     ];
     const missing = quoted.filter((text) => !checklist.includes(text));
     expect(missing).toEqual([]);
@@ -89,6 +111,46 @@ describe("documents", () => {
     expect(readme).toMatch(/only codes from an authenticator app work/);
     expect(readme).toMatch(/AUTHEXODUS_LOG=debug/);
     expect(readme).toMatch(/AUTHEXODUS_UNCONSTRAINED_CA=1[^\n]*\n?[^\n]*testing aid/);
+  });
+
+  it("the README covers what the completeness review found missing from it", () => {
+    // Sign-in by API key, and who needs it.
+    expect(readme).toMatch(/API key/);
+    expect(readme).toMatch(/Settings → Security → Keys/);
+    expect(readme).toMatch(/no two-step login/i);
+    // Attaching by hand.
+    expect(readme).toMatch(/Choose a different login/);
+    // Keeping the Mac awake, and one window only.
+    expect(readme).toMatch(/plugged in/);
+    expect(readme).toMatch(/closing the lid/i);
+    expect(readme).toMatch(/only one copy/i);
+    // What is left on disk.
+    expect(readme).toMatch(/## What is left on your Mac afterwards/);
+    expect(readme).toMatch(/Library\/Application Support\/dev\.somecorp\.authexodus/);
+    // Which destinations have been tried against the real app.
+    expect(readme).toMatch(/## Which destinations have been tested/);
+    for (const app of ["1Password", "2FAS", "Aegis", "Proton Authenticator", "Google Authenticator", "Bitwarden"]) expect(readme).toContain(app);
+    // The releases address does not exist yet, and the README must not say it does.
+    expect(readme).toMatch(/Releases will be published at/);
+    expect(readme).not.toMatch(/Releases are on the/);
+  });
+
+  it("the import steps in the app and the README agree on the two traps", () => {
+    const guides = en.destination.file.guides;
+    expect(guides.bitwarden.steps.join(" ")).toMatch(/Bitwarden \(csv\)/);
+    expect(guides.protonAuthenticator.steps.join(" ")).toMatch(/choose Aegis/);
+    expect(readme).toMatch(/Bitwarden \(csv\)/);
+    expect(readme).toMatch(/choose Aegis/i);
+  });
+
+  it("the checklist covers the new experiments", () => {
+    for (const needle of [
+      /plugged in/, /lid open/, /API key/, /authenticator-app two-step login/, /reload/i, /Wi-Fi off and on/,
+      /backups are switched off/, /Cancel/, /second copy/, /local network/i, /Dock/, /Finder/,
+      /nothing is left under `~\/Library\/Application Support\/dev\.somecorp\.authexodus`/,
+    ]) expect(checklist, String(needle)).toMatch(needle);
+    // The old advice that could not work is gone.
+    expect(checklist).not.toMatch(/`bw-cli` is expected after the Bitwarden path/);
   });
 
   it("no string claims the certificate can only be used for Authy", () => {
