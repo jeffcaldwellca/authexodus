@@ -291,6 +291,16 @@ async fn rig() -> Rig {
     rig_tuned(|upstream| upstream).await
 }
 
+/// The address the simulated iPhone or iPad has.
+const PHONE: &str = "192.168.1.57";
+
+/// A rig in which every connection to the proxy counts as coming from the phone, for tests
+/// that use an HTTP client (which opens its own connections) and need its traffic to be the
+/// device's. In the plain [`rig`] a connection is this computer's unless a test says otherwise.
+async fn phone_rig() -> Rig {
+    rig_tuned(|upstream| upstream.with_default_peer(PHONE.parse().unwrap())).await
+}
+
 /// The usual rig, with the test upstream adjusted first.
 async fn rig_tuned(tune: impl FnOnce(TestUpstream) -> TestUpstream) -> Rig {
     let upstream_ca = test_ca("stand-in upstream CA");
@@ -332,12 +342,15 @@ impl Rig {
 
     /// Open a connection to the proxy that the proxy will treat as coming from `peer`.
     async fn connect_as(&self, peer: &str) -> TcpStream {
-        let tcp = TcpStream::connect(self.proxy).await.unwrap();
+        // The local port is chosen, and the pretence registered, before the connection is
+        // made: the proxy may accept it before `connect` returns here.
+        let socket = tokio::net::TcpSocket::new_v4().unwrap();
+        socket.bind(SocketAddr::new(LOCALHOST, 0)).unwrap();
         self.upstream
             .as_ref()
             .expect("a test upstream")
-            .pretend_peer(tcp.local_addr().unwrap().port(), peer.parse().unwrap());
-        tcp
+            .pretend_peer(socket.local_addr().unwrap().port(), peer.parse().unwrap());
+        socket.connect(self.proxy).await.unwrap()
     }
 
     /// An HTTP client that uses the proxy and trusts exactly `roots`.
@@ -530,6 +543,20 @@ impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for LogBuffer {
 /// Those tests drive the proxy with raw sockets only, so that the one thing writing to the log
 /// is the proxy (an HTTP client library in the test would log its own view of the hosts).
 fn capture_logs() -> (LogBuffer, tracing::subscriber::DefaultGuard) {
+    // `tracing` remembers for each log line whether anybody wants it, and while exactly one
+    // subscriber exists it answers that from the thread that reaches the line first. Another
+    // test's thread, which has no subscriber, could get there first and switch the line off
+    // for everyone. A second subscriber that lives as long as the process (and discards what
+    // it is given) makes `tracing` ask every subscriber instead.
+    static KEEP_LINES_ON: std::sync::OnceLock<tracing::Dispatch> = std::sync::OnceLock::new();
+    KEEP_LINES_ON.get_or_init(|| {
+        tracing::Dispatch::new(
+            tracing_subscriber::fmt()
+                .with_max_level(tracing::Level::TRACE)
+                .with_writer(std::io::sink)
+                .finish(),
+        )
+    });
     let buffer = LogBuffer::default();
     let subscriber = tracing_subscriber::fmt()
         .with_max_level(tracing::Level::TRACE)
@@ -546,7 +573,7 @@ fn capture_logs() -> (LogBuffer, tracing::subscriber::DefaultGuard) {
 
 #[tokio::test]
 async fn intercepts_authy_and_captures_backup() {
-    let mut rig = rig().await;
+    let mut rig = phone_rig().await;
     assert_eq!(rig.handle.backup().tokens.len(), 0);
 
     let res = rig
@@ -570,6 +597,7 @@ async fn intercepts_authy_and_captures_backup() {
     assert_eq!(
         events,
         [
+            ProxyEvent::DeviceConnected,
             ProxyEvent::TrustWorking,
             ProxyEvent::BackupCaptured { count: 3 }
         ]
@@ -908,7 +936,7 @@ async fn falls_back_when_port_in_use() {
 #[tokio::test]
 async fn logs_never_contain_query_strings() {
     let (logs, _guard) = capture_logs();
-    let mut rig = rig().await;
+    let mut rig = phone_rig().await;
     let (site, site_seen) = serve(None, Arc::new(|_, _, _, _| ok("plain"))).await;
     let ca = rig.ca_der.clone();
 
@@ -977,12 +1005,12 @@ async fn logs_never_contain_query_strings() {
         "method=POST path=/json/fail status=401",
         "method=GET path=/ status=200",
         "method=GET path=/cert status=200",
-        "method=GET path=/missing status=404",
+        "method=GET path=(other) status=404",
     ] {
         assert!(logs.contains(expected), "missing {expected:?} in:\n{logs}");
     }
     for forbidden in [
-        "SECRET", "api_key", "otp1", "token=", "session", "who=", "?",
+        "SECRET", "api_key", "otp1", "token=", "session", "who=", "?", "/missing",
     ] {
         assert!(
             !logs.contains(forbidden),
@@ -1098,7 +1126,7 @@ async fn logs_never_name_tunnelled_or_forwarded_hosts() {
 
 #[tokio::test]
 async fn gzip_encoded_backup_is_captured_and_passed_through_untouched() {
-    let mut rig = rig().await;
+    let mut rig = phone_rig().await;
     let res = rig
         .trusting_client()
         .get(format!(
@@ -1127,7 +1155,7 @@ async fn gzip_encoded_backup_is_captured_and_passed_through_untouched() {
 
 #[tokio::test]
 async fn later_empty_backup_does_not_clobber_and_native_apps_are_added() {
-    let mut rig = rig().await;
+    let mut rig = phone_rig().await;
     let client = rig.trusting_client();
     let get = |path: &str| client.get(format!("https://{AUTHY_HOST}{path}")).send();
 
@@ -1328,7 +1356,7 @@ async fn request_bodies_and_large_responses_pass_through_intact() {
 
 #[tokio::test]
 async fn reconnects_when_authy_closes_the_connection() {
-    let mut rig = rig().await;
+    let mut rig = phone_rig().await;
     let client = rig.trusting_client();
     for path in [
         "/json/close",
@@ -1561,7 +1589,6 @@ async fn numeric_ids_are_redacted_in_logs_and_events() {
 
 #[tokio::test]
 async fn device_connected_needs_a_proxy_request_not_just_a_connection() {
-    const PHONE: &str = "192.168.1.57";
     let mut rig = rig().await;
 
     // A port scanner: connects, says nothing.
@@ -1621,7 +1648,6 @@ async fn device_connected_needs_a_proxy_request_not_just_a_connection() {
 
 #[tokio::test]
 async fn a_second_peer_cannot_replace_the_captured_backup() {
-    const PHONE: &str = "192.168.1.57";
     const STRAY: &str = "192.168.1.99";
     let mut rig = rig().await;
     let ca = rig.ca_der.clone();
@@ -1729,7 +1755,6 @@ async fn authy_is_reached_on_its_own_port_whatever_the_connect_says() {
 
 #[tokio::test]
 async fn this_computer_cannot_take_the_device_slot() {
-    const PHONE: &str = "192.168.1.57";
     const OTHER: &str = "192.168.1.99";
     let mut rig = rig().await;
     let ca = rig.ca_der.clone();
@@ -1839,4 +1864,177 @@ async fn idle_tunnels_are_closed_and_busy_ones_are_not() {
     assert!(matches!(read, Ok(0) | Err(_)), "{read:?}");
     assert!(quiet_since.elapsed() >= idle / 2, "not before it was idle");
     rig.handle.shutdown().await;
+}
+
+// ---------------------------------------------------------------------------------------------
+// Final review fixes
+// ---------------------------------------------------------------------------------------------
+
+#[tokio::test]
+async fn nothing_is_captured_before_there_is_a_device() {
+    let mut rig = rig().await;
+    let ca = rig.ca_der.clone();
+
+    // Something on this computer trusts the root and pushes a backup of its own through the
+    // proxy before any device exists. It is served, but nothing of it is kept.
+    let (head, body) = raw_https(
+        rig.proxy,
+        AUTHY_HOST,
+        443,
+        &[&ca],
+        "GET",
+        "/json/users/9/authenticator_tokens",
+    )
+    .await;
+    assert!(head.starts_with("HTTP/1.1 200"), "{head}");
+    assert_eq!(body, tokens_body(9), "it still gets Authy's answer");
+    assert_eq!(rig.drain().await, [ProxyEvent::TrustWorking]);
+    assert_eq!(
+        rig.handle.backup().tokens.len(),
+        0,
+        "a body served to this computer is not a capture"
+    );
+
+    // The phone arrives. Its smaller backup is the one that is held: the larger one that was
+    // served earlier cannot stand in its way.
+    let (status, tcp) = connect_on(rig.connect_as(PHONE).await, AUTHY_HOST, 443).await;
+    assert_eq!(status, "HTTP/1.1 200 OK");
+    let (head, _) = https_over(
+        tcp,
+        AUTHY_HOST,
+        &[&ca],
+        "GET",
+        "/json/users/1/authenticator_tokens",
+    )
+    .await;
+    assert!(head.starts_with("HTTP/1.1 200"), "{head}");
+    assert_eq!(
+        rig.wait_for(|e| matches!(e, ProxyEvent::BackupCaptured { .. }))
+            .await,
+        [
+            ProxyEvent::DeviceConnected,
+            ProxyEvent::BackupCaptured { count: 3 }
+        ]
+    );
+    let backup = rig.handle.backup();
+    assert_eq!(backup.tokens.len(), 3);
+    assert_eq!(backup.tokens[0].unique_id, "5000");
+    rig.handle.shutdown().await;
+}
+
+#[tokio::test]
+async fn one_peer_cannot_use_up_every_connection() {
+    const STRAY: &str = "192.168.1.99";
+    let (logs, _guard) = capture_logs();
+    let rig = rig_tuned(|upstream| upstream.with_max_per_peer(2)).await;
+    let get = b"GET / HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n";
+
+    // A stray peer opens connections and sits on them.
+    let first = rig.connect_as(STRAY).await;
+    let _second = rig.connect_as(STRAY).await;
+
+    // Its next one is closed without an answer...
+    let mut third = rig.connect_as(STRAY).await;
+    let _ = third.write_all(get).await;
+    let mut answer = Vec::new();
+    let read = tokio::time::timeout(WAIT, third.read_to_end(&mut answer))
+        .await
+        .expect("closed, not left waiting");
+    assert!(matches!(read, Ok(0) | Err(_)), "{read:?}");
+    assert!(answer.is_empty(), "no answer for a peer at its limit");
+
+    // ...while the phone is served as if the stray were not there.
+    for _ in 0..3 {
+        let mut phone = rig.connect_as(PHONE).await;
+        phone.write_all(get).await.unwrap();
+        let mut answer = Vec::new();
+        tokio::time::timeout(WAIT, phone.read_to_end(&mut answer))
+            .await
+            .expect("the phone is served")
+            .unwrap();
+        assert!(answer.starts_with(b"HTTP/1.1 200"));
+    }
+
+    // When the stray lets one go, it may have another.
+    drop(first);
+    let mut served = false;
+    for _ in 0..100 {
+        let mut again = rig.connect_as(STRAY).await;
+        let _ = again.write_all(get).await;
+        let mut answer = Vec::new();
+        let _ = tokio::time::timeout(WAIT, again.read_to_end(&mut answer)).await;
+        if answer.starts_with(b"HTTP/1.1 200") {
+            served = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    assert!(served, "a freed slot is given back to the peer");
+    rig.handle.shutdown().await;
+
+    let logs = logs.text();
+    assert!(
+        logs.contains("a peer is at its connection limit") && logs.contains("limit=2"),
+        "{logs}"
+    );
+    assert!(!logs.contains(STRAY), "the peer is not named:\n{logs}");
+}
+
+#[tokio::test]
+async fn a_refused_certificate_is_logged_with_the_alert_the_device_sent() {
+    let (logs, _guard) = capture_logs();
+    let mut rig = rig().await;
+    let ca = rig.ca_der.clone();
+
+    // A device that does not trust the root: it aborts the handshake with an alert.
+    let stranger = test_ca("some other root");
+    let (status, tcp) = connect_on(rig.connect_as(PHONE).await, AUTHY_HOST, 443).await;
+    assert_eq!(status, "HTTP/1.1 200 OK");
+    let refused = TlsConnector::from(client_tls(&[&stranger.cert_der]))
+        .connect(ServerName::try_from(AUTHY_HOST).unwrap(), tcp)
+        .await;
+    assert!(refused.is_err());
+    rig.wait_for(|e| *e == ProxyEvent::TlsRejected).await;
+
+    // One that just goes away after the proxy's hello: no alert, not a refusal.
+    let (_, mut tcp) = connect_on(rig.connect_as(PHONE).await, CHECK_HOST, 443).await;
+    tcp.write_all(&client_hello(CHECK_HOST, &[&ca], &[b"http/1.1"]))
+        .await
+        .unwrap();
+    let mut some = [0u8; 64];
+    let _ = tokio::time::timeout(WAIT, tcp.read(&mut some)).await;
+    drop(tcp);
+
+    // Then it trusts the root, and is accepted as the device.
+    let (_, tcp) = connect_on(rig.connect_as(PHONE).await, AUTHY_HOST, 443).await;
+    let (head, _) = https_over(tcp, AUTHY_HOST, &[&ca], "GET", "/json/ping").await;
+    assert!(head.starts_with("HTTP/1.1 200"), "{head}");
+    rig.wait_for(|e| *e == ProxyEvent::TrustWorking).await;
+    rig.drain().await;
+    rig.handle.shutdown().await;
+
+    let logs = logs.text();
+    let failed: Vec<&str> = logs
+        .lines()
+        .filter(|l| l.contains("TLS handshake for an intercepted host failed"))
+        .collect();
+    assert_eq!(failed.len(), 2, "{logs}");
+    assert!(
+        failed[0].contains("host=authy")
+            && failed[0].contains("alert=UnknownCA")
+            && failed[0].contains("refused=true"),
+        "{}",
+        failed[0]
+    );
+    assert!(
+        failed[1].contains("host=check")
+            && failed[1].contains("alert=none")
+            && failed[1].contains("refused=false"),
+        "{}",
+        failed[1]
+    );
+    assert!(
+        logs.contains(&format!("device accepted device={PHONE} host=authy")),
+        "{logs}"
+    );
 }

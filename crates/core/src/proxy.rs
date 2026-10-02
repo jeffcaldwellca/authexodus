@@ -6,10 +6,10 @@
 //! CONNECT is a blind tunnel: the bytes are copied in both directions and nothing about the
 //! connection is inspected, kept or logged. Plain HTTP is forwarded, also without a log line.
 //!
-//! Built directly on hyper and tokio-rustls, not on `hudsucker::Proxy`, for two reasons: the
-//! handshake with the device is ours, so a refused certificate is seen as `TlsRejected`; and
-//! the tunnel and plain-HTTP paths contain no logging, so tunnelled hosts never reach a log.
-//! `hudsucker` is used only for `decode_response`. The device is offered HTTP/1.1 only.
+//! Built directly on hyper and tokio-rustls rather than on a proxy framework, for two reasons:
+//! the handshake with the device is ours, so a refused certificate is seen as `TlsRejected`;
+//! and the tunnel and plain-HTTP paths contain no logging, so tunnelled hosts never reach a
+//! log. The device is offered HTTP/1.1 only.
 //!
 //! The proxy listens on a shared network, so it assumes strangers can connect to it:
 //!
@@ -22,7 +22,16 @@
 //!   a stray peer cannot lock the real device out of anything but Authy before it gets there
 //!   first. This computer talking to its own proxy is served until there is a device, but it
 //!   can never become the device, so it can never lock the iPhone or iPad out.
-//! * Connections are capped, idle tunnels are closed, and outbound dials time out.
+//! * Only a response Authy gave to the device is kept as the backup. What this computer, or
+//!   any other peer, fetched through the intercepted hosts is passed on and forgotten.
+//! * Connections are capped for each peer and overall, idle tunnels are closed, and outbound
+//!   dials time out.
+//!
+//! What is logged (through `tracing`; the app decides where it goes): for the two intercepted
+//! hosts and the proxy's own pages, the method, the path without its query string and with
+//! ids replaced, and the status; TLS handshake failures on the intercepted hosts with the
+//! alert the peer sent; the address of the accepted device. Never a query string, a body, a
+//! tunnelled or plain-HTTP host, or the address of any peer other than the accepted device.
 
 use std::collections::{HashMap, HashSet};
 use std::convert::Infallible;
@@ -42,7 +51,7 @@ use http::header::{
 };
 use http::{Method, Request, Response, StatusCode, Uri, Version};
 use http_body_util::combinators::UnsyncBoxBody;
-use http_body_util::{BodyExt, Empty, Full, Limited};
+use http_body_util::{BodyExt, Empty, Full};
 use hyper::body::{Body, Frame, Incoming, SizeHint};
 use hyper::client::conn::http1 as client;
 use hyper::server::conn::http1 as server;
@@ -52,7 +61,7 @@ use hyper_util::rt::{TokioIo, TokioTimer};
 use rustls::crypto::aws_lc_rs;
 use rustls::pki_types::{CertificateDer, ServerName};
 use rustls::{AlertDescription, ClientConfig, RootCertStore, ServerConfig};
-use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, ReadBuf};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::{mpsc, watch, OwnedSemaphorePermit, Semaphore};
 use tokio::task::JoinHandle;
@@ -83,8 +92,18 @@ const REFUSED_EVERY: Duration = Duration::from_secs(2);
 const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(30);
 /// A blind tunnel that carries no bytes in either direction for this long is closed.
 const TUNNEL_IDLE: Duration = Duration::from_secs(10 * 60);
-/// Connections served at once, tunnels included. Further ones wait in the listen queue.
-const MAX_CONNECTIONS: usize = 256;
+/// Connections served at once from every peer together, tunnels included. Further ones wait
+/// in the listen queue.
+const MAX_CONNECTIONS: usize = 512;
+/// Connections served at once from one peer address. A peer at its limit has further
+/// connections closed straight away, so no single peer can use up [`MAX_CONNECTIONS`] and
+/// keep the iPhone or iPad out.
+const MAX_CONNECTIONS_PER_PEER: usize = 128;
+/// When several addresses are tried for one name, the next attempt starts this long after the
+/// previous one if that has not answered yet; the first to connect wins.
+const CONNECT_STAGGER: Duration = Duration::from_millis(250);
+/// At most one "peer at its connection limit" log line in this long.
+const LIMIT_LOG_EVERY: Duration = Duration::from_secs(10);
 const DRAIN_TIMEOUT: Duration = Duration::from_secs(5);
 /// A response larger than this is passed through but not searched for the backup.
 const CAPTURE_LIMIT: usize = 16 * 1024 * 1024;
@@ -168,7 +187,10 @@ pub struct TestUpstream {
     /// The port of every connection the proxy opened for [`AUTHY_HOST`], as it asked for it
     /// (before the stand-in's address was substituted).
     authy_ports: Arc<Mutex<Vec<u16>>>,
+    /// The peer address to treat every other connection as coming from.
+    default_peer: Option<IpAddr>,
     max_connections: usize,
+    max_per_peer: usize,
     tunnel_idle: Duration,
 }
 
@@ -181,20 +203,30 @@ impl TestUpstream {
             root_cert_der,
             peers: Arc::default(),
             authy_ports: Arc::default(),
+            default_peer: None,
             max_connections: MAX_CONNECTIONS,
+            max_per_peer: MAX_CONNECTIONS_PER_PEER,
             tunnel_idle: TUNNEL_IDLE,
         }
     }
 
     /// Treat the connection to the proxy that comes from local port `source_port` as if it
     /// came from `peer`. Tests run on one loopback address; this lets them be several
-    /// devices. Clones share the mapping, so it can be called after the proxy has started,
-    /// any time before that connection's first request.
+    /// devices. Clones share the mapping, so it can be called after the proxy has started.
+    /// Call it before the connection is opened (bind the local port first): the proxy counts
+    /// a connection against its peer as soon as it accepts it.
     pub fn pretend_peer(&self, source_port: u16, peer: IpAddr) {
         self.peers
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
             .insert(source_port, peer);
+    }
+
+    /// Treat every connection that [`TestUpstream::pretend_peer`] has not named as if it came
+    /// from `peer`: for tests whose HTTP client opens its own connections.
+    pub fn with_default_peer(mut self, peer: IpAddr) -> TestUpstream {
+        self.default_peer = Some(peer);
+        self
     }
 
     /// The port the proxy asked for each time it opened a connection for [`AUTHY_HOST`]: what
@@ -209,6 +241,13 @@ impl TestUpstream {
     /// Serve at most this many connections at once (the default is the production limit).
     pub fn with_max_connections(mut self, max: usize) -> TestUpstream {
         self.max_connections = max;
+        self
+    }
+
+    /// Serve at most this many connections at once from one peer address (the default is the
+    /// production limit).
+    pub fn with_max_per_peer(mut self, max: usize) -> TestUpstream {
+        self.max_per_peer = max;
         self
     }
 
@@ -295,8 +334,13 @@ pub async fn start(
         .upstream
         .as_ref()
         .map_or(MAX_CONNECTIONS, |u| u.max_connections);
+    let max_per_peer = cfg
+        .upstream
+        .as_ref()
+        .map_or(MAX_CONNECTIONS_PER_PEER, |u| u.max_per_peer);
     let tunnel_idle = cfg.upstream.as_ref().map_or(TUNNEL_IDLE, |u| u.tunnel_idle);
     let pretend_peers = cfg.upstream.as_ref().map(|u| Arc::clone(&u.peers));
+    let default_peer = cfg.upstream.as_ref().and_then(|u| u.default_peer);
     let leaf_authy = ca.leaf_server_config(AUTHY_HOST)?;
     let leaf_check = ca.leaf_server_config(CHECK_HOST)?;
 
@@ -319,7 +363,11 @@ pub async fn start(
         trust_working: Once::default(),
         device: Mutex::new(None),
         refused: Throttle::new(REFUSED_EVERY),
+        per_peer: Mutex::new(HashMap::new()),
+        max_per_peer,
+        at_limit: Throttle::new(LIMIT_LOG_EVERY),
         pretend_peers,
+        default_peer,
         tunnel_idle,
         stop: stop_rx,
     });
@@ -372,8 +420,14 @@ struct Shared {
     /// host.
     device: Mutex<Option<IpAddr>>,
     refused: Throttle,
+    /// Open connections for each peer address.
+    per_peer: Mutex<HashMap<IpAddr, usize>>,
+    max_per_peer: usize,
+    at_limit: Throttle,
     /// Tests only: source port -> pretended peer address.
     pretend_peers: Option<Arc<Mutex<HashMap<u16, IpAddr>>>>,
+    /// Tests only: the pretended address of every other peer.
+    default_peer: Option<IpAddr>,
     tunnel_idle: Duration,
     stop: watch::Receiver<bool>,
 }
@@ -406,6 +460,25 @@ impl Shared {
             .is_none_or(|device| device == peer.to_canonical())
     }
 
+    /// Is this peer the accepted device?
+    fn is_the_device(&self, peer: IpAddr) -> bool {
+        *self.lock_device() == Some(peer.to_canonical())
+    }
+
+    /// Count one more connection for `peer`, unless it is at its limit already.
+    fn peer_slot(self: &Arc<Self>, peer: IpAddr) -> Option<PeerSlot> {
+        let mut open = self.per_peer.lock().unwrap_or_else(PoisonError::into_inner);
+        let count = open.entry(peer).or_insert(0);
+        if *count >= self.max_per_peer {
+            return None;
+        }
+        *count += 1;
+        Some(PeerSlot {
+            shared: Arc::clone(self),
+            peer,
+        })
+    }
+
     /// A peer was turned away from an intercepted host because another peer is the device.
     /// Reported when the peer is a device itself (not this computer), and not too often. The
     /// log line names neither the peer nor the host.
@@ -426,6 +499,7 @@ impl Shared {
                     .get(&peer.port())
                     .copied()
             })
+            .or(self.default_peer)
             .unwrap_or(peer.ip())
             .to_canonical()
     }
@@ -445,6 +519,28 @@ impl Shared {
         tokio::select! {
             value = fut => Some(value),
             _ = self.stopped() => None,
+        }
+    }
+}
+
+/// One connection's place in its peer's count; gives it back when dropped.
+struct PeerSlot {
+    shared: Arc<Shared>,
+    peer: IpAddr,
+}
+
+impl Drop for PeerSlot {
+    fn drop(&mut self) {
+        let mut open = self
+            .shared
+            .per_peer
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        if let Some(count) = open.get_mut(&self.peer) {
+            *count = count.saturating_sub(1);
+            if *count == 0 {
+                open.remove(&self.peer);
+            }
         }
     }
 }
@@ -523,15 +619,15 @@ fn claim_device(device: &mut Option<IpAddr>, peer: IpAddr, local: IpAddr) -> Cla
 
 /// One accepted connection's context. Every task that outlives the request holds a clone, and
 /// through `_alive` keeps [`ProxyHandle::shutdown`] waiting until it has ended. The connection
-/// counts against [`MAX_CONNECTIONS`] until the last clone is gone, which for a tunnel is when
-/// the tunnel closes.
+/// counts against [`MAX_CONNECTIONS`] and its peer's [`MAX_CONNECTIONS_PER_PEER`] until the
+/// last clone is gone, which for a tunnel is when the tunnel closes.
 #[derive(Clone)]
 struct Conn {
     shared: Arc<Shared>,
     peer: SocketAddr,
     local: SocketAddr,
     _alive: mpsc::Sender<()>,
-    _slot: Arc<OwnedSemaphorePermit>,
+    _slot: Arc<(OwnedSemaphorePermit, PeerSlot)>,
 }
 
 impl Conn {
@@ -578,12 +674,25 @@ async fn accept_loop(
         // Whatever address a peer reached us on is this computer's.
         shared.dial.add_own([local.ip()]);
 
+        let from = shared.peer_of(peer);
+        let Some(peer_slot) = shared.peer_slot(from) else {
+            // This peer holds its share already. Closing at once keeps the rest free for
+            // everyone else. The line says only whether it was the accepted device.
+            if shared.at_limit.ready() {
+                tracing::warn!(
+                    limit = shared.max_per_peer,
+                    accepted_device = shared.is_the_device(from),
+                    "a peer is at its connection limit; closing its new connections"
+                );
+            }
+            continue;
+        };
         let conn = Conn {
             shared: Arc::clone(&shared),
             peer,
             local,
             _alive: alive.clone(),
-            _slot: Arc::new(slot),
+            _slot: Arc::new((slot, peer_slot)),
         };
         tokio::spawn(async move {
             let shared = Arc::clone(&conn.shared);
@@ -655,6 +764,16 @@ enum Intercepted {
     Check,
 }
 
+impl Intercepted {
+    /// For the log: which of the two it is, not a host name taken from the peer.
+    fn label(self) -> &'static str {
+        match self {
+            Intercepted::Authy => "authy",
+            Intercepted::Check => "check",
+        }
+    }
+}
+
 fn intercepted(host: &str) -> Option<Intercepted> {
     let host = bare_host(host);
     if host.eq_ignore_ascii_case(AUTHY_HOST) {
@@ -680,8 +799,32 @@ fn own_page(shared: &Shared, method: &Method, path: &str) -> Response<ProxyBody>
             _ => plain(StatusCode::NOT_FOUND),
         }
     };
+    // Anyone on the network can ask for any path here, so only the two real ones are named.
+    let path = if matches!(path, "/" | "/cert") {
+        path
+    } else {
+        "(other)"
+    };
+    let method = known_method(method);
     tracing::info!(%method, %path, status = res.status().as_u16(), "own page");
     res
+}
+
+/// A method name for the log: a standard one as it is, anything else as `OTHER` (a peer can
+/// send any token it likes as a method).
+fn known_method(method: &Method) -> &'static str {
+    match *method {
+        Method::GET => "GET",
+        Method::HEAD => "HEAD",
+        Method::POST => "POST",
+        Method::PUT => "PUT",
+        Method::DELETE => "DELETE",
+        Method::PATCH => "PATCH",
+        Method::OPTIONS => "OPTIONS",
+        Method::CONNECT => "CONNECT",
+        Method::TRACE => "TRACE",
+        _ => "OTHER",
+    }
 }
 
 /// The root certificate, in the form an iPhone or iPad offers to install as a profile.
@@ -874,6 +1017,18 @@ fn certificate_refused(error: &io::Error) -> bool {
     )
 }
 
+/// The TLS alert the peer sent, by name (`UnknownCA`, `BadCertificate`, ...), or `none` when
+/// the handshake failed without one.
+fn alert_name(error: &io::Error) -> String {
+    match error
+        .get_ref()
+        .and_then(|inner| inner.downcast_ref::<rustls::Error>())
+    {
+        Some(rustls::Error::AlertReceived(alert)) => format!("{alert:?}"),
+        _ => "none".to_owned(),
+    }
+}
+
 /// Terminate TLS for an intercepted host and serve the requests inside it.
 async fn intercept(conn: Conn, req: Request<Incoming>, connect_host: Intercepted) {
     let shared = Arc::clone(&conn.shared);
@@ -884,11 +1039,27 @@ async fn intercept(conn: Conn, req: Request<Incoming>, connect_host: Intercepted
         LazyConfigAcceptor::new(rustls::server::Acceptor::default(), TokioIo::new(upgraded));
     // No ClientHello (the device opened the connection and dropped it, or is not speaking TLS):
     // it never saw our certificate, so nothing was rejected.
-    let Some(Ok(Ok(start))) = shared
+    let start = match shared
         .unless_stopped(tokio::time::timeout(HANDSHAKE_TIMEOUT, acceptor))
         .await
-    else {
-        return;
+    {
+        Some(Ok(Ok(start))) => start,
+        Some(Ok(Err(error))) => {
+            tracing::debug!(
+                host = %connect_host.label(),
+                %error,
+                "connection for an intercepted host ended before a TLS hello"
+            );
+            return;
+        }
+        Some(Err(_)) => {
+            tracing::debug!(
+                host = %connect_host.label(),
+                "connection for an intercepted host sent no TLS hello in time"
+            );
+            return;
+        }
+        None => return,
     };
     // The name the device asks for in the handshake decides, when it is one of ours.
     let which = start
@@ -909,21 +1080,57 @@ async fn intercept(conn: Conn, req: Request<Incoming>, connect_host: Intercepted
     {
         Some(Ok(Ok(tls))) => tls,
         Some(Ok(Err(error))) => {
+            // The line that tells a device which refuses the certificate (and why) from one
+            // that merely went away: `alert` is what the peer sent, `none` if it sent nothing.
             let refused = certificate_refused(&error);
-            tracing::info!(%error, refused, "TLS handshake for an intercepted host failed");
+            tracing::warn!(
+                host = %which.label(),
+                alert = %alert_name(&error),
+                refused,
+                %error,
+                "TLS handshake for an intercepted host failed"
+            );
             if refused {
                 shared.emit(ProxyEvent::TlsRejected);
             }
             return;
         }
-        Some(Err(_)) | None => return, // stalled, or the proxy stopped
+        Some(Err(_)) => {
+            tracing::warn!(
+                host = %which.label(),
+                "TLS handshake for an intercepted host stalled"
+            );
+            return;
+        }
+        None => return, // the proxy stopped
     };
-    let claim = claim_device(&mut shared.lock_device(), conn.peer(), conn.local.ip());
-    if claim == Claim::Other {
-        // Lost a race with the device; see `connect`.
-        shared.note_refused(conn.peer(), conn.local.ip());
-        return;
+    let claim = {
+        let mut device = shared.lock_device();
+        let claim = claim_device(&mut device, conn.peer(), conn.local.ip());
+        if claim == Claim::Became {
+            // Only the device's own traffic is ever kept (see `CaptureSink`), so there is
+            // nothing here from before it existed; emptying it again costs nothing and makes
+            // that true whatever else changes.
+            *shared.lock_backup() = CapturedBackup::default();
+        }
+        claim
+    };
+    match claim {
+        Claim::Other => {
+            // Lost a race with the device; see `connect`.
+            shared.note_refused(conn.peer(), conn.local.ip());
+            return;
+        }
+        Claim::Became => {
+            tracing::info!(device = %conn.peer(), host = %which.label(), "device accepted")
+        }
+        Claim::Is | Claim::NotADevice => {}
     }
+    tracing::debug!(
+        host = %which.label(),
+        accepted_device = claim != Claim::NotADevice,
+        "TLS handshake for an intercepted host completed"
+    );
     if shared.trust_working.first() {
         shared.emit(ProxyEvent::TrustWorking);
     }
@@ -967,23 +1174,41 @@ async fn intercepted_request(
             Intercepted::Authy => forward_authy(&conn, &link, &path, req).await,
         }
     };
-    tracing::info!(%method, %path, status = res.status().as_u16(), "intercepted request");
+    tracing::info!(
+        method = %known_method(&method),
+        %path,
+        status = res.status().as_u16(),
+        "intercepted request"
+    );
     res
 }
 
-/// A path with every all-digit segment replaced by `:id`. Authy's paths carry the account id
-/// and device id; neither belongs in a log or an event.
+/// A path with every segment that looks like an identifier replaced by `:id`. Authy's paths
+/// carry the account id and device id; neither belongs in a log or an event. A segment is
+/// kept only when it reads like a route word: letters, digits, `_`, `-` and `.`, starting with
+/// a letter, not long, and with too few digits in it to be an id.
 fn redact_ids(path: &str) -> String {
     path.split('/')
         .map(|segment| {
-            if !segment.is_empty() && segment.bytes().all(|b| b.is_ascii_digit()) {
-                ":id"
-            } else {
+            if segment.is_empty() || is_route_word(segment) {
                 segment
+            } else {
+                ":id"
             }
         })
         .collect::<Vec<_>>()
         .join("/")
+}
+
+fn is_route_word(segment: &str) -> bool {
+    let bytes = segment.as_bytes();
+    let digits = bytes.iter().filter(|b| b.is_ascii_digit()).count();
+    bytes[0].is_ascii_alphabetic()
+        && bytes.len() <= 40
+        && digits <= 3
+        && bytes
+            .iter()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'_' | b'-' | b'.'))
 }
 
 /// `path` is the redacted path, for the event; the request itself is forwarded as it came.
@@ -1008,7 +1233,10 @@ async fn forward_authy(
             Some(sender) => sender,
             None => match open(conn, AUTHY_HOST, AUTHY_PORT, true).await {
                 Ok(sender) => sender,
-                Err(_) => return plain(StatusCode::BAD_GATEWAY),
+                Err(error) => {
+                    tracing::warn!(kind = ?error.kind(), %error, "could not connect to Authy");
+                    return plain(StatusCode::BAD_GATEWAY);
+                }
             },
         };
         match sender.send_request(outbound(req, AUTHY_HOST)).await {
@@ -1016,7 +1244,10 @@ async fn forward_authy(
                 *link = Some(sender);
                 res
             }
-            Err(_) => return plain(StatusCode::BAD_GATEWAY),
+            Err(error) => {
+                tracing::warn!(%error, "the request to Authy failed");
+                return plain(StatusCode::BAD_GATEWAY);
+            }
         }
     };
 
@@ -1028,7 +1259,8 @@ async fn forward_authy(
         });
     }
     let (mut parts, body) = res.into_parts();
-    let body = if status.is_success() {
+    // Only what Authy tells the device is watched for the backup.
+    let body = if status.is_success() && shared.is_the_device(conn.peer()) {
         let encodings = parts
             .headers
             .get_all(CONTENT_ENCODING)
@@ -1178,17 +1410,20 @@ impl Dial {
             return true;
         }
         let ip = ip.to_canonical();
-        !special_purpose(ip)
-            && !self
-                .own
-                .lock()
-                .unwrap_or_else(PoisonError::into_inner)
-                .contains(&ip)
+        if special_purpose(ip) {
+            return false;
+        }
+        let own = self.own.lock().unwrap_or_else(PoisonError::into_inner);
+        let carried = match ip {
+            IpAddr::V6(v6) => embedded_ipv4(v6),
+            IpAddr::V4(_) => Vec::new(),
+        };
+        !own.contains(&ip) && !carried.iter().any(|v4| own.contains(&IpAddr::V4(*v4)))
     }
 
     /// Resolve and connect, within [`DIAL_TIMEOUT`] overall and [`CONNECT_TIMEOUT`] for each
-    /// address. Every resolved address is checked and only a checked address is dialled, so a
-    /// name cannot smuggle in a refused address.
+    /// address (see [`first_reachable`]). Every resolved address is checked and only a checked
+    /// address is dialled, so a name cannot smuggle in a refused address.
     async fn connect(&self, host: &str, port: u16) -> io::Result<TcpStream> {
         within_dial_timeout(self.connect_unbounded(host, port)).await
     }
@@ -1217,37 +1452,78 @@ async fn within_dial_timeout<T>(dial: impl Future<Output = io::Result<T>>) -> io
         .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "connect timed out"))?
 }
 
-/// Try each allowed address in turn, giving each [`CONNECT_TIMEOUT`], and return the first
-/// connection. The error is the last one met: `PermissionDenied` for an address that is not
-/// allowed, `TimedOut` for one that did not answer, `NotFound` when there was no address.
+/// Connect to the first allowed address that answers.
+///
+/// The addresses are tried with the two families taking turns (the first address's family
+/// first), each attempt starting [`CONNECT_STAGGER`] after the one before unless that one has
+/// failed already, and each given [`CONNECT_TIMEOUT`]. So a name whose IPv6 addresses swallow
+/// packets is reached over IPv4 a moment later, however many dead addresses it lists. Only an
+/// address that passed `allowed` is ever dialled. The error is the last one met:
+/// `PermissionDenied` for an address that is not allowed, `TimedOut` for one that did not
+/// answer, `NotFound` when there was no address.
 async fn first_reachable<T, F>(
     addrs: impl IntoIterator<Item = SocketAddr>,
     allowed: impl Fn(IpAddr) -> bool,
     connect: impl Fn(SocketAddr) -> F,
 ) -> io::Result<T>
 where
-    F: Future<Output = io::Result<T>>,
+    T: Send + 'static,
+    F: Future<Output = io::Result<T>> + Send + 'static,
 {
     let mut last = io::Error::new(io::ErrorKind::NotFound, "no address");
+    let mut candidates = Vec::new();
     for addr in addrs {
-        if !allowed(addr.ip()) {
+        if allowed(addr.ip()) {
+            candidates.push(addr);
+        } else {
             last = io::Error::new(io::ErrorKind::PermissionDenied, "destination refused");
-            continue;
-        }
-        match tokio::time::timeout(CONNECT_TIMEOUT, connect(addr)).await {
-            Ok(Ok(stream)) => return Ok(stream),
-            Ok(Err(e)) => last = e,
-            Err(_) => last = io::Error::new(io::ErrorKind::TimedOut, "connect timed out"),
         }
     }
-    Err(last)
+    let mut waiting = interleave_families(candidates);
+    // Dropping the set (on return) aborts the attempts still under way.
+    let mut attempts = tokio::task::JoinSet::new();
+    loop {
+        if let Some(addr) = waiting.pop_front() {
+            attempts.spawn(tokio::time::timeout(CONNECT_TIMEOUT, connect(addr)));
+        }
+        if attempts.is_empty() {
+            return Err(last);
+        }
+        tokio::select! {
+            ended = attempts.join_next() => match ended {
+                Some(Ok(Ok(Ok(stream)))) => return Ok(stream),
+                Some(Ok(Ok(Err(e)))) => last = e,
+                Some(Ok(Err(_))) => {
+                    last = io::Error::new(io::ErrorKind::TimedOut, "connect timed out");
+                }
+                Some(Err(e)) => last = io::Error::other(e),
+                None => {}
+            },
+            _ = tokio::time::sleep(CONNECT_STAGGER), if !waiting.is_empty() => {}
+        }
+    }
+}
+
+/// The addresses with the two families taking turns, each family in the order it came, and
+/// the family of the first address going first.
+fn interleave_families(addrs: Vec<SocketAddr>) -> std::collections::VecDeque<SocketAddr> {
+    let first_is_v6 = addrs.first().is_some_and(SocketAddr::is_ipv6);
+    let (mut first, mut second): (std::collections::VecDeque<_>, std::collections::VecDeque<_>) =
+        addrs.into_iter().partition(|a| a.is_ipv6() == first_is_v6);
+    let mut out = std::collections::VecDeque::with_capacity(first.len() + second.len());
+    while !first.is_empty() || !second.is_empty() {
+        out.extend(first.pop_front());
+        out.extend(second.pop_front());
+    }
+    out
 }
 
 /// Addresses that are never a legitimate destination for a device's traffic through this
 /// proxy, because they name this computer, its local network, or no host at all: loopback,
 /// unspecified, link-local, private (RFC 1918), carrier-grade NAT (100.64.0.0/10), unique
 /// local (fc00::/7), multicast, broadcast and reserved space, and IPv6 forms that embed an
-/// IPv4 address. Expects a canonical address (an IPv4-mapped one already unwrapped).
+/// IPv4 address of one of those kinds (see [`embedded_ipv4`]). Expects a canonical address
+/// (an IPv4-mapped one already unwrapped).
 fn special_purpose(ip: IpAddr) -> bool {
     match ip {
         IpAddr::V4(v4) => {
@@ -1272,7 +1548,32 @@ fn special_purpose(ip: IpAddr) -> bool {
                 || segments[..6] == [0; 6]
                 // an IPv4-mapped address that was not unwrapped
                 || v6.to_ipv4_mapped().is_some()
+                // the local-use NAT64 prefix 64:ff9b:1::/48 is private by definition
+                || segments[..3] == [0x64, 0xff9b, 1]
+                || embedded_ipv4(v6)
+                    .into_iter()
+                    .any(|v4| special_purpose(IpAddr::V4(v4)))
         }
+    }
+}
+
+/// The IPv4 addresses an IPv6 address stands for, when it is of a kind that carries one:
+/// NAT64 `64:ff9b::/96` (the last 32 bits), 6to4 `2002::/16` (the 32 bits after the prefix),
+/// and Teredo `2001::/32` (the server after the prefix, and the client in the last 32 bits
+/// with every bit inverted). A network that routes these would deliver the connection to that
+/// IPv4 address, so it is judged as one.
+fn embedded_ipv4(v6: std::net::Ipv6Addr) -> Vec<std::net::Ipv4Addr> {
+    let s = v6.segments();
+    let v4 =
+        |high: u16, low: u16| std::net::Ipv4Addr::from((u32::from(high) << 16) | u32::from(low));
+    if s[..6] == [0x64, 0xff9b, 0, 0, 0, 0] {
+        vec![v4(s[6], s[7])]
+    } else if s[0] == 0x2002 {
+        vec![v4(s[1], s[2])]
+    } else if s[0] == 0x2001 && s[1] == 0 {
+        vec![v4(s[2], s[3]), v4(!s[6], !s[7])]
+    } else {
+        Vec::new()
     }
 }
 
@@ -1406,35 +1707,73 @@ struct CaptureSink {
 impl CaptureSink {
     async fn finish(self, body: Vec<u8>) {
         let shared = &self.conn.shared;
+        let encoded = !self.encodings.is_empty();
         let Some(body) = decoded(body, self.encodings).await else {
+            tracing::warn!("a response from Authy could not be decoded, so it was not searched");
             return;
         };
         let Some(captured) = capture::inspect(&body) else {
             return;
         };
-        let count = {
+        let (count, native) = {
+            // The device lock is held across the merge, so a capture can never slip in from a
+            // peer that is not (or is no longer) the device. Lock order: device, then backup.
+            let device = shared.lock_device();
+            if *device != Some(self.conn.peer().to_canonical()) {
+                return;
+            }
             let mut backup = shared.lock_backup();
             if !capture::merge(&mut backup, captured) {
                 return;
             }
-            backup.tokens.len()
+            (backup.tokens.len(), backup.native_apps.len())
         };
+        tracing::info!(tokens = count, native, encoded, "backup captured");
         shared.emit(ProxyEvent::BackupCaptured { count });
     }
 }
 
-/// Undo `Content-Encoding` (gzip, deflate, brotli, zstd). `None` if it cannot be undone.
+/// Undo `Content-Encoding` (gzip, deflate, brotli, zstd) on the copy of a response. `None` if
+/// it cannot be undone, or if what comes out is larger than [`CAPTURE_LIMIT`].
 async fn decoded(body: Vec<u8>, encodings: Vec<HeaderValue>) -> Option<Bytes> {
-    if encodings.is_empty() {
-        return Some(Bytes::from(body));
+    // Encodings are listed in the order they were applied, so they are undone last to first.
+    let mut codings: Vec<String> = Vec::new();
+    for value in &encodings {
+        for coding in value.to_str().ok()?.split(',') {
+            let coding = coding.trim().to_ascii_lowercase();
+            if !coding.is_empty() && coding != "identity" {
+                codings.push(coding);
+            }
+        }
     }
-    let mut res = Response::new(hudsucker::Body::from(Full::new(Bytes::from(body))));
-    for encoding in encodings {
-        res.headers_mut().append(CONTENT_ENCODING, encoding);
+    let mut body = body;
+    for coding in codings.iter().rev() {
+        body = decode_one(coding, &body).await?;
     }
-    let res = hudsucker::decode_response(res).ok()?;
-    let body = Limited::new(res.into_body(), CAPTURE_LIMIT);
-    Some(body.collect().await.ok()?.to_bytes())
+    Some(Bytes::from(body))
+}
+
+/// One layer of `Content-Encoding`, read through a limit so a small body cannot expand without
+/// bound.
+async fn decode_one(coding: &str, body: &[u8]) -> Option<Vec<u8>> {
+    use async_compression::tokio::bufread::{BrotliDecoder, GzipDecoder, ZlibDecoder, ZstdDecoder};
+    async fn limited(reader: impl AsyncRead + Unpin) -> Option<Vec<u8>> {
+        let mut out = Vec::new();
+        reader
+            .take(CAPTURE_LIMIT as u64 + 1)
+            .read_to_end(&mut out)
+            .await
+            .ok()?;
+        (out.len() <= CAPTURE_LIMIT).then_some(out)
+    }
+    match coding {
+        "gzip" | "x-gzip" => limited(GzipDecoder::new(body)).await,
+        // HTTP's "deflate" is the zlib format (RFC 9110 section 8.4.1.2).
+        "deflate" => limited(ZlibDecoder::new(body)).await,
+        "br" => limited(BrotliDecoder::new(body)).await,
+        "zstd" => limited(ZstdDecoder::new(body)).await,
+        _ => None,
+    }
 }
 
 #[cfg(test)]
@@ -1580,10 +1919,14 @@ mod tests {
         let reached =
             within_dial_timeout(first_reachable([blackhole, good], |_| true, connect)).await;
         assert_eq!(reached.unwrap(), good, "the second address is still tried");
-        assert_eq!(started.elapsed(), CONNECT_TIMEOUT);
+        assert_eq!(
+            started.elapsed(),
+            CONNECT_STAGGER,
+            "as soon as the first has had its head start"
+        );
         assert_eq!(CONNECT_TIMEOUT, Duration::from_secs(5));
 
-        // Two dead addresses still leave time for a third.
+        // Two dead addresses of the same family still leave time for a third.
         let other_blackhole: SocketAddr = "[2001:db8::2]:443".parse().unwrap();
         let reached = within_dial_timeout(first_reachable(
             [blackhole, other_blackhole, good],
@@ -1593,7 +1936,20 @@ mod tests {
         .await;
         assert_eq!(reached.unwrap(), good);
 
-        // Nothing answers: the overall budget still ends it.
+        // An address that fails at once does not make the next one wait at all.
+        let failing = move |addr: SocketAddr| async move {
+            if addr == good {
+                Ok(addr)
+            } else {
+                Err(io::Error::from(io::ErrorKind::ConnectionRefused))
+            }
+        };
+        let started = Instant::now();
+        let reached = first_reachable([blackhole, other_blackhole, good], |_| true, failing).await;
+        assert_eq!(reached.unwrap(), good);
+        assert_eq!(started.elapsed(), Duration::ZERO);
+
+        // Nothing answers: every address has had its turn well inside the overall budget.
         let started = Instant::now();
         let none = within_dial_timeout(first_reachable(
             std::iter::repeat_n(blackhole, 10),
@@ -1602,13 +1958,123 @@ mod tests {
         ))
         .await;
         assert_eq!(none.unwrap_err().kind(), io::ErrorKind::TimedOut);
+        assert_eq!(started.elapsed(), CONNECT_STAGGER * 9 + CONNECT_TIMEOUT);
+        assert!(started.elapsed() < DIAL_TIMEOUT);
+        // And a name with more dead addresses than that is cut off by the budget.
+        let started = Instant::now();
+        let none = within_dial_timeout(first_reachable(
+            std::iter::repeat_n(blackhole, 100),
+            |_| true,
+            connect,
+        ))
+        .await;
+        assert_eq!(none.unwrap_err().kind(), io::ErrorKind::TimedOut);
         assert_eq!(started.elapsed(), DIAL_TIMEOUT);
 
         // A refused address is never dialled, and says so when nothing else worked.
-        let refused = first_reachable([good], |_| false, connect).await;
+        let dialled = Arc::new(Mutex::new(Vec::new()));
+        let record = Arc::clone(&dialled);
+        let recording = move |addr: SocketAddr| {
+            record.lock().unwrap().push(addr);
+            async move { Ok::<_, io::Error>(addr) }
+        };
+        let refused = first_reachable([good], |_| false, recording.clone()).await;
         assert_eq!(refused.unwrap_err().kind(), io::ErrorKind::PermissionDenied);
+        let reached = first_reachable([blackhole, good], |ip| ip.is_ipv4(), recording).await;
+        assert_eq!(reached.unwrap(), good);
+        assert_eq!(*dialled.lock().unwrap(), [good], "only the allowed address");
         let empty = first_reachable([], |_| true, connect).await;
         assert_eq!(empty.unwrap_err().kind(), io::ErrorKind::NotFound);
+    }
+
+    #[test]
+    fn address_families_take_turns() {
+        let a = |s: &str| -> SocketAddr { s.parse().unwrap() };
+        let v6 = [
+            a("[2001:db8::1]:443"),
+            a("[2001:db8::2]:443"),
+            a("[2001:db8::3]:443"),
+        ];
+        let v4 = [a("203.0.113.1:443"), a("203.0.113.2:443")];
+        let ordered = interleave_families(v6.iter().chain(&v4).copied().collect());
+        assert_eq!(ordered, [v6[0], v4[0], v6[1], v4[1], v6[2]]);
+        let ordered = interleave_families(v4.iter().chain(&v6).copied().collect());
+        assert_eq!(ordered, [v4[0], v6[0], v4[1], v6[1], v6[2]]);
+        assert_eq!(interleave_families(v4.to_vec()), v4);
+        assert!(interleave_families(Vec::new()).is_empty());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn dead_ipv6_addresses_do_not_keep_ipv4_waiting() {
+        let dead: Vec<SocketAddr> = (1..=4)
+            .map(|i| format!("[2001:db8::{i}]:443").parse().unwrap())
+            .collect();
+        let good: SocketAddr = "203.0.113.9:443".parse().unwrap();
+        let connect = move |addr: SocketAddr| async move {
+            if addr == good {
+                Ok(addr)
+            } else {
+                std::future::pending::<io::Result<SocketAddr>>().await
+            }
+        };
+        // The resolver lists every IPv6 address first, and none of them answers.
+        let mut addrs = dead.clone();
+        addrs.push(good);
+        let started = Instant::now();
+        let reached = within_dial_timeout(first_reachable(addrs, |_| true, connect)).await;
+        assert_eq!(
+            reached.unwrap(),
+            good,
+            "four dead addresses must not use up the budget before IPv4 is tried"
+        );
+        assert!(
+            started.elapsed() < Duration::from_secs(1),
+            "and IPv4 is tried almost at once, not after a timeout: {:?}",
+            started.elapsed()
+        );
+    }
+
+    #[test]
+    fn ipv6_forms_that_carry_an_ipv4_address_are_judged_by_it() {
+        let production = Dial {
+            authy_at: None,
+            authy_ports: None,
+            unrestricted: false,
+            own: Arc::default(),
+        };
+        for refused in [
+            // NAT64 well-known prefix around private, loopback and link-local IPv4
+            "64:ff9b::10.0.0.1",
+            "64:ff9b::192.168.1.1",
+            "64:ff9b::127.0.0.1",
+            "64:ff9b::169.254.169.254",
+            "64:ff9b::100.64.0.1",
+            // NAT64 local-use prefix: never a public destination
+            "64:ff9b:1::1",
+            "64:ff9b:1:abcd::10.0.0.1",
+            // 6to4: the IPv4 address is the second and third groups
+            "2002:0a00:0001::1",
+            "2002:c0a8:0101::1",
+            "2002:7f00:0001::1",
+            // Teredo: the server, and the client address stored inverted
+            "2001:0:0a00:0001::1",
+            "2001:0:5db8:d822:0:0:f5ff:fffe", // client 10.0.0.1 inverted
+            "2001:0:5db8:d822:0:0:3f57:fefe", // client 192.168.1.1 inverted
+        ] {
+            assert!(!production.allows(ip(refused)), "{refused}");
+        }
+        for allowed in [
+            "64:ff9b::93.184.216.34",
+            "2002:5db8:d822::1",
+            "2001:0:5db8:d822:0:0:a247:27dd", // Teredo with public server and client
+            "2001:4860:4860::8888",
+        ] {
+            assert!(production.allows(ip(allowed)), "{allowed}");
+        }
+        // An embedded address that is this computer's own is refused too.
+        production.add_own([ip("203.0.113.7")]);
+        assert!(!production.allows(ip("64:ff9b::203.0.113.7")));
+        assert!(!production.allows(ip("2002:cb00:7107::1")));
     }
 
     #[test]
@@ -1668,7 +2134,29 @@ mod tests {
         );
         assert_eq!(redact_ids("/"), "/");
         assert_eq!(redact_ids("/json/v2/ios/7"), "/json/v2/ios/:id");
-        assert_eq!(redact_ids("/a//b/12a/"), "/a//b/12a/");
+        assert_eq!(redact_ids("/a//b/c-d_e.json/"), "/a//b/c-d_e.json/");
+        // Anything that could be an identifier goes too: an address, a phone number with a
+        // plus sign, a long token, a hexadecimal id, an encoded segment.
+        assert_eq!(
+            redact_ids("/json/users/someone@example.com/status"),
+            "/json/users/:id/status"
+        );
+        assert_eq!(
+            redact_ids("/json/phones/+15550100/start"),
+            "/json/phones/:id/start"
+        );
+        assert_eq!(redact_ids("/a/12a/b"), "/a/:id/b");
+        assert_eq!(redact_ids("/a/abc1234def/b"), "/a/:id/b");
+        assert_eq!(
+            redact_ids("/a/af2c9a7e-ab4d-4c8e-9f0a-ed6e7f8a9b0c/b"),
+            "/a/:id/b"
+        );
+        assert_eq!(
+            redact_ids("/a/3f2c9a7e-1b4d-4c8e-9f0a-5d6e7f8a9b0c/b"),
+            "/a/:id/b"
+        );
+        assert_eq!(redact_ids("/a/caf%C3%A9/b"), "/a/:id/b");
+        assert_eq!(redact_ids(&format!("/a/{}/b", "x".repeat(41))), "/a/:id/b");
     }
 
     #[tokio::test(start_paused = true)]
@@ -1813,6 +2301,83 @@ mod tests {
             own: Arc::default(),
         };
         assert!(test.allows(ip("127.0.0.1")));
+    }
+
+    /// `data` under one content coding, made with the same library's encoders.
+    async fn encode(coding: &str, data: &[u8]) -> Vec<u8> {
+        use async_compression::tokio::write::{
+            BrotliEncoder, GzipEncoder, ZlibEncoder, ZstdEncoder,
+        };
+        use tokio::io::AsyncWriteExt;
+        macro_rules! with {
+            ($encoder:ident) => {{
+                let mut encoder = $encoder::new(Vec::new());
+                encoder.write_all(data).await.unwrap();
+                encoder.shutdown().await.unwrap();
+                encoder.into_inner()
+            }};
+        }
+        match coding {
+            "gzip" => with!(GzipEncoder),
+            "deflate" => with!(ZlibEncoder),
+            "br" => with!(BrotliEncoder),
+            "zstd" => with!(ZstdEncoder),
+            other => panic!("no encoder for {other}"),
+        }
+    }
+
+    fn codings(values: &[&'static str]) -> Vec<HeaderValue> {
+        values.iter().map(|v| HeaderValue::from_static(v)).collect()
+    }
+
+    #[tokio::test]
+    async fn every_content_coding_authy_might_use_is_undone() {
+        let plain = br#"{"authenticator_tokens":[],"message":"synthetic"}"#.repeat(50);
+        assert_eq!(
+            decoded(plain.clone(), Vec::new()).await.unwrap(),
+            plain,
+            "no coding: as it is"
+        );
+        for coding in ["gzip", "deflate", "br", "zstd"] {
+            let wire = encode(coding, &plain).await;
+            assert_ne!(wire, plain, "{coding}");
+            assert_eq!(
+                decoded(wire.clone(), codings(&[coding])).await.as_deref(),
+                Some(&plain[..]),
+                "{coding}"
+            );
+            // The wrong coding is not a backup, and not a panic.
+            let other = if coding == "gzip" { "br" } else { "gzip" };
+            assert_eq!(decoded(wire, codings(&[other])).await, None, "{coding}");
+        }
+        // Names are case-insensitive, `identity` means nothing was done, and several codings
+        // are undone last to first, whether listed in one header or two.
+        let twice = encode("br", &encode("gzip", &plain).await).await;
+        for headers in [codings(&["GZip, identity, BR"]), codings(&["gzip", "br"])] {
+            assert_eq!(
+                decoded(twice.clone(), headers).await.as_deref(),
+                Some(&plain[..])
+            );
+        }
+        assert_eq!(decoded(plain.clone(), codings(&["compress"])).await, None);
+        assert_eq!(
+            decoded(b"not gzip".to_vec(), codings(&["gzip"])).await,
+            None
+        );
+    }
+
+    #[tokio::test]
+    async fn a_response_that_expands_past_the_limit_is_not_searched() {
+        let at_limit = vec![b' '; CAPTURE_LIMIT];
+        let wire = encode("gzip", &at_limit).await;
+        assert!(wire.len() < CAPTURE_LIMIT / 100, "it compresses well");
+        assert_eq!(
+            decoded(wire, codings(&["gzip"])).await.map(|b| b.len()),
+            Some(CAPTURE_LIMIT)
+        );
+        let over = vec![b' '; CAPTURE_LIMIT + 1];
+        let wire = encode("gzip", &over).await;
+        assert_eq!(decoded(wire, codings(&["gzip"])).await, None);
     }
 
     #[test]
