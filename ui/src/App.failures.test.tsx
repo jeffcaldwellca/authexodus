@@ -27,7 +27,8 @@ describe("failures, by the shell's code", () => {
     render(<App api={api} />);
     const alert = await screen.findByRole("alert");
     expect(within(alert).getByText(en.common.loadFailed)).toBeInTheDocument();
-    expect(within(alert).getByText(en.problems.reason("the app data folder could not be created"))).toBeInTheDocument();
+    expect(within(alert).getByText(en.problems.unexplained)).toBeInTheDocument();
+    expect(alert.textContent).not.toContain("the app data folder could not be created");
     expect(within(alert).getByText(en.common.loadFailedHelp)).toBeInTheDocument();
     expect(en.common.loadFailedHelp).toMatch(/quit authexodus \(press Command-Q\)/);
 
@@ -86,10 +87,11 @@ describe("failures, by the shell's code", () => {
     expect(screen.getByRole("alert").textContent).not.toMatch(/Keychain/);
   });
 
-  it("a start that fails with no code keeps the screen's own title and shows the raw reason", async () => {
+  it("a start that fails with no code keeps the screen's own title and a plain sentence, never the raw text", async () => {
     const { alert } = await startFailing("os error 48");
     expect(within(alert).getByText(en.connect.startFailed(iphone))).toBeInTheDocument();
-    expect(within(alert).getByText(en.problems.reason("os error 48"))).toBeInTheDocument();
+    expect(within(alert).getByText(en.problems.unexplained)).toBeInTheDocument();
+    expect(alert.textContent).not.toContain("os error 48");
   });
 
   it("the person can still stop and clean up when the proxy never started", async () => {
@@ -156,7 +158,8 @@ describe("failures, by the shell's code", () => {
     await user.click(screen.getByRole("button", { name: en.unlock.submit }));
     const alert = await screen.findByRole("alert");
     expect(within(alert).getByText(en.unlock.failed)).toBeInTheDocument();
-    expect(within(alert).getByText(en.problems.reason("the decryption worker stopped"))).toBeInTheDocument();
+    expect(within(alert).getByText(en.problems.unexplained)).toBeInTheDocument();
+    expect(alert.textContent).not.toContain("the decryption worker stopped");
     // Not presented as a wrong password, and what was typed is kept for another try.
     expect(screen.queryByText(en.failures.wrongPassword.title)).not.toBeInTheDocument();
     expect(screen.getByLabelText(en.unlock.label)).toHaveValue(api.script.password);

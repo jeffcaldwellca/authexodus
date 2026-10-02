@@ -685,7 +685,9 @@ export const en = {
 
   // What to say for each code the shell can reject with: see PROBLEMS, above.
   problems: {
-    reason: (message: string) => `The reason given: ${message}`,
+    // For a refusal that came without one of the shell's sentences (Tauri's own, or a fault in
+    // this window). Its raw text is developer text and is never shown.
+    unexplained: "Something went wrong inside this app. Try again; if it keeps happening, quit the app (press Command-Q) and open it again.",
     // Shown for the two Keychain codes whenever the shell's sentence does not itself say how.
     keychainByHand: `To remove it by hand: ${KEYCHAIN_BY_HAND}.`,
     byCode: PROBLEMS,

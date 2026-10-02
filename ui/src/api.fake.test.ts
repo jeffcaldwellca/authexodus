@@ -100,9 +100,9 @@ describe("api.fake", () => {
       await expect(api.tokenQr("t1")).rejects.toMatchObject({ code, message: "A sentence." });
       expect(await api.tokenQr("t1")).toMatch(/^<svg/);
     }
-    // A bare string is a rejection with no code.
+    // A bare string is a rejection with no code: internal, its text kept off the screen.
     const api = createFakeApi({}, { failures: { finish: ["marker is stuck"], getState: ["no state"] } });
-    await expect(api.finish()).rejects.toMatchObject({ code: "internal", message: "marker is stuck" });
+    await expect(api.finish()).rejects.toMatchObject({ code: "internal", message: "" });
     await expect(api.getState()).rejects.toBeInstanceOf(ApiError);
   });
 

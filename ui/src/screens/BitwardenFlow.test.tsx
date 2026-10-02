@@ -106,10 +106,11 @@ describe("bitwarden path", () => {
     const { user } = await toReview({ applyResults: [new Error("session expired")] });
     await user.selectOptions(screen.getByRole("combobox", { name: t.actionFor("Google") }), t.skip);
     await user.click(screen.getByRole("button", { name: t.apply }));
-    // Refused outright, with no code: the raw reason is shown, not a claim that it stopped part-way.
+    // Refused outright, with no code: a plain sentence (never the raw text), not a claim that it stopped part-way.
     const alert = await screen.findByRole("alert");
     expect(within(alert).getByText(t.applyRejected)).toBeInTheDocument();
-    expect(within(alert).getByText(en.problems.reason("session expired"))).toBeInTheDocument();
+    expect(within(alert).getByText(en.problems.unexplained)).toBeInTheDocument();
+    expect(alert.textContent).not.toContain("session expired");
     expect(screen.getByRole("heading", { level: 1, name: t.reportStoppedTitle })).toBeInTheDocument();
     expect(screen.queryByText(en.failures.bitwardenServer.title)).not.toBeInTheDocument();
     expect(screen.getByRole("button", { name: t.runAgain })).toBeInTheDocument();
@@ -216,8 +217,9 @@ describe("bitwarden path", () => {
     api.bwLogin = async () => { throw new Error("bw: unexpected output"); };
     await user.click(screen.getByRole("button", { name: t.signIn }));
     await screen.findByText(t.loginFailed);
-    // A rejection with no code: the shell's text is shown as the reason, never swallowed.
-    expect(screen.getByText(en.problems.reason("bw: unexpected output"))).toBeInTheDocument();
+    // A rejection with no code: a plain sentence is shown; the raw text is developer text.
+    expect(screen.getByText(en.problems.unexplained)).toBeInTheDocument();
+    expect(document.body.textContent).not.toContain("bw: unexpected output");
     expect(screen.getByText(t.loginFailedAdvice)).toBeInTheDocument();
     expect(t.loginFailedAdvice).toMatch(/Save a file for another app, then Bitwarden/);
     expect(screen.getByLabelText(t.password)).toHaveValue("");

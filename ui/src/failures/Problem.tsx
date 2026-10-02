@@ -29,12 +29,13 @@ export function Problem({ error, d, title, children }: {
 }) {
   const known = en.problems.byCode[error.code];
   const advice = known.advice(d);
-  const sentence = error.message.trim();
-  const unexplained = error.code === "internal";
+  // The shell's own sentence. A rejection that came without one (Tauri's own, or this UI's
+  // fault) has none, and gets a fixed plain sentence: its raw text is never shown.
+  const sentence = error.message.trim() || (error.code === "internal" ? en.problems.unexplained : "");
   const route = keychainRoute(error);
   return (
     <Callout tone="error" title={known.title(d) || title} alert>
-      {sentence !== "" && <p data-shell-sentence>{unexplained ? en.problems.reason(sentence) : sentence}</p>}
+      {sentence !== "" && <p data-shell-sentence>{sentence}</p>}
       {advice !== "" && <p>{advice}</p>}
       {route !== null && <p>{route}</p>}
       {children}

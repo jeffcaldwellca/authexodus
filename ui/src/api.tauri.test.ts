@@ -102,14 +102,20 @@ describe("api.tauri", () => {
     }
   });
 
-  it("a rejection with no code, or one the UI does not know, is internal and keeps the raw text", async () => {
+  it("a rejection with no code, or one the UI does not know, is internal; its raw text goes only to the console", async () => {
     const api = createTauriApi();
-    for (const raw of ["a backup is already captured", "made_up_code: something else", "Not A Code: text", ": nothing before the colon", "bad_email"]) {
+    const consoleError = vi.spyOn(console, "error").mockImplementation(() => undefined);
+    const developerText = "invalid args `login` for command `bw_login`: missing field `region`";
+    for (const raw of [developerText, "a backup is already captured", "made_up_code: something else", "Not A Code: text", ": nothing before the colon", "bad_email"]) {
       invoke.mockRejectedValueOnce(raw);
-      await expect(api.cleanup(), raw).rejects.toMatchObject({ code: "internal", message: raw });
+      // The screen gets no message to show: Tauri's own words are not for the person.
+      await expect(api.cleanup(), raw).rejects.toMatchObject({ code: "internal", message: "" });
+      // A development build keeps them for whoever is fixing it.
+      expect(consoleError).toHaveBeenLastCalledWith(expect.any(String), raw);
     }
     invoke.mockRejectedValueOnce(new Error("boom"));
-    await expect(api.cleanup()).rejects.toMatchObject({ code: "internal", message: "boom" });
+    await expect(api.cleanup()).rejects.toMatchObject({ code: "internal", message: "" });
+    consoleError.mockRestore();
     invoke.mockRejectedValueOnce({ unexpected: true });
     await expect(api.cleanup()).rejects.toBeInstanceOf(ApiError);
     invoke.mockRejectedValueOnce(undefined);

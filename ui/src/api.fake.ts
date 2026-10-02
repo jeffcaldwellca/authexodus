@@ -5,7 +5,7 @@ import type {
   Api, AppState, ApplyReport, BwLogin, BwLoginResult, Decision, Destination, Device, LiveCode,
   Proposal, ProxyEvent, ProxyInfo, SessionSnapshot, Step, TokenView, UnlockSummary, VaultLoginView,
 } from "./api";
-import { ApiError } from "./api.errors";
+import { ApiError, unexplained } from "./api.errors";
 
 /** The commands of the contract: everything except the two subscriptions. */
 export type FakeMethod = Exclude<keyof Api, "onProxyEvent" | "onBwProgress">;
@@ -35,7 +35,8 @@ export type FakeScript = {
   googlePages: string[] | null;
   /**
    * Rejections, per command, used up one per call in order: an `ApiError` as the shell would
-   * send it, or a bare string for a rejection with no code (which arrives as `internal`).
+   * send it, or a bare string for a rejection with no code (which arrives as `internal`, with
+   * the text kept off the screen, as the real binding does).
    */
   failures: Partial<Record<FakeMethod, (ApiError | string)[]>>;
   /** Makes `bwPrepare` fail with this message. */
@@ -224,7 +225,7 @@ export function createFakeApi(initial: Partial<AppState> = {}, overrides: Partia
   /** Throws the next scripted rejection for `method`, if there is one. */
   const failIfScripted = (method: FakeMethod) => {
     const next = script.failures[method]?.shift();
-    if (next !== undefined) throw typeof next === "string" ? new ApiError("internal", next) : next;
+    if (next !== undefined) throw typeof next === "string" ? unexplained(next) : next;
   };
   const cancelled = () => new ApiError("bw_failed", "Cancelled.");
   /** Waits for `release` when the call is held; rejects when `bwCancel` arrives first. */

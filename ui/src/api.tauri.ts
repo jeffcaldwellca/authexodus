@@ -6,22 +6,22 @@
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 import type { Api, ProxyEvent } from "./api";
-import { ApiError, isErrorCode } from "./api.errors";
+import { ApiError, isErrorCode, unexplained } from "./api.errors";
 
 export const PROXY_EVENT = "proxy-event";
 export const BW_PROGRESS_EVENT = "bw-progress";
 
 /**
  * The one place a rejection is read. The shell rejects with "<code>: <plain sentence>". A
- * rejection with no code, or with one this UI does not know, is `internal` and keeps the raw
- * text as its message.
+ * rejection with no code, or with one this UI does not know, is `internal` with no message:
+ * its raw text is developer text, kept off the screen (see `unexplained`).
  */
 export function toApiError(err: unknown): ApiError {
   if (err instanceof ApiError) return err;
   const raw = err instanceof Error ? err.message : typeof err === "string" ? err : String(err);
   const colon = raw.indexOf(":");
   const code = colon > 0 ? raw.slice(0, colon) : "";
-  return isErrorCode(code) ? new ApiError(code, raw.slice(colon + 1).trimStart()) : new ApiError("internal", raw);
+  return isErrorCode(code) ? new ApiError(code, raw.slice(colon + 1).trimStart()) : unexplained(raw);
 }
 
 async function call<T>(command: string, args?: Record<string, unknown>): Promise<T> {

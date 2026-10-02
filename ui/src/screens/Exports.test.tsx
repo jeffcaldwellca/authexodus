@@ -45,11 +45,12 @@ describe("QR codes, one by one", () => {
     await screen.findByAltText(t.qr.alt("GitHub"));
   });
 
-  it("a failure with no code keeps the screen's own title and the raw reason", async () => {
+  it("a failure with no code keeps the screen's own title and a plain sentence, never the raw text", async () => {
     await open("qr", { summary: two, failures: { tokenQr: ["encoder panicked"] } });
     const alert = await screen.findByRole("alert");
     expect(within(alert).getByText(t.qr.failed)).toBeInTheDocument();
-    expect(within(alert).getByText(en.problems.reason("encoder panicked"))).toBeInTheDocument();
+    expect(within(alert).getByText(en.problems.unexplained)).toBeInTheDocument();
+    expect(alert.textContent).not.toContain("encoder panicked");
   });
 
   it("codes that are locked again lead back to the backup password", async () => {
@@ -131,7 +132,8 @@ describe("Google Authenticator transfer codes", () => {
   it("the list of what the codes cannot carry failing is a failure of the walk too", async () => {
     await open("google", { failures: { googleUnsupported: ["list unavailable"] } });
     const alert = await screen.findByRole("alert");
-    expect(within(alert).getByText(en.problems.reason("list unavailable"))).toBeInTheDocument();
+    expect(within(alert).getByText(en.problems.unexplained)).toBeInTheDocument();
+    expect(alert.textContent).not.toContain("list unavailable");
   });
 
   it("no codes at all is an answer, not a wait: nothing fits, use the other way", async () => {
@@ -165,12 +167,13 @@ describe("saved files", () => {
     expect(screen.queryByRole("alert")).not.toBeInTheDocument();
   });
 
-  it("a rejection with no code says the file could not be saved, with the raw reason", async () => {
+  it("a rejection with no code says the file could not be saved, in plain words, never the raw text", async () => {
     const { user } = await open("file", { failures: { exportFile: ["dialog closed unexpectedly"] } });
     await user.click(saveFor("aegis"));
     const alert = await screen.findByRole("alert");
     expect(within(alert).getByText(f.failed)).toBeInTheDocument();
-    expect(within(alert).getByText(en.problems.reason("dialog closed unexpectedly"))).toBeInTheDocument();
+    expect(within(alert).getByText(en.problems.unexplained)).toBeInTheDocument();
+    expect(alert.textContent).not.toContain("dialog closed unexpectedly");
   });
 
   it("no steps are shown before a file is saved, or after a cancelled save", async () => {

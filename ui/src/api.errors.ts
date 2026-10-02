@@ -26,8 +26,19 @@ export class ApiError extends Error {
   }
 }
 
+/**
+ * A rejection that is not the shell's "<code>: <sentence>": Tauri's own (a malformed argument,
+ * a command it could not run) or a fault in this UI. Its text is developer text, never shown:
+ * the screen says a fixed plain sentence for `internal` instead. A development build writes
+ * the text to the console for whoever is fixing it; a production build drops it.
+ */
+export function unexplained(raw: unknown): ApiError {
+  if (import.meta.env.DEV) console.error("A command was refused without one of the shell's codes:", raw);
+  return new ApiError("internal", "");
+}
+
 /** Whatever was thrown, as an `ApiError`. Anything that is not one already is `internal`. */
 export function asApiError(err: unknown): ApiError {
   if (err instanceof ApiError) return err;
-  return new ApiError("internal", err instanceof Error ? err.message : String(err));
+  return unexplained(err instanceof Error ? err.message : err);
 }
