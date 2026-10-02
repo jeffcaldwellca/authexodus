@@ -1,10 +1,13 @@
 // Screen 4: delete Authy, reinstall it, sign in, and stop at the backup password prompt.
 // Advances by itself when the encrypted backup passes through the proxy.
+import { useState } from "react";
 import type { Device } from "../api";
 import { Callout, Guide, Screen, Waiting, type GuideStep } from "../components/ui";
 import { AuthyPrompt } from "../device/scenes";
 import { Attestation } from "../failures/Attestation";
+import { ConnectionNotices } from "../failures/ConnectionNotices";
 import { MethodBroken } from "../failures/MethodBroken";
+import { StopConfirm } from "../failures/StopConfirm";
 import { Trouble } from "../failures/Trouble";
 import { Trust } from "../failures/Trust";
 import { Vpn } from "../failures/Vpn";
@@ -14,7 +17,8 @@ import { deviceLabel, type ScreenProps } from "./types";
 
 const t = en.authy;
 
-export function Authy({ state, dispatch, proxy }: ScreenProps) {
+export function Authy({ state, dispatch, proxy, onRestart, restart }: ScreenProps) {
+  const [confirming, setConfirming] = useState(false);
   const device: Device = state.device ?? "iphone";
   const d = deviceLabel(state.device);
   const help = { d, ip: proxy?.ip, port: proxy?.port };
@@ -35,7 +39,7 @@ export function Authy({ state, dispatch, proxy }: ScreenProps) {
       status={<Callout tone="ok"><p>{t.trusted}</p></Callout>}
       footer={
         <>
-          <Trouble onAbandon={abandon}>
+          <Trouble d={d} mentionAuthy onAbandon={abandon} onRestart={() => onRestart()}>
             <Attestation {...help} collapsible />
             <Vpn {...help} collapsible />
             <Trust {...help} collapsible />
@@ -44,13 +48,14 @@ export function Authy({ state, dispatch, proxy }: ScreenProps) {
         </>
       }
     >
+      <ConnectionNotices d={d} refused={state.deviceRefused} restart={restart} onRestart={() => onRestart()} />
       {trouble === "attestation" && <Attestation {...help} />}
-      {trouble === "trust" && <Trust {...help} />}
       {trouble === "methodBroken" && (
         <MethodBroken {...help}>
-          <button type="button" className="secondary" onClick={abandon}>{en.common.stopAndCleanUp}</button>
+          <button type="button" className="secondary" onClick={() => setConfirming(true)}>{en.common.stopAndCleanUp}</button>
         </MethodBroken>
       )}
+      {confirming && <StopConfirm mentionAuthy onCancel={() => setConfirming(false)} onConfirm={abandon} />}
       <Guide steps={steps} />
     </Screen>
   );

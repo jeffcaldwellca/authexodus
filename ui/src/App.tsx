@@ -3,6 +3,7 @@
 import { useCallback, useEffect, useReducer, useRef, useState, type ReactNode } from "react";
 import type { Api, ProxyInfo, Step } from "./api";
 import { Callout } from "./components/ui";
+import type { RestartState } from "./failures/ConnectionNotices";
 import { Authy } from "./screens/Authy";
 import { Certificate } from "./screens/Certificate";
 import { Cleanup } from "./screens/Cleanup";
@@ -24,6 +25,8 @@ export function App({ api, devTools }: { api: Api; devTools?: ReactNode }) {
   const [loaded, setLoaded] = useState<"loading" | "ready" | "failed">("loading");
   const [proxy, setProxy] = useState<ProxyInfo | null>(null);
   const [proxyError, setProxyError] = useState(false);
+  const [addressRejected, setAddressRejected] = useState<string | null>(null);
+  const [restart, setRestart] = useState<RestartState>("idle");
   const proxyAsked = useRef(false);
 
   useEffect(() => {
@@ -35,9 +38,28 @@ export function App({ api, devTools }: { api: Api; devTools?: ReactNode }) {
     return () => { live = false; off(); };
   }, [api]);
 
-  const startProxy = useCallback((ip?: string) => {
+  const startProxy = useCallback(() => {
     setProxyError(false);
-    api.startProxy(ip).then(setProxy).catch(() => setProxyError(true));
+    api.startProxy().then(setProxy).catch(() => setProxyError(true));
+  }, [api]);
+
+  // The shell refuses a new address once a backup is captured; the way through is a restart.
+  const pickAddress = useCallback((ip: string) => {
+    setAddressRejected(null);
+    api.startProxy(ip).then(setProxy).catch(() => setAddressRejected(ip));
+  }, [api]);
+
+  const restartProxy = useCallback((ip?: string) => {
+    setRestart("busy");
+    api.restartProxy(ip)
+      .then((info) => {
+        setProxy(info);
+        setProxyError(false);
+        setAddressRejected(null);
+        setRestart("idle");
+        dispatch({ type: "restarted" });
+      })
+      .catch(() => setRestart("failed"));
   }, [api]);
 
   // The proxy starts when the person reaches the connect step, and only once.
@@ -53,7 +75,7 @@ export function App({ api, devTools }: { api: Api; devTools?: ReactNode }) {
   }, [state.step]);
 
   const position = state.step === "done" ? RAIL.length : RAIL.indexOf(state.step);
-  const props = { api, state, dispatch, proxy };
+  const props = { api, state, dispatch, proxy, onRestart: restartProxy, restart };
 
   return (
     <div className="app">
@@ -71,7 +93,15 @@ export function App({ api, devTools }: { api: Api; devTools?: ReactNode }) {
             );
           })}
         </ol>
-        {state.version && <p className="version">{en.rail.version(state.version)}</p>}
+        <div className="version">
+          {state.version && <p>{en.rail.version(state.version)}</p>}
+          {state.releasesUrl && (
+            <p>
+              {en.rail.releases}
+              <span className="selectable">{state.releasesUrl}</span>
+            </p>
+          )}
+        </div>
       </nav>
       {/* `key` remounts the screen on each step, which moves focus to its heading. */}
       <main className="main" key={state.step}>
@@ -79,7 +109,7 @@ export function App({ api, devTools }: { api: Api; devTools?: ReactNode }) {
         {loaded === "failed" && <div className="screen-body"><Callout tone="error" title={en.common.loadFailed} alert /></div>}
         {loaded === "ready" && state.step === "welcome" && <Welcome {...props} />}
         {loaded === "ready" && state.step === "connect" && (
-          <Connect {...props} proxyError={proxyError} onPickAddress={startProxy} onRetry={() => startProxy()} />
+          <Connect {...props} proxyError={proxyError} addressRejected={addressRejected} onPickAddress={pickAddress} onRetry={startProxy} />
         )}
         {loaded === "ready" && state.step === "certificate" && <Certificate {...props} />}
         {loaded === "ready" && state.step === "authy" && <Authy {...props} />}

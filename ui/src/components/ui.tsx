@@ -3,11 +3,13 @@ import { useEffect, useRef, useState, type ReactNode } from "react";
 import { en } from "../strings/en";
 
 /** One wizard screen: a heading that takes focus when the screen appears, a body, and a footer bar. */
-export function Screen({ title, lede, children, footer, status }: {
+export function Screen({ title, lede, children, footer, status, focusKey }: {
   title: string; lede?: ReactNode; children: ReactNode; footer?: ReactNode; status?: ReactNode;
+  /** When a screen changes stage without remounting, a new key moves focus to the heading again. */
+  focusKey?: string;
 }) {
   const heading = useRef<HTMLHeadingElement>(null);
-  useEffect(() => { heading.current?.focus(); }, []);
+  useEffect(() => { heading.current?.focus(); }, [focusKey]);
   return (
     <>
       <div className="screen-body">

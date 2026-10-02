@@ -9,10 +9,13 @@ export const CHECK_IDS = ["device", "backups", "password", "multiDevice"] as con
 export type CheckId = (typeof CHECK_IDS)[number];
 
 /** Things the person does by hand on the phone (and Mac) during cleanup. */
-export type CleanupId = "proxyOff" | "profileRemoved" | "fileDeleted";
+export type CleanupId = "proxyOff" | "profileRemoved" | "authySignedIn" | "fileDeleted";
 
 /** A problem the proxy has told us about, which the current screen should explain. */
-export type Trouble = "trust" | "methodBroken" | "attestation";
+export type Trouble = "trust" | "methodBroken" | "attestation" | "deviceRefused";
+
+/** How many refused Authy connections, after trust was proven, mean the method is broken. */
+export const BROKEN_AFTER = 3;
 
 export type WizardState = {
   step: Step;
@@ -22,8 +25,16 @@ export type WizardState = {
   checks: Record<CheckId, boolean>;
   /** A trusted connection to Authy has succeeded at least once. */
   trustProven: boolean;
-  /** The phone refused our certificate since trust was last proven. */
+  /** The phone refused our certificate before trust was ever proven. */
   tlsRejected: boolean;
+  /** Authy connections refused since trust was last seen working. */
+  rejectionsAfterTrust: number;
+  /** A different device tried to reach Authy after one was accepted. */
+  deviceRefused: boolean;
+  /** The wizard got as far as telling the person to delete Authy. */
+  reachedAuthy: boolean;
+  /** Something has been moved: a QR walk finished, a file saved, or a Bitwarden apply done. */
+  moved: boolean;
   authyError: { status: number; path: string } | null;
   /** Largest number of accounts captured so far. */
   captured: number | null;
@@ -34,6 +45,7 @@ export type WizardState = {
   /** This launch opened on cleanup because the last run was not finished. */
   resumed: boolean;
   version: string;
+  releasesUrl: string;
 };
 
 export type WizardEvent =
@@ -43,7 +55,9 @@ export type WizardEvent =
   | { type: "start" }
   | { type: "proxy"; event: ProxyEvent }
   | { type: "unlocked"; summary: UnlockSummary }
+  | { type: "restarted" }
   | { type: "fileExported" }
+  | { type: "moved" }
   | { type: "destinationDone" }
   | { type: "backToDestination" }
   | { type: "verified" }
@@ -59,13 +73,18 @@ export function initialState(): WizardState {
     checks: { device: false, backups: false, password: false, multiDevice: false },
     trustProven: false,
     tlsRejected: false,
+    rejectionsAfterTrust: 0,
+    deviceRefused: false,
+    reachedAuthy: false,
+    moved: false,
     authyError: null,
     captured: null,
     summary: null,
     exportedFile: false,
-    cleanupTicks: { proxyOff: false, profileRemoved: false, fileDeleted: false },
+    cleanupTicks: { proxyOff: false, profileRemoved: false, authySignedIn: false, fileDeleted: false },
     resumed: false,
     version: "",
+    releasesUrl: "",
   };
 }
 
@@ -74,7 +93,17 @@ export function canStart(s: WizardState): boolean {
 }
 
 export function cleanupItems(s: WizardState): CleanupId[] {
-  return s.exportedFile ? ["proxyOff", "profileRemoved", "fileDeleted"] : ["proxyOff", "profileRemoved"];
+  const items: CleanupId[] = ["proxyOff", "profileRemoved"];
+  // Once the person was told to delete Authy (or we cannot know, after a resume), Authy has
+  // to be signed back in before they are done, or they are left without their fallback.
+  if (s.reachedAuthy || s.resumed) items.push("authySignedIn");
+  if (s.exportedFile) items.push("fileDeleted");
+  return items;
+}
+
+/** The destination step may be left once something was moved, or when there is nothing to move. */
+export function canLeaveDestination(s: WizardState): boolean {
+  return s.moved || (s.summary?.tokens.length ?? 0) === 0;
 }
 
 export function canFinish(s: WizardState): boolean {
@@ -83,9 +112,13 @@ export function canFinish(s: WizardState): boolean {
 
 /** Which failure the current screen should explain without being asked, if any. */
 export function troubleFor(s: WizardState): Trouble | null {
-  if (s.step !== "certificate" && s.step !== "authy") return null;
-  if (s.tlsRejected) return s.trustProven ? "methodBroken" : "trust";
-  if (s.step === "authy" && s.authyError) return "attestation";
+  if (!LISTENING.includes(s.step)) return null;
+  if (s.deviceRefused) return "deviceRefused";
+  if (s.step === "certificate") return s.tlsRejected && !s.trustProven ? "trust" : null;
+  if (s.step !== "authy") return null;
+  // One refusal proves nothing. Only trust seen working, then refused again and again, does.
+  if (s.trustProven && s.rejectionsAfterTrust >= BROKEN_AFTER) return "methodBroken";
+  if (s.authyError) return "attestation";
   return null;
 }
 
@@ -99,16 +132,22 @@ function onProxy(s: WizardState, e: ProxyEvent): WizardState {
       return s.step === "connect" ? { ...s, step: "certificate" } : s;
     case "trustWorking":
       // A trusted connection implies the device is connected, so this also leaves `connect`.
-      return { ...s, step: "authy", trustProven: true, tlsRejected: false };
+      return { ...s, step: "authy", reachedAuthy: true, trustProven: true, tlsRejected: false, rejectionsAfterTrust: 0 };
     case "tlsRejected":
+      if (s.trustProven) return { ...s, rejectionsAfterTrust: s.rejectionsAfterTrust + 1 };
       // Before the certificate step every connection to Authy is refused; that is expected.
       return s.step === "connect" ? s : { ...s, tlsRejected: true };
+    case "deviceRefused":
+      return { ...s, deviceRefused: true };
     case "authyError":
       return { ...s, authyError: { status: e.status, path: e.path } };
     case "backupCaptured": {
       // The backup can arrive more than once and a later one can be empty: keep the largest.
       if (e.count <= 0) return s;
-      return { ...s, step: "unlock", captured: Math.max(s.captured ?? 0, e.count), authyError: null, tlsRejected: false };
+      return {
+        ...s, step: "unlock", reachedAuthy: true, captured: Math.max(s.captured ?? 0, e.count),
+        authyError: null, tlsRejected: false, deviceRefused: false,
+      };
     }
   }
 }
@@ -116,7 +155,7 @@ function onProxy(s: WizardState, e: ProxyEvent): WizardState {
 export function reduce(s: WizardState, ev: WizardEvent): WizardState {
   switch (ev.type) {
     case "loaded": {
-      const base = { ...s, device: ev.app.device, version: ev.app.version };
+      const base = { ...s, device: ev.app.device, version: ev.app.version, releasesUrl: ev.app.releasesUrl };
       return ev.app.resumeCleanup ? { ...base, step: "cleanup", resumed: true } : { ...base, resumed: false };
     }
     case "chooseDevice":
@@ -132,10 +171,19 @@ export function reduce(s: WizardState, ev: WizardEvent): WizardState {
       return onProxy(s, ev.event);
     case "unlocked":
       return s.step === "unlock" ? { ...s, step: "destination", summary: ev.summary } : s;
+    case "restarted":
+      // The proxy started over: the capture is gone and the device must reconnect. The
+      // certificate on the phone is unchanged, so trust will be seen again by itself.
+      return LISTENING.includes(s.step) ? {
+        ...s, step: "connect", trustProven: false, tlsRejected: false, rejectionsAfterTrust: 0,
+        deviceRefused: false, authyError: null, captured: null,
+      } : s;
     case "fileExported":
-      return { ...s, exportedFile: true };
+      return { ...s, exportedFile: true, moved: true };
+    case "moved":
+      return s.step === "destination" ? { ...s, moved: true } : s;
     case "destinationDone":
-      return s.step === "destination" ? { ...s, step: "verify" } : s;
+      return s.step === "destination" && canLeaveDestination(s) ? { ...s, step: "verify" } : s;
     case "backToDestination":
       return s.step === "verify" ? { ...s, step: "destination" } : s;
     case "verified":

@@ -2,9 +2,7 @@
 // It is never loaded inside Tauri.
 import { useState } from "react";
 import { FAKE_PASSWORD, type FakeApi } from "../api.fake";
-import { en } from "../strings/en";
-
-const t = en.dev;
+import { dev as t } from "../strings/dev";
 
 export function DevPanel({ api }: { api: FakeApi }) {
   const [open, setOpen] = useState(true);
@@ -23,6 +21,7 @@ export function DevPanel({ api }: { api: FakeApi }) {
         <button type="button" onClick={() => api.emitProxyEvent({ kind: "tlsRejected" })}>{t.tlsRejected}</button>
         <button type="button" onClick={() => api.emitProxyEvent({ kind: "trustWorking" })}>{t.trustWorking}</button>
         <button type="button" onClick={() => api.emitProxyEvent({ kind: "authyError", status: 400, path: "/json/users/new" })}>{t.authyError}</button>
+        <button type="button" onClick={() => api.emitProxyEvent({ kind: "deviceRefused" })}>{t.deviceRefused}</button>
         <button type="button" onClick={() => api.emitProxyEvent({ kind: "backupCaptured", count: api.script.summary.tokens.length + 2 })}>{t.backupCaptured}</button>
         <button type="button" onClick={() => { api.script.applyResults.push({ attached: 2, created: 0, skipped: 0, kept: [], failed: t.bwFailMessage }); }}>{t.bwFail}</button>
       </div>

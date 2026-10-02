@@ -1,6 +1,7 @@
 import React from "react";
 import ReactDOM from "react-dom/client";
 import type { Api } from "./api";
+import { createTauriApi } from "./api.tauri";
 import { App } from "./App";
 import "./styles.css";
 
@@ -12,15 +13,13 @@ function insideTauri(): boolean {
 async function boot() {
   let api: Api;
   let devTools: React.ReactNode = null;
-  if (insideTauri()) {
-    const { createTauriApi } = await import("./api.tauri");
-    api = createTauriApi();
+  // `import.meta.env.DEV` is a constant at build time, so in a production build this whole
+  // branch, and with it the fake and the pretend phone, is removed from the bundle.
+  if (import.meta.env.DEV && !insideTauri()) {
+    const { createDevApi } = await import("./dev/boot");
+    ({ api, devTools } = createDevApi());
   } else {
-    // No Tauri: run the whole wizard against the in-memory fake, with a pretend phone.
-    const [{ createFakeApi }, { DevPanel }] = await Promise.all([import("./api.fake"), import("./dev/DevPanel")]);
-    const fake = createFakeApi({}, { delayMs: 400 });
-    api = fake;
-    devTools = <DevPanel api={fake} />;
+    api = createTauriApi();
   }
   ReactDOM.createRoot(document.getElementById("root") as HTMLElement).render(
     <React.StrictMode>

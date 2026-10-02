@@ -254,6 +254,8 @@ button.guide-step:hover { background: var(--sunken); }
 .device { display: block; height: auto; }
 .device-iphone { width: 250px; }
 .device-ipad { width: 372px; }
+.device-iphone.noted { width: 350px; }
+.device-ipad.noted { width: 430px; }
 .device-plain { width: 250px; }
 
 .qr-block { display: grid; gap: 8px; justify-items: center; text-align: center; width: 280px; }
@@ -305,14 +307,30 @@ details.panel[open] summary { border-bottom: 1px solid var(--line); }
 .panel-content { padding: 10px 14px 12px; }
 .panel-content > * + * { margin-top: 6px; }
 
-.sheet-backdrop { position: fixed; inset: 0; background: rgba(10, 16, 15, 0.45); display: flex; justify-content: flex-end; z-index: 10; }
+.backdrop { position: fixed; inset: 0; background: rgba(10, 16, 15, 0.45); display: flex; z-index: 10; }
+.backdrop-sheet { justify-content: flex-end; }
+.backdrop-box { align-items: center; justify-content: center; padding: 24px; }
+.box { width: min(460px, 100%); background: var(--surface); border-radius: 14px; padding: 22px 24px; border: 1px solid var(--line); }
+.box:focus { outline: none; }
+.box > * + * { margin-top: 10px; }
+.dialog-actions { display: flex; justify-content: flex-end; gap: 10px; margin-top: 18px; }
+.strong { font-weight: 650; }
+.secondary.danger { color: var(--danger); border-color: var(--danger); }
+.panel-reminder { border-color: var(--line); background: var(--sunken); }
+.panel-reminder h2 { color: var(--ink); }
+.way-out { margin-top: 28px; }
+.plain-list { list-style: disc; padding-left: 1.2em; }
+.selectable { display: block; user-select: text; -webkit-user-select: text; overflow-wrap: anywhere; cursor: text; }
+.version p + p { margin-top: 4px; }
 .sheet {
   width: min(440px, 100%); height: 100%; overflow-y: auto;
   background: var(--surface); padding: 22px 24px; border-left: 1px solid var(--line);
 }
 .sheet:focus { outline: none; }
-.sheet-head { display: flex; justify-content: space-between; align-items: center; }
-.sheet-head h2 { margin: 0; font-size: 19px; }
+.dialog-head { display: flex; justify-content: space-between; align-items: center; }
+.dialog-head h2 { margin: 0; font-size: 19px; }
+.sheet > * + * { margin-top: 8px; }
+.sheet-foot > * + * { margin-top: 6px; }
 .sheet-foot { margin-top: 18px; padding-top: 10px; border-top: 1px solid var(--line); }
 
 /* ---------- destination ---------- */
@@ -392,6 +410,7 @@ details.panel[open] summary { border-bottom: 1px solid var(--line); }
 .d-on-stop { fill: #2e2200; }
 .d-hl { fill: var(--marker-wash); stroke: var(--marker); stroke-width: 2.5; }
 .d-ring { fill: none; }
+.d-note-line { fill: none; stroke: var(--marker); stroke-width: 2.5; stroke-linecap: round; stroke-linejoin: round; }
 .d-live { fill: var(--marker-wash); stroke: var(--marker); stroke-width: 1.5; }
 .d-outline { stroke: var(--ink-2); stroke-width: 2; stroke-linejoin: round; stroke-linecap: round; }
 .d-nofill { fill: none; }

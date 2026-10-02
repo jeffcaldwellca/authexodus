@@ -3,6 +3,7 @@
 import type { Device } from "../api";
 import { Callout, Guide, Screen, Waiting, type GuideStep } from "../components/ui";
 import { NetworkDetail, ProxyForm, WifiList } from "../device/scenes";
+import { ConnectionNotices } from "../failures/ConnectionNotices";
 import { Firewall } from "../failures/Firewall";
 import { Trouble } from "../failures/Trouble";
 import { Vpn } from "../failures/Vpn";
@@ -14,11 +15,13 @@ const t = en.connect;
 
 export type ConnectProps = ScreenProps & {
   proxyError: boolean;
+  /** An address the shell refused to switch to without a restart. */
+  addressRejected: string | null;
   onPickAddress: (ip: string) => void;
   onRetry: () => void;
 };
 
-export function Connect({ state, dispatch, proxy, proxyError, onPickAddress, onRetry }: ConnectProps) {
+export function Connect({ state, dispatch, proxy, proxyError, addressRejected, onPickAddress, onRetry, onRestart, restart }: ConnectProps) {
   const device: Device = state.device ?? "iphone";
   const d = deviceLabel(state.device);
   const help = { d, ip: proxy?.ip, port: proxy?.port };
@@ -37,7 +40,7 @@ export function Connect({ state, dispatch, proxy, proxyError, onPickAddress, onR
       lede={t.lede(d)}
       footer={
         <>
-          <Trouble onAbandon={() => dispatch({ type: "abandon" })}>
+          <Trouble d={d} mentionAuthy={state.reachedAuthy} onAbandon={() => dispatch({ type: "abandon" })} onRestart={() => onRestart()}>
             <Firewall {...help} collapsible />
             <Wifi {...help} collapsible />
             <Vpn {...help} collapsible />
@@ -46,6 +49,14 @@ export function Connect({ state, dispatch, proxy, proxyError, onPickAddress, onR
         </>
       }
     >
+      <ConnectionNotices d={d} refused={state.deviceRefused} restart={restart} onRestart={() => onRestart()} />
+      {addressRejected && (
+        <Callout tone="warn" title={t.addressRejected(addressRejected)} alert>
+          <button type="button" className="secondary" disabled={restart === "busy"} onClick={() => onRestart(addressRejected)}>
+            {t.restartOn(addressRejected)}
+          </button>
+        </Callout>
+      )}
       {proxyError && (
         <Callout tone="error" title={t.startFailed(d)} alert>
           <button type="button" className="secondary" onClick={onRetry}>{en.common.tryAgain}</button>

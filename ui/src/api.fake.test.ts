@@ -48,4 +48,22 @@ describe("api.fake", () => {
     await api.finish();
     expect((await api.getState()).resumeCleanup).toBe(false);
   });
+
+  it("refuses a different address once a backup is captured, until the proxy is restarted", async () => {
+    const api = createFakeApi();
+    await api.startProxy();
+    api.emitProxyEvent({ kind: "backupCaptured", count: 3 });
+    // The same address is fine: starting is idempotent.
+    expect((await api.startProxy("192.168.4.109")).ip).toBe("192.168.4.109");
+    expect((await api.startProxy()).ip).toBe("192.168.4.109");
+    await expect(api.startProxy("10.0.0.12")).rejects.toThrow();
+    expect((await api.restartProxy("10.0.0.12")).ip).toBe("10.0.0.12");
+    expect((await api.startProxy("192.168.4.109")).ip).toBe("192.168.4.109");
+  });
+
+  it("reports the release page and the titles Google's codes cannot carry", async () => {
+    const api = createFakeApi({}, { googleUnsupported: ["Steam"] });
+    expect((await api.getState()).releasesUrl).toMatch(/^https:\/\//);
+    expect(await api.googleUnsupported()).toEqual(["Steam"]);
+  });
 });

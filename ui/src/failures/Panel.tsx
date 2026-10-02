@@ -7,10 +7,13 @@ export type HelpContext = { d: string; ip?: string; port?: number };
 export type PanelProps = HelpContext & {
   /** Inside the "Having trouble?" sheet panels fold away; shown on their own they are open. */
   collapsible?: boolean;
+  reminder?: boolean;
 };
 
-export function Panel({ id, title, body, steps, children, collapsible }: {
+export function Panel({ id, title, body, steps, children, collapsible, reminder }: {
   id: string; title: string; body?: string; steps?: readonly string[]; children?: ReactNode; collapsible?: boolean;
+  /** A reminder is calm and announced politely; it does not interrupt like a problem does. */
+  reminder?: boolean;
 }) {
   const content = (
     <>
@@ -28,7 +31,7 @@ export function Panel({ id, title, body, steps, children, collapsible }: {
     );
   }
   return (
-    <section className="panel panel-open" data-failure={id} role="alert">
+    <section className={reminder ? "panel panel-open panel-reminder" : "panel panel-open"} data-failure={id} role={reminder ? "status" : "alert"}>
       <h2>{title}</h2>
       {content}
     </section>
