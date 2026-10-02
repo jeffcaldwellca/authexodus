@@ -1,9 +1,11 @@
 // Screen 3: download the certificate, install the profile, and (the step people miss) switch
 // on full trust. Advances by itself when an intercepted connection to Authy succeeds.
+// A refused connection here is expected until the last step, so it only adds a calm reminder
+// under the guide; it never moves the picture the person is looking at.
 import type { Device } from "../api";
 import { Callout, Guide, QrImage, Screen, Waiting, type GuideStep } from "../components/ui";
 import { DownloadPage, InstallProfile, ProfileDownloaded, TrustSettings } from "../device/scenes";
-import { MethodBroken } from "../failures/MethodBroken";
+import { ConnectionNotices } from "../failures/ConnectionNotices";
 import { Trouble } from "../failures/Trouble";
 import { Trust } from "../failures/Trust";
 import { Vpn } from "../failures/Vpn";
@@ -14,7 +16,7 @@ import { deviceLabel, type ScreenProps } from "./types";
 
 const t = en.certificate;
 
-export function Certificate({ state, dispatch, proxy }: ScreenProps) {
+export function Certificate({ state, dispatch, proxy, onRestart, restart }: ScreenProps) {
   const device: Device = state.device ?? "iphone";
   const d = deviceLabel(state.device);
   const help = { d, ip: proxy?.ip, port: proxy?.port };
@@ -47,7 +49,7 @@ export function Certificate({ state, dispatch, proxy }: ScreenProps) {
       status={<Callout tone="ok"><p>{t.connected(d)}</p></Callout>}
       footer={
         <>
-          <Trouble onAbandon={abandon}>
+          <Trouble d={d} mentionAuthy={state.reachedAuthy} onAbandon={abandon} onRestart={() => onRestart()}>
             <Trust {...help} collapsible />
             <Wifi {...help} collapsible />
             <Vpn {...help} collapsible />
@@ -56,14 +58,10 @@ export function Certificate({ state, dispatch, proxy }: ScreenProps) {
         </>
       }
     >
-      {trouble === "trust" && <Trust {...help} />}
-      {trouble === "methodBroken" && (
-        <MethodBroken {...help}>
-          <button type="button" className="secondary" onClick={abandon}>{en.common.stopAndCleanUp}</button>
-        </MethodBroken>
-      )}
-      {/* Remounting on `trouble` puts the trust picture in view the moment trust is the problem. */}
-      <Guide key={trouble ?? "none"} steps={steps} initial={trouble === "trust" ? "trust" : "scan"} />
+      <ConnectionNotices d={d} refused={state.deviceRefused} restart={restart} onRestart={() => onRestart()} />
+      {/* The guide never moves on an event: the person may still be scanning the code. */}
+      <Guide steps={steps} />
+      {trouble === "trust" && <Trust {...help} reminder />}
     </Screen>
   );
 }

@@ -163,24 +163,26 @@ const IPAD = { vw: 420, vh: 372, full: 540, sx: 12, sy: 12, sw: 396, sh: 516, to
  * The device body with a clipped screen. `children` draws the main pane and is told how wide
  * it is. On an iPad with a `sidebar`, Settings' left column is drawn beside the pane.
  */
-export function Frame({ device, label, sidebar, children }: {
-  device: Device; label: string; sidebar?: Sidebar; children: (w: number) => ReactNode;
+export function Frame({ device, label, sidebar, note, children }: {
+  device: Device; label: string; sidebar?: Sidebar; note?: Note; children: (w: number) => ReactNode;
 }) {
   const clip = useId();
   const fade = useId();
+  const extra = note ? NOTE_W : 0;
   if (device === "iphone") {
     const f = IPHONE;
     return (
-      <svg className="device device-iphone" data-device="iphone" role="img" aria-label={label} viewBox={`0 0 ${f.vw} ${f.vh}`}>
+      <svg className={note ? "device device-iphone noted" : "device device-iphone"} data-device="iphone" role="img" aria-label={label} viewBox={`0 0 ${f.vw + extra} ${f.vh}`}>
         <rect x={1.5} y={1.5} width={f.vw - 3} height={f.full - 3} rx={42} className="d-body" />
         <clipPath id={clip}><rect x={f.sx} y={f.sy} width={f.sw} height={f.sh} rx={33} /></clipPath>
-        <g clipPath={`url(#${clip})`}>
+        <g clipPath={`url(#${clip})`} data-part="screen">
           <rect x={f.sx} y={f.sy} width={f.sw} height={f.sh} className="d-screen" />
           <text x={f.sx + 28} y={f.sy + 24} className="d-text d-bold d-small">{t.time}</text>
           <rect x={f.vw / 2 - 34} y={f.sy + 9} width={68} height={20} rx={10} className="d-island" />
           <g transform={`translate(${f.sx} ${f.sy + f.top})`}>{children(f.sw)}</g>
         </g>
         <Fade id={fade} w={f.vw} h={f.vh} />
+        {note && <NoteFlag note={note} from={f.vw} into={f.sx + f.sw - 30} top={f.sy + f.top} />}
       </svg>
     );
   }
@@ -188,10 +190,10 @@ export function Frame({ device, label, sidebar, children }: {
   const paneX = sidebar ? f.sx + f.side : f.sx;
   const paneW = sidebar ? f.sw - f.side : f.sw;
   return (
-    <svg className="device device-ipad" data-device="ipad" role="img" aria-label={label} viewBox={`0 0 ${f.vw} ${f.vh}`}>
+    <svg className={note ? "device device-ipad noted" : "device device-ipad"} data-device="ipad" role="img" aria-label={label} viewBox={`0 0 ${f.vw + extra} ${f.vh}`}>
       <rect x={1.5} y={1.5} width={f.vw - 3} height={f.full - 3} rx={24} className="d-body" />
       <clipPath id={clip}><rect x={f.sx} y={f.sy} width={f.sw} height={f.sh} rx={13} /></clipPath>
-      <g clipPath={`url(#${clip})`}>
+      <g clipPath={`url(#${clip})`} data-part="screen">
         <rect x={f.sx} y={f.sy} width={f.sw} height={f.sh} className="d-screen" />
         <text x={f.sx + 14} y={f.sy + 18} className="d-text d-bold d-small">{t.time}</text>
         {sidebar && (
@@ -203,7 +205,27 @@ export function Frame({ device, label, sidebar, children }: {
         <g transform={`translate(${paneX} ${f.sy + f.top})`}>{children(paneW)}</g>
       </g>
       <Fade id={fade} w={f.vw} h={f.vh} />
+      {note && <NoteFlag note={note} from={f.vw} into={f.sx + f.sw / 2 + 110} top={f.sy + f.top} />}
     </svg>
+  );
+}
+
+/**
+ * A remark about the screen, drawn beside the device rather than on its screen so that it
+ * cannot be mistaken for something to tap. `y` is in the pane's own coordinates.
+ */
+export type Note = { text: string; y: number };
+const NOTE_W = 104;
+
+function NoteFlag({ note, from, into, top }: { note: Note; from: number; into: number; top: number }) {
+  const y = top + note.y;
+  return (
+    <g data-part="note">
+      <path d={`M${from + 8} ${y}H${into}`} className="d-note-line" />
+      <path d={`M${into + 9} ${y - 6}L${into} ${y}L${into + 9} ${y + 6}`} className="d-note-line" />
+      <rect x={from + 6} y={y - 17} width={NOTE_W - 10} height={34} rx={8} className="d-stop" />
+      <text x={from + 6 + (NOTE_W - 10) / 2} y={y + 5} textAnchor="middle" className="d-text d-bold d-on-stop">{note.text}</text>
+    </g>
   );
 }
 

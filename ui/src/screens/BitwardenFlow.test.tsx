@@ -1,4 +1,4 @@
-import { screen, within } from "@testing-library/react";
+import { screen, waitFor, within } from "@testing-library/react";
 import type { Proposal } from "../api";
 import type { FakeScript } from "../api.fake";
 import { en } from "../strings/en";
@@ -134,14 +134,89 @@ describe("bitwarden path", () => {
     expect(screen.queryByLabelText(t.password)).not.toBeInTheDocument();
   });
 
-  it("a login that already has a code is offered as left alone, and is reported as kept", async () => {
+  it("a login that already has a code cannot be chosen, and its row waits for a choice", async () => {
     const withCode: Proposal[] = [
       { tokenId: "gh", confidence: "high", decision: { kind: "attach", itemId: "v-gh" },
-        candidates: [{ itemId: "v-gh", name: "GitHub", username: "sam", hasCode: true }] },
+        candidates: [
+          { itemId: "v-gh", name: "GitHub", username: "sam", hasCode: true },
+          { itemId: "v-gh2", name: "GitHub (old)", username: null, hasCode: false },
+        ] },
     ];
-    const { user } = await toReview({ summary: { ...summary, tokens: [summary.tokens[0]!] }, proposals: withCode });
-    expect(screen.getByRole("option", { name: t.attachHasCode("GitHub", "sam") })).toBeInTheDocument();
+    const { api, user } = await toReview({ summary: { ...summary, tokens: [summary.tokens[0]!] }, proposals: withCode });
+    const select = screen.getByRole("combobox", { name: t.actionFor("GitHub") });
+    // Confident or not, a match that cannot be applied is not decided for the person.
+    expect(select).toHaveValue("");
+    expect(screen.getByText(t.questionHasCode)).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: t.apply })).toBeDisabled();
+
+    const taken = screen.getByRole("option", { name: t.attachHasCode("GitHub", "sam") });
+    expect(taken).toBeDisabled();
+    expect(taken.textContent).toMatch(/already has a code/);
+    expect(screen.getByRole("option", { name: t.attach("GitHub (old)", null) })).toBeEnabled();
+
+    await user.selectOptions(select, t.createNew);
     await user.click(screen.getByRole("button", { name: t.apply }));
-    await screen.findByText(t.kept(["GitHub"]));
+    await screen.findByRole("heading", { level: 1, name: t.reportTitle });
+    expect(api.calls.find((c) => c.method === "bwApply")?.args[0]).toEqual([{ tokenId: "gh", decision: { kind: "createNew" } }]);
+  });
+
+  it("focus moves to the heading on every stage of the Bitwarden path", async () => {
+    const { user } = await walkTo("destination", { summary, proposals });
+    const heading = () => screen.getByRole("heading", { level: 1 });
+    await user.click(screen.getByRole("button", { name: new RegExp(en.destination.options.bitwarden.title) }));
+    expect(heading()).toHaveTextContent(t.introTitle);
+    expect(heading()).toHaveFocus();
+
+    await user.click(screen.getByRole("button", { name: t.prepare }));
+    await screen.findByRole("heading", { level: 1, name: t.loginTitle });
+    await waitFor(() => expect(heading()).toHaveFocus());
+
+    await user.type(screen.getByLabelText(t.email), "sam@example.com");
+    await user.type(screen.getByLabelText(t.password), "master pw");
+    await user.click(screen.getByRole("button", { name: t.signIn }));
+    await screen.findByRole("heading", { level: 1, name: t.reviewTitle });
+    await waitFor(() => expect(heading()).toHaveFocus());
+
+    await user.selectOptions(screen.getByRole("combobox", { name: t.actionFor("Google") }), t.skip);
+    await user.click(screen.getByRole("button", { name: t.apply }));
+    await screen.findByRole("heading", { level: 1, name: t.reportTitle });
+    await waitFor(() => expect(heading()).toHaveFocus());
+    expect(document.activeElement).not.toBe(document.body);
+  });
+
+  it("a self-hosted server needs a full https address before sign-in is possible", async () => {
+    const { api, user } = await walkTo("destination", { summary, proposals });
+    await user.click(screen.getByRole("button", { name: new RegExp(en.destination.options.bitwarden.title) }));
+    await user.click(screen.getByRole("button", { name: t.prepare }));
+    await screen.findByRole("heading", { level: 1, name: t.loginTitle });
+    await user.type(screen.getByLabelText(t.email), "sam@example.com");
+    await user.type(screen.getByLabelText(t.password), "master pw");
+    const signIn = screen.getByRole("button", { name: t.signIn });
+    expect(signIn).toBeEnabled();
+
+    await user.click(screen.getByRole("radio", { name: t.regions.selfHosted }));
+    const url = screen.getByLabelText(t.serverUrl);
+    expect(signIn).toBeDisabled();
+    expect(screen.getByText(t.serverUrlHint)).toBeInTheDocument();
+
+    for (const bad of ["vault.example.com", "http://vault.example.com", "https://", "https:// vault"]) {
+      await user.clear(url);
+      await user.type(url, bad);
+      expect(signIn, bad).toBeDisabled();
+      expect(screen.getByText(t.serverUrlInvalid)).toBeInTheDocument();
+      expect(url).toHaveAttribute("aria-invalid", "true");
+    }
+    // Pressing Enter in the form does not get around it.
+    await user.type(url, "{Enter}");
+    expect(api.calls.some((c) => c.method === "bwLogin")).toBe(false);
+
+    await user.clear(url);
+    await user.type(url, "https://vault.example.com");
+    expect(signIn).toBeEnabled();
+    await user.click(signIn);
+    await screen.findByRole("heading", { level: 1, name: t.reviewTitle });
+    expect(api.calls.find((c) => c.method === "bwLogin")?.args[0]).toMatchObject({
+      region: { kind: "selfHosted", url: "https://vault.example.com" },
+    });
   });
 });

@@ -2,6 +2,7 @@
 // lives in this component only until the unlock succeeds, and is never trimmed or changed.
 import { useRef, useState, type FormEvent } from "react";
 import { Callout, Screen } from "../components/ui";
+import { StopConfirm } from "../failures/StopConfirm";
 import { WrongPassword } from "../failures/WrongPassword";
 import { en } from "../strings/en";
 import { deviceLabel, type ScreenProps } from "./types";
@@ -13,6 +14,7 @@ export function Unlock({ api, state, dispatch }: ScreenProps) {
   const [visible, setVisible] = useState(false);
   const [busy, setBusy] = useState(false);
   const [problem, setProblem] = useState<"wrong" | "failed" | null>(null);
+  const [confirming, setConfirming] = useState(false);
   const input = useRef<HTMLInputElement>(null);
   const d = deviceLabel(state.device);
 
@@ -48,9 +50,7 @@ export function Unlock({ api, state, dispatch }: ScreenProps) {
       }
       footer={
         <>
-          <button type="button" className="quiet danger" onClick={() => dispatch({ type: "abandon" })}>
-            {en.common.stopAndCleanUp}
-          </button>
+          <span />
           <button type="submit" form="unlock-form" className="primary" disabled={busy || password === ""}>
             {busy ? t.working : t.submit}
           </button>
@@ -83,6 +83,13 @@ export function Unlock({ api, state, dispatch }: ScreenProps) {
         </div>
       </form>
       <p className="quiet-text narrow">{t.alsoAuthy(d)}</p>
+      <p className="quiet-text narrow way-out">
+        {t.forgotten}
+        <button type="button" className="quiet danger small" onClick={() => setConfirming(true)}>{en.common.stopAndCleanUp}</button>
+      </p>
+      {confirming && (
+        <StopConfirm mentionAuthy onCancel={() => setConfirming(false)} onConfirm={() => dispatch({ type: "abandon" })} />
+      )}
     </Screen>
   );
 }

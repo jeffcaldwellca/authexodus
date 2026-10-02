@@ -58,6 +58,20 @@ describe("device illustrations", () => {
     unmount();
   });
 
+  it.each(DEVICES)("Stop here is a note beside the device, not something on its screen (%s)", (device) => {
+    const { container } = render(<AuthyPrompt device={device} stop />);
+    const note = container.querySelector('[data-part="note"]')!;
+    expect(note).not.toBeNull();
+    expect(within(note as HTMLElement).getByText(en.device.stopHere)).toBeInTheDocument();
+    const screenPart = container.querySelector('[data-part="screen"]')!;
+    expect(screenPart.contains(note)).toBe(false);
+    expect(within(screenPart as HTMLElement).queryByText(en.device.stopHere)).not.toBeInTheDocument();
+    // The flag sits to the right of the device body, in the widened drawing.
+    const flag = note.querySelector("rect")!;
+    const bodyWidth = Number(container.querySelector(".d-body")!.getAttribute("width"));
+    expect(Number(flag.getAttribute("x"))).toBeGreaterThan(bodyWidth);
+  });
+
   it("the trust drawing names the certificate exactly as the phone shows it", () => {
     render(<TrustSettings device="iphone" />);
     expect(screen.getByText(en.certName)).toBeInTheDocument();

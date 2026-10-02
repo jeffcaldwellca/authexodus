@@ -1,12 +1,13 @@
 // Screen 6: choose where the codes go. Four ways, each a sub-view of this screen. Tokens that
 // cannot move (Authy's own 7-digit ones, and unusable keys) are listed by name, never exported.
 import { useState } from "react";
-import { Screen } from "../components/ui";
+import { Callout, Screen } from "../components/ui";
 import { en } from "../strings/en";
+import { canLeaveDestination } from "../wizard/machine";
 import { BitwardenFlow } from "./BitwardenFlow";
 import { FileExport } from "./FileExport";
 import { GoogleWalk, QrWalk } from "./QrWalk";
-import type { ScreenProps } from "./types";
+import { deviceLabel, type ScreenProps } from "./types";
 
 const t = en.destination;
 const OPTIONS = ["qr", "bitwarden", "google", "file"] as const;
@@ -18,14 +19,18 @@ export function Destination(props: ScreenProps) {
   const [used, setUsed] = useState<ReadonlySet<Option>>(new Set());
   const summary = state.summary ?? { tokens: [], invalid: [], native: [] };
   const cantMove = summary.native.length + summary.invalid.length;
+  const canLeave = canLeaveDestination(state);
 
   const leave = (option: Option, wasUsed: boolean) => {
-    if (wasUsed) setUsed((prev) => new Set(prev).add(option));
+    if (wasUsed) {
+      setUsed((prev) => new Set(prev).add(option));
+      dispatch({ type: "moved" });
+    }
     setView(null);
   };
 
-  if (view === "qr") return <QrWalk {...props} tokens={summary.tokens} onDone={() => leave("qr", true)} />;
-  if (view === "google") return <GoogleWalk {...props} onDone={() => leave("google", true)} />;
+  if (view === "qr") return <QrWalk {...props} tokens={summary.tokens} onDone={(walked) => leave("qr", walked)} />;
+  if (view === "google") return <GoogleWalk {...props} onDone={(walked) => leave("google", walked)} />;
   if (view === "file") return <FileExport {...props} onDone={(saved) => leave("file", saved)} />;
   if (view === "bitwarden") return <BitwardenFlow {...props} tokens={summary.tokens} onDone={(applied) => leave("bitwarden", applied)} />;
 
@@ -35,13 +40,16 @@ export function Destination(props: ScreenProps) {
       lede={summary.tokens.length > 0 ? t.lede(summary.tokens.length) : t.none}
       footer={
         <>
-          <span />
-          <button type="button" className={used.size > 0 ? "primary" : "secondary"} onClick={() => dispatch({ type: "destinationDone" })}>
+          <p className="footer-hint" aria-live="polite">{canLeave ? "" : t.continueBlocked}</p>
+          <button type="button" className="primary" disabled={!canLeave} onClick={() => dispatch({ type: "destinationDone" })}>
             {t.continue}
           </button>
         </>
       }
     >
+      <Callout tone="warn" title={t.authyTitle}>
+        <p>{t.authyBody(deviceLabel(state.device))}</p>
+      </Callout>
       {summary.tokens.length > 0 && (
         <ul className="options">
           {OPTIONS.map((option) => (

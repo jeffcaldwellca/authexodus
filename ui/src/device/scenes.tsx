@@ -179,11 +179,14 @@ export function DownloadPage({ device, ip, port, highlight }: P & { ip: string; 
   );
 }
 
-/** Authy asking for the backups password. With `stop`, the drawing says to stop here. */
+/**
+ * Authy asking for the backups password. With `stop`, a "Stop here" flag beside the device
+ * points at the password field; it is outside the screen so it does not look like a button.
+ */
 export function AuthyPrompt({ device, stop }: P & { stop: boolean }) {
   const d = name(device);
   return (
-    <Frame device={device} label={stop ? alt.authyPrompt(d) : alt.authyPassword(d)}>
+    <Frame device={device} label={stop ? alt.authyPrompt(d) : alt.authyPassword(d)} note={stop ? { text: t.stopHere, y: 171 } : undefined}>
       {(w) => {
         const cx = w / 2;
         return (
@@ -195,12 +198,6 @@ export function AuthyPrompt({ device, stop }: P & { stop: boolean }) {
             <rect x={cx - 96} y={152} width={192} height={38} rx={9} className="d-card" />
             <text x={cx - 84} y={176} className="d-text d-dim">{t.authyPasswordField}</text>
             {!stop && <rect x={cx - 100} y={148} width={200} height={46} rx={11} className="d-hl" />}
-            {stop && (
-              <g>
-                <rect x={cx - 96} y={214} width={192} height={46} rx={10} className="d-stop" />
-                <text x={cx} y={243} textAnchor="middle" className="d-text d-bold d-large d-on-stop">{t.stopHere}</text>
-              </g>
-            )}
           </>
         );
       }}

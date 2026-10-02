@@ -4,7 +4,7 @@
 import { useEffect, useRef, useState } from "react";
 import type { Device } from "../api";
 import { Callout, Screen, Tick, Waiting } from "../components/ui";
-import { DeviceManagement, ProxyForm, TrashFile } from "../device/scenes";
+import { AuthyAccounts, DeviceManagement, ProxyForm, TrashFile } from "../device/scenes";
 import { en } from "../strings/en";
 import { canFinish, cleanupItems, type CleanupId } from "../wizard/machine";
 import { deviceLabel, type ScreenProps } from "./types";
@@ -15,6 +15,7 @@ function ItemArt({ id, device }: { id: CleanupId; device: Device }) {
   switch (id) {
     case "proxyOff": return <ProxyForm device={device} ip="" port={0} mode="off" />;
     case "profileRemoved": return <DeviceManagement device={device} />;
+    case "authySignedIn": return <AuthyAccounts device={device} />;
     case "fileDeleted": return <TrashFile />;
   }
 }
@@ -63,6 +64,7 @@ export function Cleanup({ api, state, dispatch }: ScreenProps) {
         </>
       }
     >
+      {!state.cleanupTicks.proxyOff && <Callout tone="warn" title={t.noInternet(d)} />}
       <div aria-live="polite">
         {core === "working" && <Waiting>{t.working}</Waiting>}
         {core === "clean" && <Callout tone="ok"><p>{t.clean}</p></Callout>}
@@ -106,6 +108,7 @@ export function Cleanup({ api, state, dispatch }: ScreenProps) {
               />
             ))}
           </div>
+          <p className="quiet-text">{t.vpnBack}</p>
           <p className="quiet-text">{t.keepAuthy}</p>
         </div>
         <div className="split-art">

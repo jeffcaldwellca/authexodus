@@ -18,7 +18,6 @@ export const en = {
     havingTrouble: "Having trouble?",
     close: "Close",
     tryAgain: "Try again",
-    back: "Back",
     done: "Done",
     previous: "Previous",
     next: "Next",
@@ -27,6 +26,11 @@ export const en = {
     hidePicture: "Hide picture",
     showPictureFor: (label: string) => `Show picture for: ${label}`,
     stopAndCleanUp: "Stop and clean up",
+    keepGoing: "Keep going",
+    restart: "Restart the connection",
+    restarting: "Restarting…",
+    restartFailed: "The connection could not be restarted. Try again.",
+    authyFinish: "Finish signing in to Authy: enter your backup password there so it keeps working as your fallback.",
     loadFailed: "The app could not start.",
   },
 
@@ -42,9 +46,9 @@ export const en = {
       verify: "Check codes",
       cleanup: "Clean up",
     },
-    current: "current step",
     finished: "finished",
     version: (v: string) => `Version ${v}`,
+    releases: "New versions are published at",
   },
 
   welcome: {
@@ -99,6 +103,8 @@ export const en = {
     addressLabel: "This computer's address",
     addressHint: (d: string) => `If your ${d} can't connect, try the other address.`,
     addressOption: (ip: string, label: string) => `${ip} (${label})`,
+    addressRejected: (ip: string) => `The address can't change to ${ip} without starting the connection over.`,
+    restartOn: (ip: string) => `Restart on ${ip}`,
     steps: {
       wifi: { iphone: "Open Settings and tap Wi-Fi.", ipad: "Open Settings and tap Wi-Fi in the sidebar." },
       info: "Tap the blue ⓘ beside the network you are connected to.",
@@ -112,7 +118,7 @@ export const en = {
 
   certificate: {
     title: "Install the certificate",
-    lede: "The certificate lets this computer read Authy's traffic while you do this. You will remove it at the end.",
+    lede: "This certificate is only used for Authy's servers, and you remove it at the end.",
     connected: (d: string) => `Your ${d} is connected.`,
     qrAlt: "QR code that opens the certificate download page",
     orType: "Or type this address into Safari:",
@@ -150,6 +156,7 @@ export const en = {
     submit: "Unlock",
     working: "Unlocking…",
     alsoAuthy: (d: string) => `When this works, type the same password into Authy on your ${d} too. Authy then keeps working as a fallback.`,
+    forgotten: "Can't find the password?",
     failed: "The codes could not be unlocked. Try again.",
   },
 
@@ -157,6 +164,9 @@ export const en = {
     title: "Where should your codes go?",
     lede: (n: number) => `${plural(n, "account is", "accounts are")} ready to move. Pick one way. You can come back and use another.`,
     none: "No accounts could be unlocked for moving.",
+    authyTitle: "First, finish signing in to Authy",
+    authyBody: (d: string) => `On your ${d}, enter your backup password in Authy so it keeps working as your fallback.`,
+    continueBlocked: "Move your codes with one of the choices first.",
     options: {
       qr: { title: "Scan into any app", body: "One QR code per account. Works with every authenticator app." },
       bitwarden: { title: "Bitwarden, matched to your logins", body: "Adds each code to the login it belongs to. You review every match first." },
@@ -178,12 +188,15 @@ export const en = {
       alt: (name: string) => `QR code for ${name}`,
       loading: "Drawing the code…",
       warning: "Anyone who photographs these codes can copy your accounts. Keep the screen to yourself.",
+      failed: "The code could not be drawn. Go back to the choices and try again.",
     },
     google: {
       title: "Scan into Google Authenticator",
       lede: "In Google Authenticator, open the menu, then Transfer accounts → Import accounts, and scan each code.",
       position: (n: number, total: number) => `Code ${n} of ${total}`,
       alt: (n: number) => `Google Authenticator transfer code ${n}`,
+      unsupportedTitle: (n: number) => `${plural(n, "account is", "accounts are")} not in these codes`,
+      unsupportedBody: "Google's transfer codes can't carry every kind of account. Add what is listed here with “Scan into any app” instead.",
     },
     file: {
       title: "Save a file for another app",
@@ -220,6 +233,7 @@ export const en = {
     regions: { us: "bitwarden.com", eu: "bitwarden.eu", selfHosted: "My own server" },
     serverUrl: "Server address",
     serverUrlHint: "For example https://vault.example.com",
+    serverUrlInvalid: "Enter the full address, starting with https://",
     twoFactor: "Two-step login code",
     needsTwoFactor: "Bitwarden needs your two-step login code. Enter it and sign in again.",
     badCredentials: "Bitwarden did not accept that email and master password. Check both and try again.",
@@ -233,15 +247,17 @@ export const en = {
     colAccount: "Authy account",
     colAction: "What to do in Bitwarden",
     question: "Which login is this?",
+    questionHasCode: "The matching login already has a code. What should happen?",
     choose: "Choose…",
     attach: (name: string, username: string | null) => (username ? `Add to ${name} (${username})` : `Add to ${name}`),
     attachHasCode: (name: string, username: string | null) =>
-      `Already has a code, leave as it is: ${username ? `${name} (${username})` : name}`,
+      `${username ? `${name} (${username})` : name}: already has a code`,
     createNew: "Create a new login in the “Authy import” folder",
     skip: "Skip this account",
     actionFor: (title: string) => `What to do with ${title}`,
     needChoice: (n: number) => `${plural(n, "account needs", "accounts need")} your choice first.`,
     apply: "Apply to Bitwarden",
+    applyingTitle: "Updating Bitwarden",
     applying: "Adding codes to Bitwarden…",
     progressLabel: "Progress",
 
@@ -269,6 +285,8 @@ export const en = {
 
   cleanup: {
     title: "Put everything back",
+    noInternet: (d: string) => `Your ${d} has no internet until you switch its proxy off. Do that first.`,
+    vpnBack: "If you switched off a VPN or iCloud Private Relay earlier, switch it back on now.",
     resumed: "The app was closed before clean-up finished last time. Finish these steps now.",
     working: "Stopping the connection and destroying the certificate key…",
     clean: "This computer is clean: the connection is stopped and the certificate key is destroyed.",
@@ -284,6 +302,10 @@ export const en = {
         label: "I removed the certificate profile",
         how: `Settings → General → VPN & Device Management → ${CERT_NAME} → Remove Profile.`,
       },
+      authySignedIn: {
+        label: "Authy is signed in and shows my codes",
+        how: "Finish signing in to Authy: enter your backup password there so it keeps working as your fallback. If you never deleted Authy, check that it still opens.",
+      },
       fileDeleted: {
         label: "I deleted the file I saved",
         how: "Import it into your new app first. Then delete it on this computer and empty the Trash.",
@@ -298,6 +320,7 @@ export const en = {
     title: "All done",
     body: (d: string) => `Your ${d} and this computer are back to normal.`,
     keepAuthy: "Keep Authy installed for a week or two as a fallback.",
+    again: "To move your codes to another app later, run authexodus again from the start.",
     close: "You can close this window.",
   },
 
@@ -315,6 +338,21 @@ export const en = {
   failures: {
     sheetTitle: "Having trouble?",
     sheetLede: "These are the usual causes. Open the one that sounds right.",
+    restart: {
+      title: "Start the connection over",
+      body: (d: string) => `Use this if your ${d} joined a different Wi-Fi, its address changed, or nothing above helps. Your ${d} keeps its certificate: it only needs to reconnect, and Authy needs to be opened again.`,
+      lost: "Anything captured so far is discarded.",
+    },
+    stop: {
+      title: "Stop and clean up?",
+      lost: "This throws away what was captured from Authy and destroys the certificate key. It cannot be undone.",
+      redo: "To try again later you start from the beginning: connect, install a new certificate, and reinstall Authy.",
+    },
+    deviceRefused: {
+      title: "A different device was turned away",
+      body: (d: string) => `This computer only listens to the first ${d} that connected. Another device, or your ${d} after its address changed, just tried to reach Authy and was refused.`,
+      next: (d: string) => `If it was your ${d}, restart the connection. It keeps its certificate: it only needs to reconnect, and Authy needs to be opened again.`,
+    },
     firewall: {
       title: "Your Mac may be blocking the connection",
       body: (d: string) => `When this app opened, your Mac may have asked whether authexodus can accept incoming network connections. If Deny was chosen, your ${d} can't reach this computer.`,
@@ -348,7 +386,7 @@ export const en = {
     },
     trust: {
       title: "The certificate isn't trusted yet",
-      body: (d: string) => `Installing the certificate is not enough. Your ${d} also needs trust switched on for it.`,
+      body: (d: string) => `That is expected until every step is done. Installing the certificate is not enough: your ${d} also needs trust switched on for it.`,
       steps: [
         "Open Settings → General → About.",
         "Scroll to the bottom and tap Certificate Trust Settings.",
@@ -384,7 +422,7 @@ export const en = {
     },
     methodBroken: {
       title: "This method no longer works with Authy",
-      body: "The certificate is trusted, but Authy still refuses the connection. That means Authy has changed, and this app can no longer read its codes. It is not something you did.",
+      body: "The certificate was trusted and working, but Authy now keeps refusing the connection. The likeliest reason is that Authy has changed and this app can no longer read its codes.",
       next: "Your codes are still safe in Authy. Clean up first, then move each account by hand.",
     },
   },
@@ -413,13 +451,10 @@ export const en = {
     },
     time: "9:41",
     settings: "Settings",
-    search: "Search",
-    appleAccount: "Apple Account, iCloud and more",
     yourName: "Your name",
     airplane: "Airplane Mode",
     wifi: "Wi-Fi",
     bluetooth: "Bluetooth",
-    cellular: "Cellular",
     general: "General",
     accessibility: "Accessibility",
     privacy: "Privacy & Security",
@@ -434,7 +469,6 @@ export const en = {
     autoJoin: "Auto-Join",
     ipAddress: "IP Address",
     ipAddressValue: "192.168.4.57",
-    configureDns: "Configure DNS",
     automatic: "Automatic",
     httpProxy: "HTTP proxy",
     configureProxy: "Configure Proxy",
@@ -477,20 +511,6 @@ export const en = {
     sampleCode: "••• •••",
     fileName: "authy-export",
     trash: "Trash",
-  },
-
-  dev: {
-    title: "Pretend phone",
-    note: (password: string) => `Not the real app. Backup password: ${password}`,
-    deviceConnected: "Device connects",
-    trustWorking: "Trust works",
-    tlsRejected: "Certificate refused",
-    authyError: "Authy error",
-    backupCaptured: "Backup captured",
-    bwFail: "Next apply fails",
-    bwFailMessage: "503 Service Unavailable",
-    hide: "Hide",
-    show: "Pretend phone",
   },
 } as const;
 

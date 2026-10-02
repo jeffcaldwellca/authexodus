@@ -2,7 +2,7 @@ import { act, render, screen, within } from "@testing-library/react";
 import { vi } from "vitest";
 import { createFakeApi } from "../api.fake";
 import { en } from "../strings/en";
-import { walkTo } from "../test-utils";
+import { moveByQr, walkTo } from "../test-utils";
 import { initialState } from "../wizard/machine";
 import { Verify } from "./Verify";
 
@@ -52,7 +52,7 @@ describe("destination", () => {
     await user.click(await screen.findByRole("button", { name: en.verify.confirm }));
     await screen.findByRole("heading", { level: 1, name: en.cleanup.title });
     expect(screen.getByRole("checkbox", { name: new RegExp(en.cleanup.items.fileDeleted.label) })).toBeInTheDocument();
-    expect(screen.getAllByRole("checkbox")).toHaveLength(3);
+    expect(screen.getAllByRole("checkbox")).toHaveLength(4);
   });
 
   it("a cancelled save dialog adds nothing to cleanup", async () => {
@@ -61,10 +61,32 @@ describe("destination", () => {
     await user.click(screen.getByRole("button", { name: en.destination.file.save(en.destination.file.apps.twoFas) }));
     await screen.findByText(en.destination.file.cancelled);
     await user.click(screen.getByRole("button", { name: en.common.done }));
+    // Nothing was saved, so nothing has been moved yet either.
+    expect(screen.getByRole("button", { name: en.destination.continue })).toBeDisabled();
+    await moveByQr(user);
     await user.click(screen.getByRole("button", { name: en.destination.continue }));
     await user.click(await screen.findByRole("button", { name: en.verify.confirm }));
     await screen.findByRole("heading", { level: 1, name: en.cleanup.title });
-    expect(screen.getAllByRole("checkbox")).toHaveLength(2);
+    expect(screen.queryByRole("checkbox", { name: new RegExp(en.cleanup.items.fileDeleted.label) })).not.toBeInTheDocument();
+    expect(screen.getAllByRole("checkbox")).toHaveLength(3);
+  });
+
+  it("the Google screen lists the accounts its codes cannot carry, with what to do", async () => {
+    const { api, user } = await walkTo("destination", { googleUnsupported: ["Steam", "Old bank"] });
+    await user.click(screen.getByRole("button", { name: new RegExp(en.destination.options.google.title) }));
+    await screen.findByAltText(en.destination.google.alt(1));
+    expect(screen.getByText(en.destination.google.unsupportedTitle(2))).toBeInTheDocument();
+    expect(screen.getByText(en.destination.google.unsupportedBody)).toBeInTheDocument();
+    expect(screen.getByText("Steam")).toBeInTheDocument();
+    expect(screen.getByText("Old bank")).toBeInTheDocument();
+    expect(api.calls.filter((c) => c.method === "googleUnsupported")).toHaveLength(1);
+  });
+
+  it("the Google screen says nothing extra when every account fits", async () => {
+    const { user } = await walkTo("destination");
+    await user.click(screen.getByRole("button", { name: new RegExp(en.destination.options.google.title) }));
+    await screen.findByAltText(en.destination.google.alt(1));
+    expect(screen.queryByText(en.destination.google.unsupportedBody)).not.toBeInTheDocument();
   });
 });
 
@@ -80,7 +102,7 @@ describe("verify", () => {
     api.calls.length = 0;
     const state = { ...initialState(), step: "verify" as const, summary };
 
-    render(<Verify api={api} state={state} dispatch={() => undefined} proxy={null} />);
+    render(<Verify api={api} state={state} dispatch={() => undefined} proxy={null} onRestart={() => undefined} restart="idle" />);
     await act(async () => { await vi.advanceTimersByTimeAsync(0); });
     const first = (await api.liveCodes())[0]!;
     expect(screen.getByText(`${first.code.slice(0, 3)} ${first.code.slice(3)}`)).toBeInTheDocument();

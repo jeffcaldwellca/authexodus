@@ -1,5 +1,6 @@
 import type { Dispatch } from "react";
 import type { Api, Device, ProxyInfo } from "../api";
+import type { RestartState } from "../failures/ConnectionNotices";
 import { en } from "../strings/en";
 import type { WizardEvent, WizardState } from "../wizard/machine";
 
@@ -9,6 +10,9 @@ export type ScreenProps = {
   state: WizardState;
   dispatch: Dispatch<WizardEvent>;
   proxy: ProxyInfo | null;
+  /** Start the connection over (`restartProxy`), optionally on another address. */
+  onRestart: (ip?: string) => void;
+  restart: RestartState;
 };
 
 /** The device's name for sentences: the chosen one, or "iPhone or iPad" before the choice. */

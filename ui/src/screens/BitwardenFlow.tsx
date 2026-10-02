@@ -25,6 +25,22 @@ function decode(value: string): Decision | null {
   return null;
 }
 
+/** The login the proposal would attach to already holds a code, which is never replaced. */
+function proposedHasCode(p: Proposal): boolean {
+  const d = p.decision;
+  return d.kind === "attach" && p.candidates.some((c) => c.itemId === d.itemId && c.hasCode);
+}
+
+/** Rows the person must answer themselves: uncertain matches, and matches that cannot be applied. */
+function needsAnswer(p: Proposal): boolean {
+  return p.confidence === "low" || proposedHasCode(p);
+}
+
+/** A self-hosted server must be a full https address before it is sent anywhere. */
+export function validServerUrl(url: string): boolean {
+  return /^https:\/\/[^\s/]+\S*$/.test(url.trim());
+}
+
 export function BitwardenFlow({ api, tokens, onDone }: ScreenProps & { tokens: TokenView[]; onDone: (applied: boolean) => void }) {
   const [stage, setStage] = useState<Stage>("intro");
   const [prepareFailed, setPrepareFailed] = useState(false);
@@ -71,7 +87,7 @@ export function BitwardenFlow({ api, tokens, onDone }: ScreenProps & { tokens: T
     try {
       const found = await api.bwPropose();
       setProposals(found);
-      setChoices(Object.fromEntries(found.map((p) => [p.tokenId, p.confidence === "high" ? encode(p.decision) : ""])));
+      setChoices(Object.fromEntries(found.map((p) => [p.tokenId, needsAnswer(p) ? "" : encode(p.decision)])));
       setStage("review");
     } catch {
       setLoginProblem("failed");
@@ -84,7 +100,8 @@ export function BitwardenFlow({ api, tokens, onDone }: ScreenProps & { tokens: T
     if (busy) return;
     setBusy(true);
     setLoginProblem(null);
-    const region: BwRegion = regionKind === "selfHosted" ? { kind: "selfHosted", url: serverUrl } : { kind: regionKind };
+    if (regionKind === "selfHosted" && !validServerUrl(serverUrl)) { setBusy(false); return; }
+    const region: BwRegion = regionKind === "selfHosted" ? { kind: "selfHosted", url: serverUrl.trim() } : { kind: regionKind };
     try {
       const result = await api.bwLogin({ email, password, region, ...(needsCode && code !== "" ? { twoFactorCode: code } : {}) });
       if (result.kind === "needsTwoFactor") {
@@ -106,6 +123,7 @@ export function BitwardenFlow({ api, tokens, onDone }: ScreenProps & { tokens: T
   };
 
   const unanswered = proposals.filter((p) => !choices[p.tokenId]).length;
+  const urlProblem = regionKind === "selfHosted" && !validServerUrl(serverUrl);
 
   const apply = async () => {
     const decisions = proposals.flatMap((p) => {
@@ -130,6 +148,7 @@ export function BitwardenFlow({ api, tokens, onDone }: ScreenProps & { tokens: T
   if (stage === "intro" || stage === "preparing") {
     return (
       <Screen
+        focusKey={stage}
         title={t.introTitle}
         lede={t.introBody}
         footer={
@@ -149,12 +168,13 @@ export function BitwardenFlow({ api, tokens, onDone }: ScreenProps & { tokens: T
   if (stage === "login" || stage === "matching") {
     return (
       <Screen
+        focusKey={stage}
         title={t.loginTitle}
         lede={t.loginLede}
         footer={
           <>
             {back}
-            <button type="submit" form="bw-login" className="primary" disabled={busy || stage === "matching" || email === "" || password === ""}>
+            <button type="submit" form="bw-login" className="primary" disabled={busy || stage === "matching" || email === "" || password === "" || urlProblem}>
               {busy ? t.signingIn : t.signIn}
             </button>
           </>
@@ -179,8 +199,10 @@ export function BitwardenFlow({ api, tokens, onDone }: ScreenProps & { tokens: T
           {regionKind === "selfHosted" && (
             <>
               <label htmlFor="bw-url">{t.serverUrl}</label>
-              <input id="bw-url" type="url" value={serverUrl} onChange={(e) => setServerUrl(e.target.value)} aria-describedby="bw-url-hint" spellCheck={false} />
-              <p id="bw-url-hint" className="quiet-text">{t.serverUrlHint}</p>
+              <input id="bw-url" type="url" value={serverUrl} onChange={(e) => setServerUrl(e.target.value)} aria-describedby="bw-url-hint" aria-invalid={serverUrl !== "" && urlProblem} spellCheck={false} />
+              <p id="bw-url-hint" className={serverUrl !== "" && urlProblem ? "error-text" : "quiet-text"}>
+                {serverUrl !== "" && urlProblem ? t.serverUrlInvalid : t.serverUrlHint}
+              </p>
             </>
           )}
           {needsCode && (
@@ -199,9 +221,10 @@ export function BitwardenFlow({ api, tokens, onDone }: ScreenProps & { tokens: T
   }
 
   if (stage === "review") {
-    const ordered = [...proposals].sort((a, b) => Number(a.confidence === "high") - Number(b.confidence === "high"));
+    const ordered = [...proposals].sort((a, b) => Number(!needsAnswer(a)) - Number(!needsAnswer(b)));
     return (
       <Screen
+        focusKey={stage}
         title={t.reviewTitle}
         lede={t.reviewLede}
         footer={
@@ -219,7 +242,7 @@ export function BitwardenFlow({ api, tokens, onDone }: ScreenProps & { tokens: T
               const token = titleOf(p.tokenId);
               const title = token?.title ?? p.tokenId;
               const value = choices[p.tokenId] ?? "";
-              const asking = p.confidence === "low";
+              const asking = needsAnswer(p);
               return (
                 <tr key={p.tokenId} className={asking && value === "" ? "asking" : ""}>
                   <th scope="row">
@@ -227,11 +250,11 @@ export function BitwardenFlow({ api, tokens, onDone }: ScreenProps & { tokens: T
                     {token?.username && <span className="quiet-text">{token.username}</span>}
                   </th>
                   <td>
-                    {asking && <span className="question">{t.question}</span>}
+                    {asking && <span className="question">{p.confidence === "low" ? t.question : t.questionHasCode}</span>}
                     <select aria-label={t.actionFor(title)} value={value} onChange={(e) => setChoices((prev) => ({ ...prev, [p.tokenId]: e.target.value }))}>
                       {value === "" && <option value="" disabled>{t.choose}</option>}
                       {p.candidates.map((c) => (
-                        <option key={c.itemId} value={`attach:${c.itemId}`}>
+                        <option key={c.itemId} value={`attach:${c.itemId}`} disabled={c.hasCode}>
                           {c.hasCode ? t.attachHasCode(c.name, c.username) : t.attach(c.name, c.username)}
                         </option>
                       ))}
@@ -250,7 +273,7 @@ export function BitwardenFlow({ api, tokens, onDone }: ScreenProps & { tokens: T
 
   if (stage === "applying") {
     return (
-      <Screen title={t.reviewTitle} footer={<><span /><Waiting>{t.applying}</Waiting></>}>
+      <Screen focusKey={stage} title={t.applyingTitle} footer={<><span /><Waiting>{t.applying}</Waiting></>}>
         <ProgressLog lines={progress} />
       </Screen>
     );
@@ -259,6 +282,7 @@ export function BitwardenFlow({ api, tokens, onDone }: ScreenProps & { tokens: T
   const failed = applyError ?? report?.failed ?? null;
   return (
     <Screen
+      focusKey={stage}
       title={failed ? t.reportPartialTitle : t.reportTitle}
       footer={
         <>

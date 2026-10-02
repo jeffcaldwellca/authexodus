@@ -1,59 +1,54 @@
 // The "Having trouble?" control on each waiting step. It opens a sheet holding the help
-// panels that fit that step.
-import { useEffect, useId, useRef, useState, type ReactNode } from "react";
+// panels that fit that step, a way to start the connection over, and a way to stop.
+import { useEffect, useRef, useState, type ReactNode } from "react";
+import { Dialog } from "../components/Dialog";
 import { en } from "../strings/en";
+import { StopConfirm } from "./StopConfirm";
 
-export function Trouble({ children, onAbandon }: { children: ReactNode; onAbandon?: () => void }) {
-  const [open, setOpen] = useState(false);
+const t = en.failures;
+
+export function Trouble({ children, d, mentionAuthy, onAbandon, onRestart }: {
+  children: ReactNode;
+  d: string;
+  /** See `StopConfirm`. */
+  mentionAuthy: boolean;
+  onAbandon: () => void;
+  onRestart: () => void;
+}) {
+  const [mode, setMode] = useState<"closed" | "sheet" | "confirm">("closed");
   const opener = useRef<HTMLButtonElement>(null);
-  const sheet = useRef<HTMLDivElement>(null);
-  const titleId = useId();
+  const wasOpen = useRef(false);
 
+  // The confirm box replaces the sheet, so the sheet's own focus-return has nowhere to go.
   useEffect(() => {
-    if (!open) return;
-    sheet.current?.focus();
-    const onKey = (e: KeyboardEvent) => {
-      if (e.key === "Escape") { setOpen(false); return; }
-      if (e.key !== "Tab" || !sheet.current) return;
-      // Keep Tab inside the sheet while it is open.
-      const items = sheet.current.querySelectorAll<HTMLElement>("button, summary, a[href], input, select");
-      const first = items[0];
-      const last = items[items.length - 1];
-      if (!first || !last) return;
-      if (e.shiftKey && (document.activeElement === first || document.activeElement === sheet.current)) {
-        e.preventDefault(); last.focus();
-      } else if (!e.shiftKey && document.activeElement === last) {
-        e.preventDefault(); first.focus();
-      }
-    };
-    document.addEventListener("keydown", onKey);
-    const openerEl = opener.current;
-    return () => { document.removeEventListener("keydown", onKey); openerEl?.focus(); };
-  }, [open]);
+    if (mode === "closed" && wasOpen.current) opener.current?.focus();
+    wasOpen.current = mode !== "closed";
+  }, [mode]);
 
   return (
     <>
-      <button ref={opener} type="button" className="quiet" aria-haspopup="dialog" onClick={() => setOpen(true)}>
+      <button ref={opener} type="button" className="quiet" aria-haspopup="dialog" onClick={() => setMode("sheet")}>
         {en.common.havingTrouble}
       </button>
-      {open && (
-        <div className="sheet-backdrop" onClick={(e) => { if (e.target === e.currentTarget) setOpen(false); }}>
-          <div ref={sheet} className="sheet" role="dialog" aria-modal="true" aria-labelledby={titleId} tabIndex={-1}>
-            <div className="sheet-head">
-              <h2 id={titleId}>{en.failures.sheetTitle}</h2>
-              <button type="button" className="quiet" onClick={() => setOpen(false)}>{en.common.close}</button>
-            </div>
-            <p className="quiet-text">{en.failures.sheetLede}</p>
-            {children}
-            {onAbandon && (
-              <p className="sheet-foot">
-                <button type="button" className="quiet danger" onClick={() => { setOpen(false); onAbandon(); }}>
-                  {en.common.stopAndCleanUp}
-                </button>
-              </p>
-            )}
-          </div>
-        </div>
+      {mode === "sheet" && (
+        <Dialog title={t.sheetTitle} variant="sheet" onClose={() => setMode("closed")}>
+          <p className="quiet-text">{t.sheetLede}</p>
+          {children}
+          <section className="sheet-foot">
+            <h3>{t.restart.title}</h3>
+            <p>{t.restart.body(d)}</p>
+            <p className="quiet-text">{t.restart.lost}</p>
+            <button type="button" className="secondary" onClick={() => { setMode("closed"); onRestart(); }}>
+              {en.common.restart}
+            </button>
+          </section>
+          <p className="sheet-foot">
+            <button type="button" className="quiet danger" onClick={() => setMode("confirm")}>{en.common.stopAndCleanUp}</button>
+          </p>
+        </Dialog>
+      )}
+      {mode === "confirm" && (
+        <StopConfirm mentionAuthy={mentionAuthy} onCancel={() => setMode("closed")} onConfirm={() => { setMode("closed"); onAbandon(); }} />
       )}
     </>
   );
