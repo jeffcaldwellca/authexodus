@@ -18,7 +18,7 @@ use rustls::crypto::aws_lc_rs;
 use rustls::pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer};
 use rustls::ServerConfig;
 use time::{Duration, OffsetDateTime};
-use zeroize::{Zeroize, Zeroizing};
+use zeroize::Zeroizing;
 
 /// What the person sees in Settings on the iPhone or iPad, so it says what to do with it.
 pub const COMMON_NAME: &str = "authexodus (remove after use)";
@@ -279,16 +279,6 @@ fn decode_blob(blob: &[u8]) -> Option<StoredRoot<'_>> {
         cert_der,
         key_der,
     })
-}
-
-impl Drop for MemoryKeyStore {
-    fn drop(&mut self) {
-        if let Ok(slot) = self.0.get_mut() {
-            if let Some(blob) = slot.as_mut() {
-                blob.zeroize();
-            }
-        }
-    }
 }
 
 #[cfg(test)]
