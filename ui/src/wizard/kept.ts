@@ -34,3 +34,12 @@ export function writeKept(kept: Kept): void {
     // Nothing to do: a reload then starts on the welcome screen, as it would have anyway.
   }
 }
+
+/** Forget everything kept: a finished run must not tick the checks for the next one. */
+export function clearKept(): void {
+  try {
+    sessionStorage.removeItem(KEY);
+  } catch {
+    // Storage that is off holds nothing to forget.
+  }
+}

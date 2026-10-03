@@ -18,7 +18,7 @@ import { Unlock } from "./screens/Unlock";
 import { Verify } from "./screens/Verify";
 import { Welcome } from "./screens/Welcome";
 import { en } from "./strings/en";
-import { readKept, writeKept } from "./wizard/kept";
+import { clearKept, readKept, writeKept } from "./wizard/kept";
 import { initialState, reduce } from "./wizard/machine";
 
 const RAIL: readonly Exclude<Step, "done">[] = [
@@ -96,6 +96,8 @@ export function App({ api, devTools }: { api: Api; devTools?: ReactNode }) {
   // loaded, or the blank starting state would overwrite what an earlier page kept.
   useEffect(() => {
     if (loaded !== "ready") return;
+    // Once the run is finished nothing is kept: a reload must not tick the checks for a new run.
+    if (state.step === "done") { clearKept(); return; }
     writeKept({ device: state.device, checks: state.checks, started: !NOT_A_RUN.includes(state.step) });
   }, [loaded, state.device, state.checks, state.step]);
 

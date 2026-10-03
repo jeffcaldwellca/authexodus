@@ -355,6 +355,10 @@ describe("wizard machine", () => {
       const s = reduce(initialState(), { type: "loaded", app: app({ device: null }), kept: { device: "iphone", checks } });
       expect(s).toMatchObject({ step: "welcome", device: "iphone", checks });
       expect(canStart(s)).toBe(true);
+      // A finished run keeps nothing that would tick the checks for the next one.
+      const done = reduce(initialState(), { type: "loaded", app: app({ step: "done", device: null }), kept: { device: "iphone", checks } });
+      expect(done.checks).toEqual(initialState().checks);
+      expect(canStart(done)).toBe(false);
       // What the shell says about the device wins over what the window kept.
       const shell = reduce(initialState(), { type: "loaded", app: app({ device: "ipad" }), kept: { device: "iphone", checks } });
       expect(shell.device).toBe("ipad");

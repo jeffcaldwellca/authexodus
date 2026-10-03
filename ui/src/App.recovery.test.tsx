@@ -150,6 +150,20 @@ describe("reload recovery", () => {
     await screen.findByText(en.connect.waiting(ipad));
   });
 
+  it("a reload after the run is finished does not tick the safety checks for a new run", async () => {
+    const { api, user } = await walkTo("cleanup");
+    await screen.findByText(en.cleanup.clean(en.deviceName.iphone));
+    for (const box of screen.getAllByRole("checkbox")) await user.click(box);
+    await user.click(screen.getByRole("button", { name: en.cleanup.finish }));
+    await screen.findByRole("heading", { level: 1, name: en.done.title });
+    expect(sessionStorage.length).toBe(0);
+
+    await reload(api);
+    await screen.findByRole("heading", { level: 1, name: en.welcome.title });
+    for (const box of screen.getAllByRole("checkbox")) expect(box).not.toBeChecked();
+    expect(screen.getByRole("button", { name: en.welcome.start })).toBeDisabled();
+  });
+
   it("the fake reports a fresh run as the shell does: a first start does not mark it for resume", async () => {
     const { api } = await walkTo("connect");
     expect((await api.getState()).resumeCleanup).toBe(false);

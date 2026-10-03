@@ -260,7 +260,8 @@ function onLoaded(s: WizardState, app: AppState, kept: Pick<Kept, "device" | "ch
   }
   if (snap?.summary) return atDestination(snap.summary);
   if (app.resumeCleanup) return { ...base, step: "cleanup", resumed: true, unsure: true };
-  return kept ? { ...base, checks: { ...kept.checks } } : base;
+  // After a finished run the checks are asked afresh, whatever this window kept.
+  return kept && app.step !== "done" ? { ...base, checks: { ...kept.checks } } : base;
 }
 
 export function reduce(s: WizardState, ev: WizardEvent): WizardState {
