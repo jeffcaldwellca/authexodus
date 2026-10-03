@@ -1528,6 +1528,8 @@ impl Session {
             // Dropping the run stops the proxy, its tasks and the keep-awake helper.
             slot.take();
         }
+        // The certificate authority, and with it the key, is not needed after this.
+        lock(&self.authority).take();
         if let Ok(mut slot) = self.bw.try_lock() {
             slot.take();
         }

@@ -513,6 +513,38 @@ async fn closing_the_app_mid_flow_stops_the_proxy_and_keeps_the_key_for_cleanup(
     assert_eq!(store.load().unwrap(), None);
 }
 
+/// A handle on the certificate authority the session holds, that does not keep it alive: once
+/// nothing else holds it either, it has been dropped (and its key wiped).
+fn held_authority(s: &Session) -> std::sync::Weak<Authority> {
+    Arc::downgrade(
+        lock(&s.authority)
+            .as_ref()
+            .expect("a certificate authority"),
+    )
+}
+
+#[tokio::test]
+async fn closing_the_app_drops_the_certificate_key_from_memory() {
+    let dir = tempfile::tempdir().unwrap();
+    let s = session(dir.path(), Arc::new(MemoryKeyStore::new()));
+    s.tune_proxy(0, None);
+    s.start_proxy(Some("127.0.0.1"), &loopback(), no_emit())
+        .await
+        .unwrap();
+    let authority = held_authority(&s);
+
+    s.on_exit();
+
+    assert!(
+        authority.upgrade().is_none(),
+        "nothing holds the certificate authority once the app is closing"
+    );
+    assert!(
+        dir.path().join("session.json").exists(),
+        "the marker stays, so the next launch opens on cleanup"
+    );
+}
+
 // ---------------------------------------------------------------------------------------------
 // Starting, moving and restarting the proxy (C1, C2, S10)
 
