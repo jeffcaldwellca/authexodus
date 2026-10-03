@@ -7,6 +7,7 @@ import { useEffect, useState, type ReactNode } from "react";
 import type { TokenView } from "../api";
 import { ApiError, asApiError } from "../api.errors";
 import { Callout, QrImage, Screen, Waiting } from "../components/ui";
+import { ManualGuide } from "../failures/ManualGuide";
 import { Problem } from "../failures/Problem";
 import { en } from "../strings/en";
 import { deviceLabel, type ScreenProps } from "./types";
@@ -121,7 +122,7 @@ export function QrWalk({ api, state, tokens, onDone, onLocked }: WalkProps & { t
   );
 }
 
-export function GoogleWalk({ api, state, onDone, onLocked }: WalkProps) {
+export function GoogleWalk({ api, state, tokens, onDone, onLocked }: WalkProps & { tokens: TokenView[] }) {
   const [index, setIndex] = useState(0);
   const [codes, setCodes] = useState<string[] | null>(null);
   const [unsupported, setUnsupported] = useState<string[]>([]);
@@ -134,15 +135,20 @@ export function GoogleWalk({ api, state, onDone, onLocked }: WalkProps) {
     let live = true;
     setCodes(null);
     setFailure(null);
-    Promise.all([api.googleMigrationQrs(), api.googleUnsupported()])
-      .then(([qrs, titles]) => {
+    // What the codes cannot carry is asked first: when that is every account, the shell would
+    // only refuse to draw, and asking again could never succeed. That is an answer, not a failure.
+    api.googleUnsupported()
+      .then(async (titles) => {
         if (!live) return;
         setUnsupported(titles);
+        if (titles.length >= tokens.length) { setCodes([]); return; }
+        const qrs = await api.googleMigrationQrs();
+        if (!live) return;
         if (qrs.some((s) => s.trim() === "")) setFailure(blank()); else setCodes(qrs);
       })
       .catch((err: unknown) => { if (live) setFailure(asApiError(err)); });
     return () => { live = false; setCodes(null); };
-  }, [api, attempt]);
+  }, [api, attempt, tokens.length]);
 
   const svg = codes?.[index];
   const total = codes?.length ?? 1;
@@ -164,6 +170,7 @@ export function GoogleWalk({ api, state, onDone, onLocked }: WalkProps) {
           {codes && codes.length > 0 && <p className="account-title" aria-live="polite">{t.google.position(index + 1, codes.length)}</p>}
           {svg && <ScannedTick checked={scanned.has(index)} onChange={(v) => setScanned(index, v)} count={scanned.size} total={total} />}
           <Callout tone="warn"><p>{t.qr.warning}</p></Callout>
+          {nothing && <ManualGuide />}
           {unsupported.length > 0 && (
             <Callout tone="info" title={t.google.unsupportedTitle(unsupported.length)}>
               <p>{t.google.unsupportedBody}</p>

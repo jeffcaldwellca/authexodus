@@ -39,7 +39,7 @@ export function Destination(props: ScreenProps) {
   const locked = () => dispatch({ type: "locked" });
 
   if (view === "qr") return <QrWalk {...props} tokens={summary.tokens} onDone={(walked) => leave("qr", walked)} onLocked={locked} />;
-  if (view === "google") return <GoogleWalk {...props} onDone={(walked) => leave("google", walked)} onLocked={locked} />;
+  if (view === "google") return <GoogleWalk {...props} tokens={summary.tokens} onDone={(walked) => leave("google", walked)} onLocked={locked} />;
   if (view === "file") return <FileExport {...props} onDone={(saved) => leave("file", saved)} onLocked={locked} />;
   if (view === "bitwarden") return <BitwardenFlow {...props} tokens={summary.tokens} onDone={(applied) => leave("bitwarden", applied)} onLocked={locked} />;
 

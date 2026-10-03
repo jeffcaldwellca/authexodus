@@ -136,6 +136,24 @@ describe("Google Authenticator transfer codes", () => {
     expect(alert.textContent).not.toContain("list unavailable");
   });
 
+  it("when none of the accounts can go, the list and the way by hand are shown, and no Try again that cannot work", async () => {
+    // What the shell does when every account is one Google's codes cannot carry.
+    const sentence = "None of these accounts can go into a Google Authenticator transfer code. Scan them one by one instead.";
+    const { user } = await open("google", {
+      summary: two, googleUnsupported: ["GitHub", "Dropbox"],
+      failures: { googleMigrationQrs: [new ApiError("export_failed", sentence)] },
+    });
+    expect(await screen.findByText(t.google.none)).toBeInTheDocument();
+    const list = screen.getByText(t.google.unsupportedTitle(2)).closest("section, div, aside")!;
+    expect(within(list as HTMLElement).getByText("GitHub")).toBeInTheDocument();
+    expect(within(list as HTMLElement).getByText("Dropbox")).toBeInTheDocument();
+    expect(screen.getByRole("heading", { name: en.manual.title })).toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: en.common.tryAgain })).not.toBeInTheDocument();
+    expect(screen.queryByText(t.qr.loading)).not.toBeInTheDocument();
+    await user.click(screen.getByRole("button", { name: en.common.done }));
+    await screen.findByRole("heading", { level: 1, name: t.title });
+  });
+
   it("no codes at all is an answer, not a wait: nothing fits, use the other way", async () => {
     const { user } = await open("google", { googlePages: [], googleUnsupported: ["Steam"] });
     expect(await screen.findByText(t.google.none)).toBeInTheDocument();
