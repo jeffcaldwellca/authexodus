@@ -1,10 +1,18 @@
 # authexodus
 
+**Export your two-factor (2FA) codes out of Authy** and into Bitwarden, 1Password, 2FAS, Aegis, Google Authenticator, Proton Authenticator or any other TOTP authenticator app. A guided Mac app for people who have never used a terminal.
+
 authexodus moves your two-step login codes out of Authy and into another authenticator app. Authy has no export button. This desktop app, which runs on a Mac, walks you through getting your codes out using an iPhone or iPad, and puts them where you want them: any authenticator through QR codes or an import file, or Bitwarden with each code attached to the login it belongs to.
 
 It is for people who have never heard of a proxy. Using the app never needs a terminal.
 
 Status: **pre-release (v0.1, not yet tagged)**. It has not yet been checked on a real iPhone, iPad and Authy account. See [Status](#status).
+
+## Why this exists
+
+Authy keeps your codes in its own app and offers no way to export them. The old workaround, reading them out of Authy's desktop app, ended when Twilio shut that app down in August 2024. What still works is the method this app automates: Authy on an iPhone or iPad downloads your encrypted backup when you sign in, and you can capture that download on your own network and decrypt it with your own backup password. Doing that by hand means running a proxy, trusting a certificate and running a script. authexodus does the same with a step-by-step window instead.
+
+**Contents:** [Requirements](#requirements) · [Five checks](#before-you-start-five-checks) · [How it works](#how-it-works) · [What it never does](#what-it-never-does) · [Bitwarden](#bitwarden-signing-in-and-choosing-where-each-code-goes) · [What cannot be moved](#what-cannot-be-moved) · [Tested destinations](#which-destinations-have-been-tested) · [Status](#status) · [Building](#building-from-source) · [Contributing](#contributing-and-security) · [Acknowledgements](#acknowledgements) · [Licence](#licence)
 
 ## Requirements
 
@@ -145,7 +153,7 @@ The core logic (decryption, export formats, proxy, Bitwarden matching) lives in 
 
 ## Verifying a download
 
-There is no release yet, and the address below does not exist until the repository is published. Releases will be published at `https://github.com/jeffcaldwellca/authexodus/releases`. Each will have a `.dmg` and a `SHA256SUMS.txt`. The app shows the same address beside its version number.
+There is no release yet. Releases will be published at <https://github.com/jeffcaldwellca/authexodus/releases>. Each will have a `.dmg` and a `SHA256SUMS.txt`. The app shows the same address beside its version number.
 
 1. Check the checksum. In Terminal, in the folder with both files: `shasum -a 256 -c SHA256SUMS.txt`. It must say `OK`.
 2. Check that Apple has notarized the app. Drag the app out of the `.dmg` to Applications, then run:
@@ -175,6 +183,12 @@ The workflow stops with a clear message if any of these repository secrets (Sett
 | `APPLE_TEAM_ID` | the 10-character team ID |
 
 Before the first tag, run the real-device checklist.
+
+## Contributing and security
+
+Bug reports and results from the [real-device checklist](docs/manual-device-checklist.md) are the most useful contributions right now: open an issue with your device, iOS version and Authy version, and never include codes, backup passwords, screenshots of codes or your Authy phone number. See [CONTRIBUTING.md](CONTRIBUTING.md).
+
+To report a security problem, use GitHub's private vulnerability reporting rather than a public issue. See [SECURITY.md](SECURITY.md).
 
 ## Acknowledgements
 
