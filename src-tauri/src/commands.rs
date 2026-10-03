@@ -16,8 +16,8 @@
 //!   sentences are fixed text, so none can hold a password, a secret, a path or a name. No
 //!   command logs its arguments; `unlock` and `bwLogin` carry passwords, which are held in
 //!   `Zeroizing` so they are wiped from memory when the command is done.
-//! * Every command that can be refused runs its work through [`settled`] (or [`settled_now`]):
-//!   a panic inside it is answered as `internal`, so the UI's promise always settles.
+//! * Every command runs its work through [`settled`] (or [`settled_now`]): a panic inside it
+//!   is answered as `internal`, so the UI's promise always settles.
 //!
 //! The command list is written once, in `commands!`, which also builds the Tauri handler, so
 //! `commands_match_api_contract` compares the real registered list against `api.ts`. It also
@@ -85,14 +85,19 @@ pub fn settled_now<T>(work: impl FnOnce() -> Result<T, CmdError>) -> Result<T, C
     std::panic::catch_unwind(AssertUnwindSafe(work)).unwrap_or_else(|_| panicked())
 }
 
+/// Never refused in normal use; a panic inside it is answered as `internal`.
 #[tauri::command]
-pub fn get_state(session: State<'_, Session>) -> AppState {
-    session.get_state(&network::system())
+pub fn get_state(session: State<'_, Session>) -> Result<AppState, CmdError> {
+    settled_now(|| Ok(session.get_state(&network::system())))
 }
 
+/// Never refused in normal use; a panic inside it is answered as `internal`.
 #[tauri::command]
-pub fn set_device(session: State<'_, Session>, device: Device) {
-    session.set_device(device);
+pub fn set_device(session: State<'_, Session>, device: Device) -> Result<(), CmdError> {
+    settled_now(|| {
+        session.set_device(device);
+        Ok(())
+    })
 }
 
 fn proxy_emitter(app: AppHandle) -> EmitProxy {
@@ -694,6 +699,33 @@ mod tests {
         assert_eq!(
             serde_json::to_string(&ProxyEventDto::AddressChanged).unwrap(),
             r#"{"kind":"addressChanged"}"#
+        );
+    }
+
+    /// Every command's body runs inside the panic guard, so none can leave a promise unsettled.
+    #[test]
+    fn every_command_runs_inside_the_panic_guard() {
+        let src = include_str!("commands.rs");
+        let src = &src[..src.find("macro_rules! commands").unwrap()];
+        let bodies: Vec<(&str, &str)> = src
+            .split("#[tauri::command]\n")
+            .skip(1)
+            .map(|after| {
+                let name_at = after.find("fn ").unwrap() + 3;
+                let name = &after[name_at..name_at + after[name_at..].find('(').unwrap()];
+                let body = &after[after.find("{\n").unwrap()..after.find("\n}\n").unwrap()];
+                (name, body)
+            })
+            .collect();
+        assert_eq!(bodies.len(), COMMAND_NAMES.len());
+        let unguarded: Vec<&str> = bodies
+            .iter()
+            .filter(|(_, body)| !body.contains("settled(") && !body.contains("settled_now("))
+            .map(|(name, _)| *name)
+            .collect();
+        assert!(
+            unguarded.is_empty(),
+            "outside the panic guard: {unguarded:?}"
         );
     }
 
