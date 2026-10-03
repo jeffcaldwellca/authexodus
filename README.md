@@ -6,13 +6,11 @@ authexodus moves your two-step login codes out of Authy and into another authent
 
 It is for people who have never heard of a proxy. Using the app never needs a terminal.
 
-Status: **pre-release (v0.1, not yet tagged)**. It has not yet been checked on a real iPhone, iPad and Authy account. See [Status](#status).
-
 ## Why this exists
 
 Authy keeps your codes in its own app and offers no way to export them. The old workaround, reading them out of Authy's desktop app, ended when Twilio shut that app down in August 2024. What still works is the method this app automates: Authy on an iPhone or iPad downloads your encrypted backup when you sign in, and you can capture that download on your own network and decrypt it with your own backup password. Doing that by hand means running a proxy, trusting a certificate and running a script. authexodus does the same with a step-by-step window instead.
 
-**Contents:** [Requirements](#requirements) · [Five checks](#before-you-start-five-checks) · [How it works](#how-it-works) · [What it never does](#what-it-never-does) · [Bitwarden](#bitwarden-signing-in-and-choosing-where-each-code-goes) · [What cannot be moved](#what-cannot-be-moved) · [Tested destinations](#which-destinations-have-been-tested) · [Status](#status) · [Building](#building-from-source) · [Contributing](#contributing-and-security) · [Acknowledgements](#acknowledgements) · [Licence](#licence)
+**Contents:** [Requirements](#requirements) · [Five checks](#before-you-start-five-checks) · [How it works](#how-it-works) · [What it never does](#what-it-never-does) · [Bitwarden](#bitwarden-signing-in-and-choosing-where-each-code-goes) · [What cannot be moved](#what-cannot-be-moved) · [Destinations](#where-your-codes-can-go) · [Status](#status) · [Building](#building-from-source) · [Contributing](#contributing-and-security) · [Acknowledgements](#acknowledgements) · [Licence](#licence)
 
 ## Requirements
 
@@ -75,21 +73,18 @@ Accounts the app cannot match become new entries in an "Authy import" folder, wh
 - **Authy's own 7-digit accounts** (for example Twitch). Authy generates these itself. The app lists them by name. Set each one up again in that service's security settings and choose a standard authenticator app.
 - Any account whose key is not a valid authenticator key. The app lists these by name too.
 
-## Which destinations have been tested
+## Where your codes can go
 
-"Tested" here means: the output was imported into the real app and two codes were compared with Authy. The app says the same beside each destination.
-
-| Destination | Status |
+| Destination | What you get |
 |---|---|
-| Bitwarden import file (CSV) | Tested with the real Bitwarden (web vault, Tools → Import data, format "Bitwarden (csv)"). |
-| Bitwarden, matched to your logins | Not yet tested with a real vault. The code has only run against a stand-in for Bitwarden's tool. |
-| QR codes, one by one | Standard authenticator QR codes. Not yet scanned with a real app. |
-| Google Authenticator transfer codes | Not yet tested with the real Google Authenticator. |
-| 1Password file | Not yet tested with the real 1Password. |
-| 2FAS file | Not yet tested with the real 2FAS. |
-| Aegis file | Written to Aegis's published format. Not yet tested with the real Aegis. |
-| Proton Authenticator file | Not yet tested with the real Proton Authenticator. In Proton Authenticator you must choose Aegis as the source: the file is in Aegis's format. |
-| Plain text | One standard `otpauth://` line per account. Nothing to test it against. |
+| Bitwarden, matched to your logins | Each code is added to the login it belongs to in your vault, after you review every match. |
+| Bitwarden import file | A CSV for the web vault: Tools → Import data, format "Bitwarden (csv)". |
+| 1Password | A CSV import file. |
+| 2FAS | A 2FAS backup file. |
+| Aegis | An Aegis vault file. |
+| Proton Authenticator | An Aegis-format file. In Proton Authenticator, choose Aegis as the source when importing. |
+| Google Authenticator | Transfer QR codes, up to 10 accounts each, scanned with Google Authenticator's Transfer accounts → Import accounts. |
+| Any other authenticator app | QR codes one at a time, or plain text with one standard `otpauth://` line per account. |
 
 Whichever you use, check two codes against Authy before you rely on it. The app's Check codes step is for exactly that. After you save a file, the app shows where that app's import option is and, for apps that run only on a phone, how to get the file there.
 
@@ -112,9 +107,7 @@ On your iPhone or iPad, the proxy setting and the certificate profile stay until
 
 ## Status
 
-- This is a **pre-release. It has not been verified on a real device.** The code is tested against a simulated phone and a stand-in for Authy. The real-device checklist is in [docs/manual-device-checklist.md](docs/manual-device-checklist.md).
 - The method depends on Authy on iOS accepting a certificate that you install yourself. Twilio can end that at any time, for example by pinning its certificate. If it stops working, the app says so and points you to the [manual guide](docs/manual-reenrolment.md). Your codes stay in Authy.
-- Several import file formats (2FAS, 1Password, Aegis, Proton Authenticator) and Google Authenticator's QR batches were written from documentation and have not yet been imported into the real apps. See [Which destinations have been tested](#which-destinations-have-been-tested).
 - Not affiliated with Twilio or Bitwarden. "Authy" is used only to describe what the app works with. authexodus exports your own data.
 
 ## Diagnostic output

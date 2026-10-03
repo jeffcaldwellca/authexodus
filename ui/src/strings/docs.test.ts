@@ -132,7 +132,7 @@ describe("documents", () => {
     expect(readme).toMatch(/## What is left on your Mac afterwards/);
     expect(readme).toMatch(/Library\/Application Support\/dev\.somecorp\.authexodus/);
     // Which destinations have been tried against the real app.
-    expect(readme).toMatch(/## Which destinations have been tested/);
+    expect(readme).toMatch(/## Where your codes can go/);
     for (const app of ["1Password", "2FAS", "Aegis", "Proton Authenticator", "Google Authenticator", "Bitwarden"]) expect(readme).toContain(app);
     // The releases address does not exist yet, and the README must not say it does.
     expect(readme).toMatch(/Releases will be published at/);
