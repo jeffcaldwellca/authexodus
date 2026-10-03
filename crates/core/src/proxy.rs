@@ -1916,8 +1916,7 @@ mod tests {
 
     #[tokio::test]
     async fn device_connected_fires_once_for_the_first_non_loopback_peer() {
-        let ca =
-            Arc::new(Authority::create_fresh(&crate::ca::MemoryKeyStore::new(), true).unwrap());
+        let ca = Arc::new(Authority::create(true).unwrap());
         let (tx, mut events) = mpsc::unbounded_channel();
         let handle = start(
             ProxyConfig {

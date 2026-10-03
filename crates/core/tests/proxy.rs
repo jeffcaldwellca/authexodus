@@ -11,7 +11,7 @@ use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use authexodus_core::ca::{Authority, MemoryKeyStore};
+use authexodus_core::ca::Authority;
 use authexodus_core::proxy::{
     self, ProxyConfig, ProxyEvent, ProxyHandle, TestUpstream, AUTHY_HOST, CHECK_HOST,
 };
@@ -311,7 +311,7 @@ async fn rig_tuned(tune: impl FnOnce(TestUpstream) -> TestUpstream) -> Rig {
 }
 
 async fn rig_with(upstream: Option<TestUpstream>) -> Rig {
-    let ca = Arc::new(Authority::create_fresh(&MemoryKeyStore::new(), true).unwrap());
+    let ca = Arc::new(Authority::create(true).unwrap());
     let (tx, events) = tokio::sync::mpsc::unbounded_channel();
     let handle = proxy::start(
         ProxyConfig {
@@ -874,7 +874,7 @@ async fn falls_back_when_port_in_use() {
     let blocker = std::net::TcpListener::bind((LOCALHOST, 0)).unwrap();
     let taken = blocker.local_addr().unwrap().port();
 
-    let ca = Arc::new(Authority::create_fresh(&MemoryKeyStore::new(), true).unwrap());
+    let ca = Arc::new(Authority::create(true).unwrap());
     let (tx, _events) = tokio::sync::mpsc::unbounded_channel();
     let handle = proxy::start(
         ProxyConfig {

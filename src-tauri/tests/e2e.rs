@@ -6,7 +6,7 @@
 //!   serving a synthetic backup encrypted here with a known password;
 //! * a simulated phone: a socket that uses the session's proxy, downloads the certificate the
 //!   way a phone does, trusts it and nothing else, and asks Authy for its tokens;
-//! * an in-memory key store and a temporary directory.
+//! * a temporary directory for the app's data folder.
 //!
 //! * a stand-in Bitwarden client, so the Bitwarden stages run without the real tool;
 //! * a stand-in for the list of this computer's addresses, so that it can "move networks".
@@ -14,8 +14,7 @@
 //! The app's own log subscriber (at its most talkative) records the whole run, and the log is
 //! then searched for every secret, name, host and address that went through the app.
 //!
-//! No Tauri runtime, no Keychain, no dialog, no real Bitwarden, no network beyond this
-//! computer. Every name, secret and password in this file is made up.
+//! No Tauri runtime, no dialog, no real Bitwarden, no network beyond this computer. Every name, secret and password in this file is made up.
 
 use std::io::Write;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
@@ -28,7 +27,6 @@ use async_trait::async_trait;
 use authexodus_core::bitwarden::{
     BwClient, BwError, CodeMark, LoginOutcome, Region, SetTotp, VaultLogin,
 };
-use authexodus_core::ca::MemoryKeyStore;
 use authexodus_core::proxy::{TestUpstream, AUTHY_HOST};
 use authexodus_core::totp;
 use authexodus_lib::commands::finish_export;
@@ -640,8 +638,7 @@ async fn the_whole_flow_with_a_simulated_phone() {
     let dir = tempfile::tempdir().unwrap();
     let data_dir = dir.path().join("app-data");
     std::fs::create_dir(&data_dir).unwrap();
-    let store = Arc::new(MemoryKeyStore::new());
-    let session = Session::new(store.clone(), data_dir.clone());
+    let session = Session::new(data_dir.clone());
 
     let expected_body = tokens_body();
     let authy = stand_in_authy(expected_body.clone()).await;
@@ -676,7 +673,6 @@ async fn the_whole_flow_with_a_simulated_phone() {
     assert!(!state.resume_cleanup);
     assert_eq!(state.releases_url, RELEASES_URL);
     assert_eq!(state.session.proxy, None);
-    assert_eq!(store.load().unwrap(), None);
 
     // ---- Connect: the proxy starts. (Loopback is never a default, so it is named.)
     let (emit, mut heard) = events();
@@ -688,14 +684,12 @@ async fn the_whole_flow_with_a_simulated_phone() {
     assert_eq!(info.cert_url, format!("http://127.0.0.1:{}/", info.port));
     assert!(info.cert_qr_svg.contains("<svg"));
     assert_eq!(info.addresses.len(), 2);
-    assert!(
-        store.load().unwrap().is_some(),
-        "the certificate key is stored"
-    );
-    assert!(
-        data_dir.join("session.json").exists(),
-        "and the marker says so"
-    );
+    // The certificate's key is in memory only: the marker is all there is on disk.
+    let on_disk: Vec<_> = std::fs::read_dir(&data_dir)
+        .unwrap()
+        .map(|entry| entry.unwrap().file_name())
+        .collect();
+    assert_eq!(on_disk, ["session.json"], "the marker, and nothing else");
     assert!(info.cert_constrained);
     let state = session.get_state(&net);
     assert_eq!(state.step, Step::Connect);
@@ -1114,11 +1108,6 @@ async fn the_whole_flow_with_a_simulated_phone() {
 
     // ---- Clean up.
     session.cleanup().await.unwrap();
-    assert_eq!(
-        store.load().unwrap(),
-        None,
-        "the certificate key is destroyed"
-    );
     assert!(session.live_codes().is_err(), "the secrets are dropped");
     assert!(session.token_qr("7001").is_err());
     assert!(
@@ -1131,7 +1120,7 @@ async fn the_whole_flow_with_a_simulated_phone() {
     // Until the person has ticked everything off, a new launch comes back to cleanup.
     assert!(data_dir.join("session.json").exists());
     assert!(
-        Session::new(store.clone(), data_dir.clone())
+        Session::new(data_dir.clone())
             .get_state(&net)
             .resume_cleanup
     );
@@ -1148,10 +1137,9 @@ async fn the_whole_flow_with_a_simulated_phone() {
         0,
         "nothing of the app's own making is left in its data folder"
     );
-    let next = Session::new(store.clone(), data_dir.clone());
+    let next = Session::new(data_dir.clone());
     assert!(!next.get_state(&net).resume_cleanup);
     assert_eq!(next.get_state(&net).step, Step::Welcome);
-    assert_eq!(store.load().unwrap(), None);
 
     // ---- The log: every stage is there, and nothing that went through the app is.
     tokio::time::sleep(QUIET).await;
@@ -1191,7 +1179,7 @@ async fn the_whole_flow_with_a_simulated_phone() {
         "bitwarden: applied attached=0 created=4",
         "starting over: the capture and anything unlocked are discarded",
         "cleanup: proxy stopped",
-        "cleanup: certificate key removed",
+        "cleanup: certificate key dropped from memory",
         "cleanup: Bitwarden tool removed",
         "cleanup: finished complete=true",
         "finished: the resume marker is cleared",

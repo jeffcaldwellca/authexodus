@@ -43,7 +43,8 @@ prost = "0.14"
 # the Content-Encoding of Authy's responses (a copy only; the device gets the bytes as sent).
 # hyper-rustls `webpki-tokio` supplies the public web roots the proxy verifies Authy against.
 async-compression = { version = "0.4", features = ["tokio", "gzip", "zlib", "brotli", "zstd"] }
-rcgen = "0.14"
+# `zeroize`: the root's private key is wiped when the certificate authority is dropped.
+rcgen = { version = "0.14", features = ["zeroize"] }
 rustls = { version = "0.23", default-features = false, features = ["aws-lc-rs", "std"] }
 tokio-rustls = { version = "0.26", default-features = false, features = ["aws-lc-rs"] }
 hyper = { version = "1", features = ["http1", "server", "client"] }

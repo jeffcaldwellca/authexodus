@@ -20,7 +20,6 @@ pub enum ErrorCode {
     AddressNotPrivate,
     NoPrivateAddress,
     ListenFailed,
-    KeychainFailed,
     CaptureWouldBeLost,
     BadEmail,
     BadServerUrl,
@@ -33,7 +32,6 @@ pub enum ErrorCode {
     NotUnlocked,
     NoBackup,
     ExportFailed,
-    CleanupKeychainFailed,
     CleanupFailed,
     Internal,
 }
@@ -44,7 +42,6 @@ impl ErrorCode {
         ErrorCode::AddressNotPrivate,
         ErrorCode::NoPrivateAddress,
         ErrorCode::ListenFailed,
-        ErrorCode::KeychainFailed,
         ErrorCode::CaptureWouldBeLost,
         ErrorCode::BadEmail,
         ErrorCode::BadServerUrl,
@@ -57,7 +54,6 @@ impl ErrorCode {
         ErrorCode::NotUnlocked,
         ErrorCode::NoBackup,
         ErrorCode::ExportFailed,
-        ErrorCode::CleanupKeychainFailed,
         ErrorCode::CleanupFailed,
         ErrorCode::Internal,
     ];
@@ -68,7 +64,6 @@ impl ErrorCode {
             ErrorCode::AddressNotPrivate => "address_not_private",
             ErrorCode::NoPrivateAddress => "no_private_address",
             ErrorCode::ListenFailed => "listen_failed",
-            ErrorCode::KeychainFailed => "keychain_failed",
             ErrorCode::CaptureWouldBeLost => "capture_would_be_lost",
             ErrorCode::BadEmail => "bad_email",
             ErrorCode::BadServerUrl => "bad_server_url",
@@ -81,7 +76,6 @@ impl ErrorCode {
             ErrorCode::NotUnlocked => "not_unlocked",
             ErrorCode::NoBackup => "no_backup",
             ErrorCode::ExportFailed => "export_failed",
-            ErrorCode::CleanupKeychainFailed => "cleanup_keychain_failed",
             ErrorCode::CleanupFailed => "cleanup_failed",
             ErrorCode::Internal => "internal",
         }
@@ -137,9 +131,10 @@ rejections! {
         "The app asked for a network address that is not valid. Try again; if it keeps happening, quit the app and open it again.";
     ListenFailed => ListenFailed,
         "This computer could not open the connection for your iPhone or iPad. Check that Wi-Fi is switched on and that no other copy of this app is running, then try again.";
-    /// The certificate key could not be put in the key store.
-    KeychainFailed => KeychainFailed,
-        "The certificate could not be created, because this computer's keychain did not take its key. Open Keychain Access, search for \"dev.somecorp.authexodus\", delete the item it finds, and try again.";
+    /// The certificate authority could not be generated. Nothing is stored anywhere, so
+    /// there is nothing for the person to remove: trying again is all there is.
+    CaNotCreated => Internal,
+        "The certificate for your iPhone or iPad could not be made. Try again; if it keeps happening, quit the app and open it again.";
     MarkerNotWritten => Internal,
         "This app could not write to its own data folder, so the connection was not started. Check that this computer's disk is not full, then try again.";
     CaptureWouldBeLost => CaptureWouldBeLost,
@@ -218,8 +213,6 @@ rejections! {
         "The same Bitwarden login was chosen for two accounts, and a login can hold only one code. Nothing was changed.";
 
     // ---- cleaning up ----
-    CleanupKeychainFailed => CleanupKeychainFailed,
-        "The certificate key could not be removed from this computer's keychain. To remove it by hand: open Keychain Access, search for \"dev.somecorp.authexodus\", and delete the item it finds. Then try again.";
     CleanupBwDataNotRemoved => CleanupFailed,
         "The folder the Bitwarden tool kept its data in could not be removed from this computer. Try again.";
     CleanupBwToolNotRemoved => CleanupFailed,
@@ -299,7 +292,6 @@ pub fn bw_reject(stage: BwStage, error: &BwError) -> Reject {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::keychain::KEYCHAIN_SERVICE;
     use std::collections::BTreeSet;
 
     /// The codes the UI was told to expect, word for word.
@@ -308,7 +300,6 @@ mod tests {
         "address_not_private",
         "no_private_address",
         "listen_failed",
-        "keychain_failed",
         "capture_would_be_lost",
         "bad_email",
         "bad_server_url",
@@ -321,7 +312,6 @@ mod tests {
         "not_unlocked",
         "no_backup",
         "export_failed",
-        "cleanup_keychain_failed",
         "cleanup_failed",
         "internal",
     ];
@@ -388,11 +378,8 @@ mod tests {
                 let after = &sentence[at + "https://".len()..];
                 assert!(after.starts_with(' '), "a server address in {sentence}");
             }
-            // No host or file name. The one dotted word allowed is the name the person
-            // searches Keychain Access for.
-            for word in dotted_words(sentence) {
-                assert_eq!(word, KEYCHAIN_SERVICE, "in {sentence}");
-            }
+            // No host or file name.
+            assert_eq!(dotted_words(sentence), Vec::<&str>::new(), "in {sentence}");
             // No email address, no id, no number long enough to be one.
             assert!(!sentence.contains('@'), "{sentence}");
             let digits = sentence.chars().filter(char::is_ascii_digit).count();
@@ -410,10 +397,6 @@ mod tests {
                 assert!(!sentence.contains(jargon), "{jargon:?} in {sentence}");
             }
         }
-        assert!(Reject::KeychainFailed.sentence().contains(KEYCHAIN_SERVICE));
-        assert!(Reject::CleanupKeychainFailed
-            .sentence()
-            .contains(KEYCHAIN_SERVICE));
     }
 
     #[test]

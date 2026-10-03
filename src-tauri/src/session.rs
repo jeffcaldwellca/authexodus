@@ -1,8 +1,8 @@
 //! The one `Session` held in Tauri state, plus the resume marker file (package 2A).
 //!
-//! Everything here is generic over the core traits (`KeyStore`, `BwClient`) and free of Tauri,
-//! so the tests run under `cargo test` with a `MemoryKeyStore` and a fake Bitwarden client.
-//! Secrets (`Unlocked`, the Bitwarden client) live in memory only.
+//! Everything here is generic over the core's `BwClient` and free of Tauri, so the tests run
+//! under `cargo test` with a fake Bitwarden client. Secrets (`Unlocked`, the Bitwarden client,
+//! the certificate authority's key) live in memory only.
 //!
 //! What this file logs (see `crate::logging` for where it goes): the stages of the session
 //! and their failures, with counts and kinds only. Never a password, a key, a one-time code,
@@ -10,7 +10,7 @@
 //! traffic beyond what the proxy itself logs.
 //!
 //! What a refused command tells the person is in `crate::errors`, as fixed sentences. The
-//! detail of a failure (what the key store or the Bitwarden tool said) goes to the log only.
+//! detail of a failure (what the Bitwarden tool said, say) goes to the log only.
 
 use std::collections::HashSet;
 use std::net::{IpAddr, Ipv4Addr};
@@ -23,7 +23,7 @@ use authexodus_core::backup;
 use authexodus_core::bitwarden::{
     self, BwClient, BwError, Cancel, CliBinary, CliClient, CodeMark, LoginOutcome, PrepareStage,
 };
-use authexodus_core::ca::{Authority, KeyStore};
+use authexodus_core::ca::Authority;
 use authexodus_core::export::{self, ExportFile};
 use authexodus_core::proxy::{self, ProxyConfig, ProxyEvent, ProxyHandle, TestUpstream};
 use authexodus_core::totp;
@@ -307,7 +307,6 @@ fn vault_entries(vault: &[bitwarden::VaultLogin]) -> Vec<VaultEntry> {
 }
 
 pub struct Session {
-    store: Arc<dyn KeyStore>,
     /// Whether the certificate authority of this launch carries the name constraint.
     constrained: bool,
     paths: Paths,
@@ -320,6 +319,9 @@ pub struct Session {
     /// [`Session::finish`] succeeded and nothing was started since.
     finished: AtomicBool,
     device: Mutex<Option<Device>>,
+    /// This run's certificate authority, private key and all. Only ever in memory: made by
+    /// the first start of the proxy, kept across restarts (the device trusts it), and dropped
+    /// by cleanup and when the app closes.
     authority: Mutex<Option<Arc<Authority>>>,
     proxy: tokio::sync::Mutex<Option<ProxyRun>>,
     /// The address the proxy last ran on: where a start-over goes when none is named.
@@ -573,22 +575,23 @@ fn account_key(region: &bitwarden::Region, email: &str) -> String {
 }
 
 impl Session {
-    /// A session over `store`, keeping its files in `dir`. Reads the resume marker: a marker
-    /// left by an earlier launch means the certificate may still be installed on a device.
+    /// A session keeping its files in `dir`. Reads the resume marker: a marker left by an
+    /// earlier launch means the certificate may still be installed on a device, and the proxy
+    /// setting still switched on. (The certificate's key went with that launch.)
     ///
     /// What Bitwarden left from an earlier launch is removed here: its data (the key to it
     /// lived in that launch's memory, so it is of no use, and a launch that crashed never
     /// wiped it) and the downloaded tool itself.
     ///
     /// The certificate authority is constrained unless [`UNCONSTRAINED_ENV`] is set to `1`.
-    pub fn new(store: Arc<dyn KeyStore>, dir: PathBuf) -> Session {
+    pub fn new(dir: PathBuf) -> Session {
         let constrained = ca_constrained(std::env::var(UNCONSTRAINED_ENV).ok().as_deref());
-        Session::with_ca_mode(store, dir, constrained)
+        Session::with_ca_mode(dir, constrained)
     }
 
     /// [`Session::new`] with the certificate-authority mode given rather than read from the
     /// environment.
-    pub fn with_ca_mode(store: Arc<dyn KeyStore>, dir: PathBuf, constrained: bool) -> Session {
+    pub fn with_ca_mode(dir: PathBuf, constrained: bool) -> Session {
         let paths = Paths::new(dir);
         let resume = marker_exists(&paths);
         let _ = remove_dir(&paths.bw_data());
@@ -606,7 +609,6 @@ impl Session {
             );
         }
         Session {
-            store,
             constrained,
             paths,
             resume_cleanup: AtomicBool::new(resume),
@@ -693,7 +695,7 @@ impl Session {
     /// It is never `verify`: whether the person is choosing a destination or checking the
     /// codes is the screen's own business, and nothing here could tell.
     ///
-    /// While the proxy is being started or stopped (which can wait on a system prompt), this
+    /// While the proxy is being started or stopped (a moment's work), this
     /// does not wait for it: the snapshot then says there is no proxy, and `start_proxy`
     /// gives the answer when it is there.
     pub fn get_state(&self, net: &Network) -> AppState {
@@ -751,16 +753,13 @@ impl Session {
         self.constrained
     }
 
-    /// The certificate authority of this launch, created the first time it is asked for.
+    /// The certificate authority of this launch, created the first time it is asked for, and
+    /// kept in memory only.
     ///
-    /// The resume marker is written first and the key created second, so that a crash at any
-    /// moment leaves at worst a marker without a key (the next launch offers a cleanup that
-    /// has nothing to remove), never a key the next launch does not know about. If the key
-    /// cannot be created, the marker written here is taken away again.
-    ///
-    /// The key store is never read (it cannot be): whatever it holds is deleted and a new key
-    /// is stored (see [`Authority::create_fresh`]). The store may block on a system prompt,
-    /// so it is called on the blocking pool.
+    /// The resume marker is written first and the key made second, so that whatever happens
+    /// to the app later, the next launch knows a certificate may be on a device (and the
+    /// proxy setting switched on) and opens on cleanup. If the key cannot be made, the marker
+    /// written here is taken away again.
     async fn ensure_ca(&self) -> Result<Arc<Authority>, CmdError> {
         if let Some(ca) = lock(&self.authority).as_ref() {
             return Ok(Arc::clone(ca));
@@ -768,21 +767,14 @@ impl Session {
         let had_marker = marker_exists(&self.paths);
         self.cleaned.store(false, Ordering::SeqCst);
         write_marker(&self.paths)?;
-        let (store, constrained) = (Arc::clone(&self.store), self.constrained);
-        let created =
-            tokio::task::spawn_blocking(move || Authority::create_fresh(&*store, constrained))
-                .await
-                .map_err(|_| "the key store stopped unexpectedly".to_string())
-                .and_then(|made| made.map_err(|e| store_reason(&e)));
-        let ca = match created {
+        let ca = match Authority::create(self.constrained) {
             Ok(ca) => Arc::new(ca),
-            Err(reason) => {
+            Err(e) => {
                 if !had_marker {
                     let _ = remove_marker(&self.paths);
                 }
-                // The reason is the key store's own wording: for the log, not the screen.
-                tracing::error!(error = %reason, "the certificate authority could not be created");
-                return Err(CmdError(Reject::KeychainFailed));
+                tracing::error!(error = %e, "the certificate authority could not be created");
+                return Err(CmdError(Reject::CaNotCreated));
             }
         };
         if ca.is_constrained() {
@@ -1440,13 +1432,13 @@ impl Session {
 
     // ---- end of the session ----
 
-    /// Stop the proxy, destroy the certificate key, wipe the Bitwarden data, remove the
-    /// downloaded Bitwarden tool, drop the secrets.
+    /// Stop the proxy, drop the certificate authority and its key, wipe the Bitwarden data,
+    /// remove the downloaded Bitwarden tool, drop the secrets.
     ///
-    /// Idempotent, and complete on a fresh launch that has nothing but the marker and a key in
-    /// the store (the resume-after-quit path). Every step is tried even when an earlier one
-    /// fails; the first failure is reported. A key left by an earlier launch is deleted, and
-    /// that is all that is ever done with it: it cannot be read.
+    /// Idempotent, and complete on a fresh launch that has nothing but the marker (the
+    /// resume-after-quit path): the key of an earlier launch went with it, so there is nothing
+    /// of it to remove. Every step is tried even when an earlier one fails; the first failure
+    /// is reported.
     pub async fn cleanup(&self) -> Result<(), CmdError> {
         let mut first_error: Option<CmdError> = None;
         let mut note = |e: CmdError| {
@@ -1464,21 +1456,9 @@ impl Session {
             run.stop().await;
             tracing::info!("cleanup: proxy stopped");
         }
-        lock(&self.authority).take();
-        // The key store may wait on a system prompt: not on an async worker, and not while
-        // the proxy lock is held (it was let go above).
-        let store = Arc::clone(&self.store);
-        let destroyed = tokio::task::spawn_blocking(move || Authority::destroy(&*store))
-            .await
-            .map_err(|_| "the key store stopped unexpectedly".to_string())
-            .and_then(|done| done.map_err(|e| store_reason(&e)));
-        match destroyed {
-            Ok(()) => tracing::info!("cleanup: certificate key removed"),
-            Err(reason) => {
-                // The key store's own wording: for the log, not the screen.
-                tracing::error!(error = %reason, "cleanup: the certificate key could not be removed");
-                note(CmdError(Reject::CleanupKeychainFailed));
-            }
+        // The proxy holds no copy of it, so this is the last: the key is wiped as it goes.
+        if lock(&self.authority).take().is_some() {
+            tracing::info!("cleanup: certificate key dropped from memory");
         }
         let client = self.bw.lock().await.take();
         if let Some(mut client) = client {
@@ -1514,10 +1494,11 @@ impl Session {
     }
 
     /// The app is closing before the person reached cleanup. Stop the proxy (and with it the
-    /// helper that keeps the computer awake) and remove what Bitwarden left on disk, the
-    /// downloaded tool included; keep the certificate key and the marker, so the next launch
-    /// opens on cleanup and finishes the job. Never waits: whatever is busy is skipped, and
-    /// the process ending takes care of what is in memory.
+    /// helper that keeps the computer awake), drop the certificate key, and remove what
+    /// Bitwarden left on disk, the downloaded tool included; keep the marker, so the next
+    /// launch opens on cleanup and the person removes the certificate and the proxy setting
+    /// from the device. Never waits: whatever is busy is skipped, and the process ending
+    /// takes care of what is in memory.
     pub fn on_exit(&self) {
         tracing::info!("the app is closing: stopping the proxy and removing Bitwarden files");
         self.discard_secrets();
@@ -1539,10 +1520,8 @@ impl Session {
     }
 
     /// Clear the resume marker. Unless a cleanup has already run to the end, one is run first
-    /// (it deletes the key without ever reading it). When that fails, this fails with the
-    /// same error and the marker stays, so the next launch offers cleanup again: in
-    /// particular, while the certificate key is still in the keychain this never succeeds,
-    /// whatever the person ticked (`cleanup_keychain_failed`).
+    /// (it drops the key, if this launch made one). When that fails, this fails with the same
+    /// error and the marker stays, so the next launch offers cleanup again.
     pub async fn finish(&self) -> Result<(), CmdError> {
         if !self.cleaned.load(Ordering::SeqCst) {
             self.cleanup().await.inspect_err(
@@ -1554,14 +1533,6 @@ impl Session {
         self.resume_cleanup.store(false, Ordering::SeqCst);
         self.finished.store(true, Ordering::SeqCst);
         Ok(())
-    }
-}
-
-/// What the key store said, without the "key store:" in front.
-fn store_reason(error: &authexodus_core::ca::CaError) -> String {
-    match error {
-        authexodus_core::ca::CaError::Store(message) => message.clone(),
-        other => other.to_string(),
     }
 }
 

@@ -5,14 +5,12 @@ pub mod awake;
 pub mod commands;
 pub mod dto;
 pub mod errors;
-pub mod keychain;
 pub mod logging;
 pub mod network;
 pub mod progress;
 pub mod session;
 
 use std::path::Path;
-use std::sync::Arc;
 
 use tauri::{Manager, RunEvent};
 use tauri_plugin_dialog::{DialogExt, MessageDialogKind};
@@ -45,8 +43,8 @@ pub fn run() {
     }
     let built = tauri::Builder::default()
         // First, as the plugin asks: a second copy of the app stops here, before it has
-        // touched anything the first copy owns (the keychain item, the marker, the Bitwarden
-        // folders), and the first copy's window comes forward instead.
+        // touched anything the first copy owns (the marker, the Bitwarden folders), and the
+        // first copy's window comes forward instead.
         .plugin(tauri_plugin_single_instance::init(|app, _args, _cwd| {
             tracing::info!("a second copy was opened; bringing this one forward");
             if let Some(window) = app.get_webview_window(MAIN_WINDOW) {
@@ -64,10 +62,7 @@ pub fn run() {
                 .and_then(|dir| prepare_data_dir(&dir).map(|()| dir).map_err(|e| e.kind()));
             match prepared {
                 Ok(dir) => {
-                    app.manage(session::Session::new(
-                        Arc::new(keychain::KeychainStore),
-                        dir,
-                    ));
+                    app.manage(session::Session::new(dir));
                 }
                 Err(kind) => {
                     // Not a panic and not a window that cannot work: say why in a system
@@ -104,9 +99,9 @@ pub fn run() {
 
     app.run(|handle, event| {
         // Closing the window mid-flow: stop listening on the network (and stop keeping the
-        // computer awake) and remove what Bitwarden left on disk. The certificate key and
-        // the marker stay, so the next launch opens on cleanup. Both events can arrive for
-        // one exit; doing it twice is harmless.
+        // computer awake), drop the certificate key from memory, and remove what Bitwarden
+        // left on disk. The marker stays, so the next launch opens on cleanup. Both events
+        // can arrive for one exit; doing it twice is harmless.
         if matches!(event, RunEvent::ExitRequested { .. } | RunEvent::Exit) {
             if let Some(session) = handle.try_state::<session::Session>() {
                 session.on_exit();

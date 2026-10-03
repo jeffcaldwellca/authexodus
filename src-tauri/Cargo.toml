@@ -40,13 +40,6 @@ zeroize = { version = "1", features = ["serde"] }
 # there, in the keep-awake test (see awake.rs).
 libc = "0.2"
 
-[target.'cfg(target_os = "macos")'.dependencies]
-keyring = { version = "3", features = ["apple-native"] }
-[target.'cfg(target_os = "windows")'.dependencies]
-keyring = { version = "3", features = ["windows-native"] }
-[target.'cfg(target_os = "linux")'.dependencies]
-keyring = { version = "3", features = ["sync-secret-service", "crypto-rust"] }
-
 [dev-dependencies]
 # Switches on `proxy::TestUpstream` (a stand-in for Authy) for this crate's tests only. The
 # entry under [dependencies] stays without the feature, so a built app never has it.

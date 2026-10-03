@@ -1,21 +1,19 @@
-//! Tests of `session.rs`: a `MemoryKeyStore`, a fake Bitwarden client, a temporary directory and
-//! loopback. Nothing here touches the Keychain, a real Bitwarden or the network beyond this
-//! computer. All data is synthetic.
+//! Tests of `session.rs`: a fake Bitwarden client, a temporary directory and loopback. Nothing
+//! here touches a real Bitwarden or the network beyond this computer. All data is synthetic.
 
 use super::*;
 use crate::awake::{KeepAwake, KeepAwakeCommand};
 use crate::errors::ErrorCode;
 use async_trait::async_trait;
 use authexodus_core::bitwarden::{BwError, Region, SetTotp, VaultLogin};
-use authexodus_core::ca::{CaError, MemoryKeyStore};
 use authexodus_core::types::{EncryptedToken, Secret, Token};
 use std::sync::atomic::AtomicUsize;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 use tokio::sync::Notify;
 
-fn session(dir: &Path, store: Arc<MemoryKeyStore>) -> Session {
-    Session::new(store, dir.to_path_buf())
+fn session(dir: &Path) -> Session {
+    Session::new(dir.to_path_buf())
 }
 
 fn candidate(ip: Ipv4Addr, label: &str) -> Candidate {
@@ -117,8 +115,7 @@ async fn connect_status(port: u16, target: &str) -> String {
 #[tokio::test]
 async fn marker_makes_next_launch_resume_cleanup() {
     let dir = tempfile::tempdir().unwrap();
-    let store = Arc::new(MemoryKeyStore::new());
-    let first = session(dir.path(), store.clone());
+    let first = session(dir.path());
     assert!(!first.get_state(&loopback()).resume_cleanup);
     assert_eq!(first.get_state(&loopback()).step, Step::Welcome);
 
@@ -129,90 +126,80 @@ async fn marker_makes_next_launch_resume_cleanup() {
     );
     drop(first); // the app quits without cleaning up
 
-    let second = session(dir.path(), store);
+    let second = session(dir.path());
     let state = second.get_state(&loopback());
     assert!(state.resume_cleanup);
     assert_eq!(state.step, Step::Cleanup);
 }
 
-/// A key store that cannot store.
-struct BrokenStore;
-
-impl KeyStore for BrokenStore {
-    fn store(&self, _: &[u8]) -> Result<(), CaError> {
-        Err(CaError::Store("the keychain is locked".into()))
+/// Every file under `dir`, with what it holds.
+fn files_under(dir: &Path) -> Vec<(PathBuf, Vec<u8>)> {
+    let mut found = Vec::new();
+    for entry in std::fs::read_dir(dir).unwrap() {
+        let path = entry.unwrap().path();
+        if path.is_dir() {
+            found.extend(files_under(&path));
+        } else {
+            let bytes = std::fs::read(&path).unwrap();
+            found.push((path, bytes));
+        }
     }
-    fn delete(&self) -> Result<(), CaError> {
-        Ok(())
-    }
+    found
 }
 
 #[tokio::test]
-async fn a_key_that_could_not_be_stored_leaves_no_marker() {
+async fn the_certificate_key_lives_in_memory_only() {
     let dir = tempfile::tempdir().unwrap();
-    let s = Session::new(Arc::new(BrokenStore), dir.path().to_path_buf());
-    let error = s.ensure_ca().await.err().expect("no certificate");
-    assert_eq!(error.code(), ErrorCode::KeychainFailed);
-    assert!(
-        error.sentence().contains("Keychain Access"),
-        "the way out is on the screen: {error}"
-    );
-    assert!(
-        !error.to_string().contains("the keychain is locked"),
-        "what the key store said is for the log: {error}"
-    );
-    assert!(
-        !dir.path().join("session.json").exists(),
-        "no marker claims a certificate that was never created"
-    );
-    assert!(
-        !Session::new(Arc::new(BrokenStore), dir.path().to_path_buf())
-            .get_state(&loopback())
-            .resume_cleanup
-    );
+    let s = session(dir.path());
+    s.tune_proxy(0, None);
+    s.start_proxy(Some("127.0.0.1"), &loopback(), no_emit())
+        .await
+        .unwrap();
+    let certificate = s.ensure_ca().await.unwrap().cert_der();
+
+    // On disk there is the marker and nothing else, and it says only that a run began: not
+    // the certificate, and no key.
+    let files = files_under(dir.path());
+    assert_eq!(files.len(), 1, "{files:?}");
+    assert_eq!(files[0].0, dir.path().join("session.json"));
+    assert_eq!(files[0].1, br#"{"caCreated":true}"#);
+    assert!(!files[0]
+        .1
+        .windows(certificate.len())
+        .any(|w| w == certificate.as_slice()));
+    s.cleanup().await.unwrap();
 }
 
 #[tokio::test]
-async fn a_marker_that_cannot_be_written_takes_the_key_with_it() {
+async fn a_marker_that_cannot_be_written_means_no_key_is_made() {
     let dir = tempfile::tempdir().unwrap();
     // Something that is not a file sits where the marker goes.
     std::fs::create_dir(dir.path().join("session.json")).unwrap();
-    let store = Arc::new(MemoryKeyStore::new());
-    let s = session(dir.path(), store.clone());
+    let s = session(dir.path());
     assert!(s.ensure_ca().await.is_err());
-    assert_eq!(
-        store.load().unwrap(),
-        None,
-        "no key is left that the next launch would not know about"
-    );
     assert!(lock(&s.authority).is_none());
 }
 
 #[tokio::test]
 async fn finish_clears_the_marker_for_the_next_launch() {
     let dir = tempfile::tempdir().unwrap();
-    let store = Arc::new(MemoryKeyStore::new());
-    let s = session(dir.path(), store.clone());
+    let s = session(dir.path());
     s.ensure_ca().await.unwrap();
     s.cleanup().await.unwrap();
     s.finish().await.unwrap();
     assert!(!s.get_state(&loopback()).resume_cleanup);
     assert!(!dir.path().join("session.json").exists());
-    assert!(
-        !session(dir.path(), store)
-            .get_state(&loopback())
-            .resume_cleanup
-    );
+    assert!(!session(dir.path()).get_state(&loopback()).resume_cleanup);
 }
 
 #[tokio::test]
-async fn finish_without_cleanup_still_destroys_the_key() {
+async fn finish_without_cleanup_still_drops_the_key() {
     let dir = tempfile::tempdir().unwrap();
-    let store = Arc::new(MemoryKeyStore::new());
-    let s = session(dir.path(), store.clone());
+    let s = session(dir.path());
     s.ensure_ca().await.unwrap();
+    let authority = held_authority(&s);
     s.finish().await.unwrap();
-    assert_eq!(store.load().unwrap(), None);
+    assert!(authority.upgrade().is_none());
 }
 
 #[test]
@@ -222,7 +209,7 @@ fn state_carries_the_releases_address() {
         "https://github.com/jeffcaldwellca/authexodus/releases"
     );
     let dir = tempfile::tempdir().unwrap();
-    let s = session(dir.path(), Arc::new(MemoryKeyStore::new()));
+    let s = session(dir.path());
     let json = serde_json::to_value(s.get_state(&loopback())).unwrap();
     assert_eq!(json["releasesUrl"], RELEASES_URL);
     assert_eq!(json["version"], env!("CARGO_PKG_VERSION"));
@@ -387,16 +374,15 @@ fn no_progress() -> EmitProgress {
 // Cleanup, and closing the app (S7)
 
 #[tokio::test]
-async fn cleanup_destroys_key_and_drops_secrets() {
+async fn cleanup_drops_the_key_and_the_secrets() {
     let dir = tempfile::tempdir().unwrap();
-    let store = Arc::new(MemoryKeyStore::new());
-    let s = session(dir.path(), store.clone());
+    let s = session(dir.path());
     s.tune_proxy(0, None);
 
     s.start_proxy(Some("127.0.0.1"), &loopback(), no_emit())
         .await
         .unwrap();
-    assert!(store.load().unwrap().is_some(), "the key is stored");
+    let authority = held_authority(&s);
     *lock(&s.unlocked) = Some(Arc::new(unlocked_one()));
     let bw = FakeBw::new();
     let result = s
@@ -409,7 +395,10 @@ async fn cleanup_destroys_key_and_drops_secrets() {
 
     s.cleanup().await.unwrap();
 
-    assert_eq!(store.load().unwrap(), None, "the key is gone");
+    assert!(
+        authority.upgrade().is_none(),
+        "the certificate authority, and its key, are gone"
+    );
     assert!(s.proxy.lock().await.is_none(), "the proxy is stopped");
     assert!(lock(&s.unlocked).is_none(), "secrets are dropped");
     assert!(lock(&s.proposals).is_none());
@@ -426,23 +415,29 @@ async fn cleanup_destroys_key_and_drops_secrets() {
 }
 
 #[tokio::test]
-async fn cleanup_on_fresh_launch_with_only_marker_and_key() {
+async fn cleanup_on_fresh_launch_with_only_the_marker() {
     let dir = tempfile::tempdir().unwrap();
-    let store = Arc::new(MemoryKeyStore::new());
     {
-        let earlier = session(dir.path(), store.clone());
+        let earlier = session(dir.path());
         earlier.ensure_ca().await.unwrap();
     }
 
-    let fresh = session(dir.path(), store.clone());
+    let fresh = session(dir.path());
     assert!(fresh.get_state(&loopback()).resume_cleanup);
+    assert!(
+        lock(&fresh.authority).is_none(),
+        "the earlier launch's key went with it"
+    );
     // Bitwarden data that turns up with no client to wipe it.
     std::fs::create_dir_all(dir.path().join("bw-data")).unwrap();
     std::fs::write(dir.path().join("bw-data").join("data.json"), b"{}").unwrap();
     fresh.cleanup().await.unwrap();
     fresh.finish().await.unwrap();
 
-    assert_eq!(store.load().unwrap(), None);
+    assert!(
+        lock(&fresh.authority).is_none(),
+        "no key was made to clean up"
+    );
     assert!(!dir.path().join("bw-data").exists());
     assert!(!dir.path().join("session.json").exists());
 }
@@ -452,15 +447,14 @@ fn a_launch_removes_bitwarden_data_an_earlier_one_left() {
     let dir = tempfile::tempdir().unwrap();
     std::fs::create_dir_all(dir.path().join("bw-data")).unwrap();
     std::fs::write(dir.path().join("bw-data").join("data.json"), b"{}").unwrap();
-    let _s = session(dir.path(), Arc::new(MemoryKeyStore::new()));
+    let _s = session(dir.path());
     assert!(!dir.path().join("bw-data").exists());
 }
 
 #[tokio::test]
-async fn closing_the_app_mid_flow_stops_the_proxy_and_keeps_the_key_for_cleanup() {
+async fn closing_the_app_mid_flow_stops_the_proxy_and_keeps_the_marker_for_cleanup() {
     let dir = tempfile::tempdir().unwrap();
-    let store = Arc::new(MemoryKeyStore::new());
-    let s = session(dir.path(), store.clone());
+    let s = session(dir.path());
     s.tune_proxy(0, None);
     let info = s
         .start_proxy(Some("127.0.0.1"), &loopback(), no_emit())
@@ -500,17 +494,19 @@ async fn closing_the_app_mid_flow_stops_the_proxy_and_keeps_the_key_for_cleanup(
     }
     assert!(stopped, "nothing is listening any more");
 
-    // The key and the marker stay: the next launch opens on cleanup and finishes the job.
-    assert!(store.load().unwrap().is_some());
+    // The marker stays: the next launch opens on cleanup, so that the person removes the
+    // profile and turns the proxy off, and finishes the job without the key.
+    assert!(lock(&s.authority).is_none(), "the key is dropped");
     assert!(dir.path().join("session.json").exists());
     s.on_exit(); // twice is fine
     drop(s);
-    let next = session(dir.path(), store.clone());
+    let next = session(dir.path());
     assert!(next.get_state(&loopback()).resume_cleanup);
     assert_eq!(next.get_state(&loopback()).step, Step::Cleanup);
     next.cleanup().await.unwrap();
     next.finish().await.unwrap();
-    assert_eq!(store.load().unwrap(), None);
+    assert!(!dir.path().join("session.json").exists());
+    assert!(!next.get_state(&loopback()).resume_cleanup);
 }
 
 /// A handle on the certificate authority the session holds, that does not keep it alive: once
@@ -526,7 +522,7 @@ fn held_authority(s: &Session) -> std::sync::Weak<Authority> {
 #[tokio::test]
 async fn closing_the_app_drops_the_certificate_key_from_memory() {
     let dir = tempfile::tempdir().unwrap();
-    let s = session(dir.path(), Arc::new(MemoryKeyStore::new()));
+    let s = session(dir.path());
     s.tune_proxy(0, None);
     s.start_proxy(Some("127.0.0.1"), &loopback(), no_emit())
         .await
@@ -551,7 +547,7 @@ async fn closing_the_app_drops_the_certificate_key_from_memory() {
 #[tokio::test]
 async fn start_proxy_is_idempotent_and_moves_only_while_nothing_is_captured() {
     let dir = tempfile::tempdir().unwrap();
-    let s = session(dir.path(), Arc::new(MemoryKeyStore::new()));
+    let s = session(dir.path());
     s.tune_proxy(0, None);
     let net = two_addresses();
 
@@ -616,8 +612,7 @@ async fn start_proxy_is_idempotent_and_moves_only_while_nothing_is_captured() {
 #[tokio::test]
 async fn restart_proxy_starts_over_with_the_same_certificate() {
     let dir = tempfile::tempdir().unwrap();
-    let store = Arc::new(MemoryKeyStore::new());
-    let s = session(dir.path(), store.clone());
+    let s = session(dir.path());
     s.tune_proxy(0, None);
     let net = two_addresses();
 
@@ -628,7 +623,7 @@ async fn restart_proxy_starts_over_with_the_same_certificate() {
         .unwrap();
     assert_eq!(first.ip, "127.0.0.1");
     let certificate = s.ensure_ca().await.unwrap().cert_der();
-    let key = store.load().unwrap();
+    let authority = held_authority(&s);
 
     *lock(&s.unlocked) = Some(Arc::new(unlocked_one()));
     s.bw_login(Box::new(FakeBw::new()), login_input())
@@ -664,7 +659,10 @@ async fn restart_proxy_starts_over_with_the_same_certificate() {
         certificate,
         "the device keeps the certificate it installed"
     );
-    assert_eq!(store.load().unwrap(), key);
+    assert!(
+        Arc::ptr_eq(&authority.upgrade().unwrap(), &s.ensure_ca().await.unwrap()),
+        "the same authority, key and all"
+    );
     // A fresh proxy holds no backup.
     assert!(s.unlock(password("hunter2")).await.is_err());
 
@@ -680,7 +678,7 @@ async fn restart_proxy_starts_over_with_the_same_certificate() {
 #[tokio::test]
 async fn the_proxy_is_told_every_address_of_this_computer() {
     let dir = tempfile::tempdir().unwrap();
-    let s = session(dir.path(), Arc::new(MemoryKeyStore::new()));
+    let s = session(dir.path());
     // No test upstream: the production destination rules apply.
     s.tune_proxy(0, None);
     let mut net = loopback();
@@ -716,7 +714,7 @@ async fn the_proxy_is_told_every_address_of_this_computer() {
 #[tokio::test]
 async fn unlock_command_maps_wrong_password_to_error_variant() {
     let dir = tempfile::tempdir().unwrap();
-    let s = session(dir.path(), Arc::new(MemoryKeyStore::new()));
+    let s = session(dir.path());
     let result = s
         .unlock_backup(fixture_backup(), password("not the password"))
         .await
@@ -734,7 +732,7 @@ async fn unlock_command_maps_wrong_password_to_error_variant() {
 #[tokio::test]
 async fn unlock_with_the_right_password_returns_the_summary_and_keeps_secrets_in_memory() {
     let dir = tempfile::tempdir().unwrap();
-    let s = session(dir.path(), Arc::new(MemoryKeyStore::new()));
+    let s = session(dir.path());
     let result = s
         .unlock_backup(fixture_backup(), password("hunter2"))
         .await
@@ -762,7 +760,7 @@ async fn unlock_with_the_right_password_returns_the_summary_and_keeps_secrets_in
 #[tokio::test]
 async fn unlock_before_any_backup_is_an_error_not_a_wrong_password() {
     let dir = tempfile::tempdir().unwrap();
-    let s = session(dir.path(), Arc::new(MemoryKeyStore::new()));
+    let s = session(dir.path());
     assert!(s
         .unlock_backup(CapturedBackup::default(), password("x"))
         .await
@@ -775,7 +773,7 @@ async fn unlock_before_any_backup_is_an_error_not_a_wrong_password() {
 #[tokio::test(flavor = "current_thread")]
 async fn unlocking_does_not_hold_up_the_rest_of_the_app() {
     let dir = tempfile::tempdir().unwrap();
-    let s = session(dir.path(), Arc::new(MemoryKeyStore::new()));
+    let s = session(dir.path());
     // The round count of a real backup. (The fixture was encrypted with 1000, so this is a
     // "wrong password"; the work is the same.)
     let mut backup = fixture_backup();
@@ -809,7 +807,7 @@ async fn unlocking_does_not_hold_up_the_rest_of_the_app() {
 #[tokio::test]
 async fn an_unlock_that_finishes_after_a_start_over_keeps_nothing() {
     let dir = tempfile::tempdir().unwrap();
-    let s = session(dir.path(), Arc::new(MemoryKeyStore::new()));
+    let s = session(dir.path());
     // The right password: it would be kept, had nothing happened meanwhile. The start-over
     // lands while the key derivation is on the blocking pool.
     let unlocking = s.unlock_backup(fixture_backup(), password("hunter2"));
@@ -1049,7 +1047,7 @@ fn a_symbolic_link_at_the_temporary_name_is_refused_not_followed() {
 #[tokio::test]
 async fn export_prepares_the_files_and_refuses_google() {
     let dir = tempfile::tempdir().unwrap();
-    let s = session(dir.path(), Arc::new(MemoryKeyStore::new()));
+    let s = session(dir.path());
     assert!(
         s.prepare_export(DestinationDto::Bitwarden).is_err(),
         "locked"
@@ -1070,7 +1068,7 @@ async fn export_prepares_the_files_and_refuses_google() {
 #[test]
 fn google_unsupported_lists_what_the_qr_codes_cannot_carry() {
     let dir = tempfile::tempdir().unwrap();
-    let s = session(dir.path(), Arc::new(MemoryKeyStore::new()));
+    let s = session(dir.path());
     *lock(&s.unlocked) = Some(Arc::new(Unlocked {
         tokens: vec![
             token("1", "Six Digits", 6),
@@ -1106,7 +1104,7 @@ fn decide(token: &str, decision: DecisionDto) -> DecisionEntry {
 #[tokio::test]
 async fn propose_joins_candidates_against_the_vault() {
     let dir = tempfile::tempdir().unwrap();
-    let s = session(dir.path(), Arc::new(MemoryKeyStore::new()));
+    let s = session(dir.path());
     *lock(&s.unlocked) = Some(Arc::new(unlocked_one()));
     s.bw_login(Box::new(FakeBw::new()), login_input())
         .await
@@ -1137,7 +1135,7 @@ async fn propose_joins_candidates_against_the_vault() {
 #[tokio::test]
 async fn apply_attaches_to_any_login_without_a_code_and_refuses_the_rest_whole() {
     let dir = tempfile::tempdir().unwrap();
-    let s = session(dir.path(), Arc::new(MemoryKeyStore::new()));
+    let s = session(dir.path());
     let mut sample = token("2", "Sample", 6);
     sample.secret = Secret::new("GEZDGNBVGY3TQOJQGEZDGNBVGY3TQOJQ".into());
     *lock(&s.unlocked) = Some(Arc::new(Unlocked {
@@ -1257,7 +1255,7 @@ async fn apply_attaches_to_any_login_without_a_code_and_refuses_the_rest_whole()
 async fn a_login_that_already_holds_this_very_code_may_be_chosen_again() {
     use authexodus_core::bitwarden::CodeMark;
     let dir = tempfile::tempdir().unwrap();
-    let s = session(dir.path(), Arc::new(MemoryKeyStore::new()));
+    let s = session(dir.path());
     *lock(&s.unlocked) = Some(Arc::new(unlocked_one()));
     // An earlier run attached the code; the vault, read again since, says so.
     let mut bw = FakeBw::new();
@@ -1289,7 +1287,7 @@ async fn a_login_that_already_holds_this_very_code_may_be_chosen_again() {
 #[tokio::test]
 async fn bw_login_that_needs_two_factor_keeps_no_client() {
     let dir = tempfile::tempdir().unwrap();
-    let s = session(dir.path(), Arc::new(MemoryKeyStore::new()));
+    let s = session(dir.path());
     let mut bw = FakeBw::new();
     bw.outcome = LoginOutcome::NeedsTwoFactor;
     let r = s
@@ -1307,7 +1305,7 @@ async fn bw_login_that_needs_two_factor_keeps_no_client() {
 #[tokio::test]
 async fn a_second_sign_in_wipes_the_first() {
     let dir = tempfile::tempdir().unwrap();
-    let s = session(dir.path(), Arc::new(MemoryKeyStore::new()));
+    let s = session(dir.path());
     *lock(&s.unlocked) = Some(Arc::new(unlocked_one()));
     let first = FakeBw::new();
     s.bw_login(Box::new(first.clone()), login_input())
@@ -1352,8 +1350,7 @@ async fn a_second_sign_in_wipes_the_first() {
 #[tokio::test]
 async fn cleanup_stops_a_sign_in_that_is_under_way_and_nothing_of_it_is_left() {
     let dir = tempfile::tempdir().unwrap();
-    let store = Arc::new(MemoryKeyStore::new());
-    let s = Arc::new(session(dir.path(), store));
+    let s = Arc::new(session(dir.path()));
     let (bw, entered, _release) = FakeBw::new().held();
     let bw_data = dir.path().join("bw-data");
 
@@ -1386,7 +1383,7 @@ async fn cleanup_stops_a_sign_in_that_is_under_way_and_nothing_of_it_is_left() {
 #[tokio::test]
 async fn a_sign_in_overtaken_by_the_app_closing_keeps_no_client() {
     let dir = tempfile::tempdir().unwrap();
-    let s = Arc::new(session(dir.path(), Arc::new(MemoryKeyStore::new())));
+    let s = Arc::new(session(dir.path()));
     // A client that does not notice it was told to stop: it answers "signed in" anyway.
     struct Deaf(FakeBw);
     #[async_trait]
@@ -1457,7 +1454,7 @@ async fn a_sign_in_overtaken_by_the_app_closing_keeps_no_client() {
 #[tokio::test]
 async fn sign_ins_run_one_at_a_time() {
     let dir = tempfile::tempdir().unwrap();
-    let s = Arc::new(session(dir.path(), Arc::new(MemoryKeyStore::new())));
+    let s = Arc::new(session(dir.path()));
     let (first, entered, release) = FakeBw::new().held();
     let one = {
         let s = Arc::clone(&s);
@@ -1513,128 +1510,10 @@ fn decisions_and_login_deserialise_from_the_ui_shapes() {
 // ---------------------------------------------------------------------------------------------
 // Final review fixes
 
-/// A key store whose deletion can be made to fail, as a Keychain item can refuse to go.
-#[derive(Default)]
-struct StubbornStore {
-    inner: MemoryKeyStore,
-    refuse_delete: AtomicBool,
-    /// Whether the marker file existed at the moment the key was stored.
-    marker_when_stored: Mutex<Vec<bool>>,
-    marker: Mutex<Option<PathBuf>>,
-}
-
-impl KeyStore for StubbornStore {
-    fn store(&self, blob: &[u8]) -> Result<(), CaError> {
-        if let Some(marker) = lock(&self.marker).as_ref() {
-            lock(&self.marker_when_stored).push(marker.exists());
-        }
-        self.inner.store(blob)
-    }
-    fn delete(&self) -> Result<(), CaError> {
-        // Like the Keychain: an item that is gone is deleted already, refusal or not.
-        let present = self.inner.load()?.is_some();
-        if present && self.refuse_delete.load(Ordering::SeqCst) {
-            return Err(CaError::Store("User interaction is not allowed.".into()));
-        }
-        self.inner.delete()
-    }
-}
-
-#[tokio::test]
-async fn the_marker_is_on_disk_before_the_key_is_stored() {
-    let dir = tempfile::tempdir().unwrap();
-    let store = Arc::new(StubbornStore::default());
-    *lock(&store.marker) = Some(dir.path().join("session.json"));
-    let s = Session::new(store.clone(), dir.path().to_path_buf());
-    s.ensure_ca().await.unwrap();
-    assert_eq!(
-        *lock(&store.marker_when_stored),
-        [true],
-        "a crash between the two can only leave a marker without a key, never the reverse"
-    );
-}
-
-#[tokio::test]
-async fn a_key_that_will_not_go_is_reported_with_the_way_to_remove_it_by_hand() {
-    let dir = tempfile::tempdir().unwrap();
-    let store = Arc::new(StubbornStore::default());
-    let s = Session::new(store.clone(), dir.path().to_path_buf());
-    s.tune_proxy(0, None);
-    let info = s
-        .start_proxy(Some("127.0.0.1"), &loopback(), no_emit())
-        .await
-        .unwrap();
-    *lock(&s.unlocked) = Some(Arc::new(unlocked_one()));
-    let bw = FakeBw::new();
-    s.bw_login(Box::new(bw.clone()), login_input())
-        .await
-        .unwrap();
-    std::fs::create_dir_all(dir.path().join("bw-data")).unwrap();
-    store.refuse_delete.store(true, Ordering::SeqCst);
-
-    let error = s.cleanup().await.unwrap_err();
-    assert_eq!(error, CmdError(Reject::CleanupKeychainFailed));
-    assert!(error
-        .to_string()
-        .starts_with("cleanup_keychain_failed: The certificate key could not be removed"));
-    assert!(error.sentence().contains("Keychain Access"), "{error}");
-    assert!(
-        error.sentence().contains("\"dev.somecorp.authexodus\""),
-        "{error}"
-    );
-    assert!(
-        !error.to_string().contains("User interaction"),
-        "what the key store said is for the log: {error}"
-    );
-
-    // Everything else was still done.
-    assert!(s.proxy.lock().await.is_none(), "the proxy is stopped");
-    assert!(TcpStream::connect((Ipv4Addr::LOCALHOST, info.port))
-        .await
-        .is_err());
-    assert!(bw.was_wiped());
-    assert!(!dir.path().join("bw-data").exists(), "Bitwarden data wiped");
-    assert!(lock(&s.unlocked).is_none());
-    // Nothing can be finished while the key is there, whatever the person ticked: finish
-    // says why, with the same code, and the marker stays for the next launch.
-    for _ in 0..2 {
-        assert_eq!(
-            s.finish().await.unwrap_err(),
-            CmdError(Reject::CleanupKeychainFailed)
-        );
-        assert_eq!(
-            s.finish().await.unwrap_err().code(),
-            ErrorCode::CleanupKeychainFailed
-        );
-        assert!(dir.path().join("session.json").exists());
-        assert!(
-            store.inner.load().unwrap().is_some(),
-            "the key is still there"
-        );
-        let state = s.get_state(&loopback());
-        assert_eq!(state.step, Step::Cleanup, "not done");
-    }
-    // The same on the next launch, which has only the marker and the key to go by.
-    let next = Session::new(store.clone(), dir.path().to_path_buf());
-    assert!(next.get_state(&loopback()).resume_cleanup);
-    assert_eq!(
-        next.finish().await.unwrap_err(),
-        CmdError(Reject::CleanupKeychainFailed)
-    );
-    assert!(next.get_state(&loopback()).resume_cleanup);
-    assert!(dir.path().join("session.json").exists());
-
-    // Once the person has removed it by hand, cleanup and finish go through.
-    store.inner.delete().unwrap();
-    s.cleanup().await.unwrap();
-    s.finish().await.unwrap();
-    assert!(!dir.path().join("session.json").exists());
-}
-
 #[tokio::test]
 async fn sign_in_input_is_checked_before_the_tool_is_asked() {
     let dir = tempfile::tempdir().unwrap();
-    let s = session(dir.path(), Arc::new(MemoryKeyStore::new()));
+    let s = session(dir.path());
     let bw = FakeBw::new();
     for (input, message) in [
         (
@@ -1694,7 +1573,7 @@ async fn sign_in_input_is_checked_before_the_tool_is_asked() {
 #[tokio::test]
 async fn a_refused_two_step_code_is_its_own_answer_and_unsupported_methods_say_so() {
     let dir = tempfile::tempdir().unwrap();
-    let s = session(dir.path(), Arc::new(MemoryKeyStore::new()));
+    let s = session(dir.path());
     let with_code = || -> BwLoginInput {
         serde_json::from_str(
             r#"{"email":"a@example.com","password":"pw","region":{"kind":"us"},"twoFactorCode":" 123456 "}"#,
@@ -1786,11 +1665,7 @@ fn the_unconstrained_root_is_only_ever_asked_for_by_name() {
 async fn the_proxy_serves_the_certificate_whose_fingerprint_it_reports() {
     for constrained in [true, false] {
         let dir = tempfile::tempdir().unwrap();
-        let s = Session::with_ca_mode(
-            Arc::new(MemoryKeyStore::new()),
-            dir.path().to_path_buf(),
-            constrained,
-        );
+        let s = Session::with_ca_mode(dir.path().to_path_buf(), constrained);
         assert_eq!(s.ca_is_constrained(), constrained);
         s.tune_proxy(0, None);
         let info = s
@@ -1819,7 +1694,7 @@ async fn the_proxy_serves_the_certificate_whose_fingerprint_it_reports() {
 #[tokio::test]
 async fn the_proxy_never_listens_where_the_internet_can_reach_it() {
     let dir = tempfile::tempdir().unwrap();
-    let s = session(dir.path(), Arc::new(MemoryKeyStore::new()));
+    let s = session(dir.path());
     s.tune_proxy(0, None);
     // A computer whose only usable address is public (as if plugged straight into a modem).
     let public_only = Network {
@@ -1873,7 +1748,7 @@ async fn the_proxy_never_listens_where_the_internet_can_reach_it() {
 #[tokio::test]
 async fn a_start_over_without_an_address_stays_on_the_one_in_use() {
     let dir = tempfile::tempdir().unwrap();
-    let s = session(dir.path(), Arc::new(MemoryKeyStore::new()));
+    let s = session(dir.path());
     s.tune_proxy(0, None);
     let net = two_addresses();
     // The person chose the second address, not the first.
@@ -1923,62 +1798,34 @@ fn a_code_and_its_seconds_left_come_from_the_same_instant() {
     }
 }
 
-/// A key store that says which of its operations were used.
-#[derive(Default)]
-struct WatchedStore {
-    inner: MemoryKeyStore,
-    calls: Mutex<Vec<&'static str>>,
-}
-
-impl KeyStore for WatchedStore {
-    fn store(&self, blob: &[u8]) -> Result<(), CaError> {
-        lock(&self.calls).push("store");
-        self.inner.store(blob)
-    }
-    fn delete(&self) -> Result<(), CaError> {
-        lock(&self.calls).push("delete");
-        self.inner.delete()
-    }
-}
-
 #[tokio::test]
-async fn a_stored_key_is_never_read_only_replaced_or_deleted() {
+async fn a_launch_after_a_quit_never_finds_the_old_key_and_a_new_run_gets_a_new_one() {
     let dir = tempfile::tempdir().unwrap();
-    let store = Arc::new(WatchedStore::default());
-    // Something was in the store before the run began (planted, or left by a crash).
-    store.inner.store(b"planted before the run").unwrap();
-
-    // A new run: the old item is deleted and a new one made. It is not looked at.
-    let s = Session::new(store.clone(), dir.path().to_path_buf());
+    let s = session(dir.path());
     s.tune_proxy(0, None);
     s.start_proxy(Some("127.0.0.1"), &loopback(), no_emit())
         .await
         .unwrap();
-    s.restart_proxy(None, &loopback(), no_emit()).await.unwrap();
-    assert_eq!(*lock(&store.calls), ["delete", "store"]);
-    assert_ne!(
-        store.inner.load().unwrap().unwrap(),
-        b"planted before the run"
-    );
+    let installed = s.ensure_ca().await.unwrap().cert_der();
     s.on_exit();
     drop(s);
 
-    // The next launch finds the marker. All it does with the key is delete it.
-    lock(&store.calls).clear();
-    let resumed = Session::new(store.clone(), dir.path().to_path_buf());
+    // The next launch opens on cleanup with nothing of the old key: cleanup and finish go
+    // through without it.
+    let resumed = session(dir.path());
     assert!(resumed.get_state(&loopback()).resume_cleanup);
+    assert!(lock(&resumed.authority).is_none());
     resumed.cleanup().await.unwrap();
     resumed.finish().await.unwrap();
-    assert_eq!(*lock(&store.calls), ["delete"]);
-    assert_eq!(store.inner.load().unwrap(), None);
 
-    // Finishing without having cleaned up deletes too, and still reads nothing.
-    lock(&store.calls).clear();
-    let again = Session::new(store.clone(), dir.path().to_path_buf());
-    again.ensure_ca().await.unwrap();
-    again.finish().await.unwrap();
-    assert_eq!(*lock(&store.calls), ["delete", "store", "delete"]);
-    assert_eq!(store.inner.load().unwrap(), None);
+    // A new run makes a new root: the certificate left on the device is never served again.
+    let next = session(dir.path());
+    next.tune_proxy(0, None);
+    next.start_proxy(Some("127.0.0.1"), &loopback(), no_emit())
+        .await
+        .unwrap();
+    assert_ne!(next.ensure_ca().await.unwrap().cert_der(), installed);
+    next.cleanup().await.unwrap();
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -2019,7 +1866,7 @@ async fn awake_pid(s: &Session) -> Option<u32> {
 #[tokio::test]
 async fn the_state_says_what_the_shell_knows_so_a_reloaded_window_can_carry_on() {
     let dir = tempfile::tempdir().unwrap();
-    let s = session(dir.path(), Arc::new(MemoryKeyStore::new()));
+    let s = session(dir.path());
     s.tune_proxy(0, None);
     let net = loopback();
 
@@ -2110,7 +1957,7 @@ async fn the_state_says_what_the_shell_knows_so_a_reloaded_window_can_carry_on()
 async fn a_backup_of_only_authy_native_tokens_unlocks_to_their_names_without_a_password() {
     use authexodus_core::types::NativeApp;
     let dir = tempfile::tempdir().unwrap();
-    let s = session(dir.path(), Arc::new(MemoryKeyStore::new()));
+    let s = session(dir.path());
     let native_only = CapturedBackup {
         tokens: vec![],
         native_apps: vec![
@@ -2155,7 +2002,7 @@ async fn a_backup_of_only_authy_native_tokens_unlocks_to_their_names_without_a_p
         .unwrap_err();
     assert_eq!(nothing, CmdError(Reject::BackupNotArrived));
     assert_eq!(nothing.code().as_str(), "no_backup");
-    let fresh = session(dir.path(), Arc::new(MemoryKeyStore::new()));
+    let fresh = session(dir.path());
     assert_eq!(
         fresh
             .unlock(password("x"))
@@ -2178,7 +2025,7 @@ async fn a_backup_of_only_authy_native_tokens_unlocks_to_their_names_without_a_p
 #[tokio::test]
 async fn a_code_that_cannot_be_drawn_is_an_error_not_an_empty_picture() {
     let dir = tempfile::tempdir().unwrap();
-    let s = session(dir.path(), Arc::new(MemoryKeyStore::new()));
+    let s = session(dir.path());
     assert_eq!(s.token_qr("1").unwrap_err(), CmdError(Reject::NotUnlocked));
     assert_eq!(s.token_qr("1").unwrap_err().code().as_str(), "not_unlocked");
 
@@ -2257,7 +2104,7 @@ async fn an_address_missing_from_one_look_only_is_not_a_change() {
 #[tokio::test]
 async fn a_changed_address_is_noticed_once_and_the_stale_proxy_is_not_described_again() {
     let dir = tempfile::tempdir().unwrap();
-    let s = session(dir.path(), Arc::new(MemoryKeyStore::new()));
+    let s = session(dir.path());
     s.tune_proxy(0, None);
     let own = Arc::new(Mutex::new(vec![IpAddr::V4(Ipv4Addr::LOCALHOST)]));
     let source = Arc::clone(&own);
@@ -2341,7 +2188,7 @@ async fn a_changed_address_is_noticed_once_and_the_stale_proxy_is_not_described_
 #[tokio::test]
 async fn the_computer_is_kept_awake_exactly_while_the_proxy_runs() {
     let dir = tempfile::tempdir().unwrap();
-    let s = session(dir.path(), Arc::new(MemoryKeyStore::new()));
+    let s = session(dir.path());
     s.tune_proxy(0, None);
     s.tune_keep_awake(sleeper());
     let net = two_addresses();
@@ -2410,7 +2257,7 @@ fn api_key_input() -> BwLoginInput {
 #[tokio::test]
 async fn an_api_key_signs_in_by_the_key_and_unlocks_with_the_password() {
     let dir = tempfile::tempdir().unwrap();
-    let s = session(dir.path(), Arc::new(MemoryKeyStore::new()));
+    let s = session(dir.path());
     *lock(&s.unlocked) = Some(Arc::new(unlocked_one()));
     let bw = FakeBw::new();
     let result = s
@@ -2459,7 +2306,7 @@ async fn an_api_key_signs_in_by_the_key_and_unlocks_with_the_password() {
 #[tokio::test]
 async fn an_ended_session_is_its_own_error_and_the_choices_survive_signing_in_again() {
     let dir = tempfile::tempdir().unwrap();
-    let s = session(dir.path(), Arc::new(MemoryKeyStore::new()));
+    let s = session(dir.path());
     let mut second = token("2", "Sample", 6);
     second.secret = Secret::new("GEZDGNBVGY3TQOJQGEZDGNBVGY3TQOJQ".into());
     *lock(&s.unlocked) = Some(Arc::new(Unlocked {
@@ -2651,7 +2498,7 @@ fn names_under(dir: &Path) -> Vec<String> {
 #[tokio::test]
 async fn preparing_the_tool_reports_progress_in_plain_lines() {
     let dir = tempfile::tempdir().unwrap();
-    let s = session(dir.path(), Arc::new(MemoryKeyStore::new()));
+    let s = session(dir.path());
     assert_eq!(
         s.new_cli_client().err(),
         Some(CmdError(Reject::BwNotPrepared))
@@ -2700,7 +2547,7 @@ async fn preparing_the_tool_reports_progress_in_plain_lines() {
 #[tokio::test]
 async fn a_download_or_a_sign_in_can_be_stopped_and_leaves_nothing() {
     let dir = tempfile::tempdir().unwrap();
-    let s = Arc::new(session(dir.path(), Arc::new(MemoryKeyStore::new())));
+    let s = Arc::new(session(dir.path()));
     // With nothing under way, stopping is a no-op, as often as it is asked.
     s.bw_cancel().await;
     s.bw_cancel().await;
@@ -2783,13 +2630,12 @@ async fn the_downloaded_tool_is_removed_and_finish_leaves_the_data_folder_empty(
     let dir = tempfile::tempdir().unwrap();
     let data = dir.path().join("app-data");
     std::fs::create_dir(&data).unwrap();
-    let store = Arc::new(MemoryKeyStore::new());
     let zip = bw_zip(b"#!/bin/sh\necho pretend bw\n");
     let base = download_server(zip.clone(), zip.len()).await;
-    let prepared = |store: Arc<MemoryKeyStore>| {
+    let prepared = || {
         let (base, hash, data) = (base.clone(), sha256_hex(&zip), data.clone());
         async move {
-            let s = session(&data, store);
+            let s = session(&data);
             s.tune_proxy(0, None);
             s.tune_bw_download(&base, "bw-test.zip", &hash);
             s.start_proxy(Some("127.0.0.1"), &loopback(), no_emit())
@@ -2804,7 +2650,7 @@ async fn the_downloaded_tool_is_removed_and_finish_leaves_the_data_folder_empty(
     };
 
     // Cleanup removes the tool; finish then leaves nothing of the app's own making.
-    let s = prepared(store.clone()).await;
+    let s = prepared().await;
     s.cleanup().await.unwrap();
     assert_eq!(
         names_in(&data),
@@ -2817,16 +2663,15 @@ async fn the_downloaded_tool_is_removed_and_finish_leaves_the_data_folder_empty(
     );
     s.finish().await.unwrap();
     assert_eq!(names_in(&data), Vec::<String>::new());
-    assert_eq!(store.load().unwrap(), None);
 
     // Finish without a cleanup first does the same.
-    let s = prepared(store.clone()).await;
+    let s = prepared().await;
     s.finish().await.unwrap();
     assert_eq!(names_in(&data), Vec::<String>::new());
 
     // Closing the app mid-flow removes the tool too; the marker stays for the next launch,
     // whose cleanup has nothing of Bitwarden's left to find.
-    let s = prepared(store.clone()).await;
+    let s = prepared().await;
     s.on_exit();
     assert_eq!(names_in(&data), ["session.json"]);
     drop(s);
@@ -2836,7 +2681,7 @@ async fn the_downloaded_tool_is_removed_and_finish_leaves_the_data_folder_empty(
     std::fs::create_dir_all(data.join("bw-cli")).unwrap();
     std::fs::write(data.join("bw-cli").join("bw"), b"left by a crash").unwrap();
     std::fs::create_dir_all(data.join("bw-data")).unwrap();
-    let resumed = session(&data, store.clone());
+    let resumed = session(&data);
     assert!(resumed.get_state(&loopback()).resume_cleanup);
     assert_eq!(names_in(&data), ["session.json"]);
     // Something puts the folder back before the cleanup runs: cleanup removes it itself.
@@ -2846,7 +2691,6 @@ async fn the_downloaded_tool_is_removed_and_finish_leaves_the_data_folder_empty(
     assert_eq!(names_in(&data), ["session.json"]);
     resumed.finish().await.unwrap();
     assert_eq!(names_in(&data), Vec::<String>::new());
-    assert_eq!(store.load().unwrap(), None);
 }
 
 #[cfg(unix)]
@@ -2854,7 +2698,7 @@ async fn the_downloaded_tool_is_removed_and_finish_leaves_the_data_folder_empty(
 async fn a_tool_that_cannot_be_removed_fails_the_cleanup_in_a_full_sentence() {
     use std::os::unix::fs::PermissionsExt;
     let dir = tempfile::tempdir().unwrap();
-    let s = session(dir.path(), Arc::new(MemoryKeyStore::new()));
+    let s = session(dir.path());
     s.ensure_ca().await.unwrap();
     // A folder that cannot be emptied: its owner may not write to it.
     let tool = dir.path().join("bw-cli");
