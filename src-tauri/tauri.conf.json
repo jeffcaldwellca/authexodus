@@ -30,7 +30,7 @@
     "category": "Utility",
     "shortDescription": "Guided Authy export",
     "copyright": "Copyright (c) 2026 Jeff Caldwell",
-    "license": "MIT",
+    "license": "GPL-3.0-only",
     "macOS": {
       "minimumSystemVersion": "11.0"
     },

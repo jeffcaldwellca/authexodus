@@ -187,7 +187,9 @@ Neither project is affiliated with authexodus, and they are not responsible for 
 
 ## Licence
 
-MIT. See [LICENSE](LICENSE).
+Copyright (c) 2026 Jeff Caldwell.
+
+authexodus is free software: you can redistribute it and/or modify it under the terms of the GNU General Public License, version 3, as published by the Free Software Foundation. It is distributed in the hope that it will be useful, but WITHOUT ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See [LICENSE](LICENSE) for the full text.
 
 ## More
 
