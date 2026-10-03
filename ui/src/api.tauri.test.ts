@@ -199,13 +199,18 @@ describe("api.tauri", () => {
 
   it("a listen that fails to register is not an unhandled rejection, and is reported for the screen", async () => {
     const consoleError = vi.spyOn(console, "error").mockImplementation(() => undefined);
-    const heard = vi.fn();
-    const stop = onListenFailure(heard);
+    const progress = vi.fn();
+    const events = vi.fn();
+    const stops = [onListenFailure("bw-progress", progress), onListenFailure("proxy-event", events)];
     listen.mockRejectedValue(new Error("no event system"));
     const off = createTauriApi().onBwProgress(() => undefined);
-    await vi.waitFor(() => expect(heard).toHaveBeenCalledTimes(1));
+    await vi.waitFor(() => expect(progress).toHaveBeenCalledTimes(1));
+    // Only the subscription that failed is reported: the proxy's events still arrive.
+    expect(events).not.toHaveBeenCalled();
     expect(() => off()).not.toThrow();
-    stop();
+    createTauriApi().onProxyEvent(() => undefined);
+    await vi.waitFor(() => expect(events).toHaveBeenCalledTimes(1));
+    for (const stop of stops) stop();
     consoleError.mockRestore();
   });
 });

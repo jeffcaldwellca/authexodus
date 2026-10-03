@@ -27,7 +27,7 @@ describe("the window not hearing from the shell", () => {
     resetListenFailure();
     await walkTo("connect");
     expect(screen.queryByText(en.common.listenFailed)).not.toBeInTheDocument();
-    act(() => reportListenFailure());
+    act(() => reportListenFailure("proxy-event"));
     const alert = await screen.findByRole("alert");
     expect(within(alert).getByText(en.common.listenFailed)).toBeInTheDocument();
     expect(en.common.listenFailed).toBe("The app cannot hear from its own background part. Quit and open it again.");
@@ -36,9 +36,24 @@ describe("the window not hearing from the shell", () => {
 
   it("a failure that came before the window was drawn is shown too", async () => {
     resetListenFailure();
-    reportListenFailure();
+    reportListenFailure("proxy-event");
     await mountApp();
     expect(within(screen.getByRole("alert")).getByText(en.common.listenFailed)).toBeInTheDocument();
+    resetListenFailure();
+  });
+});
+
+describe("progress lines not arriving", () => {
+  it("a failed listen for Bitwarden's progress only notes it on the Bitwarden screen, with no app-wide panel", async () => {
+    resetListenFailure();
+    const { user } = await walkTo("destination", { hold: { bwPrepare: true } });
+    act(() => reportListenFailure("bw-progress"));
+    expect(screen.queryByText(en.common.listenFailed)).not.toBeInTheDocument();
+    await user.click(screen.getByRole("button", { name: new RegExp(en.destination.options.bitwarden.title) }));
+    await user.click(screen.getByRole("button", { name: en.bitwarden.prepare }));
+    expect(await screen.findByText(en.bitwarden.progressUnavailable)).toBeInTheDocument();
+    expect(screen.queryByText(en.common.listenFailed)).not.toBeInTheDocument();
+    expect(screen.queryByRole("alert")).not.toBeInTheDocument();
     resetListenFailure();
   });
 });

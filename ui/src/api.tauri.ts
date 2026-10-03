@@ -7,10 +7,10 @@ import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 import type { Api, ProxyEvent } from "./api";
 import { ApiError, isErrorCode, unexplained } from "./api.errors";
-import { reportListenFailure } from "./listenFailure";
+import { reportListenFailure, type ShellEvent } from "./listenFailure";
 
-export const PROXY_EVENT = "proxy-event";
-export const BW_PROGRESS_EVENT = "bw-progress";
+export const PROXY_EVENT: ShellEvent = "proxy-event";
+export const BW_PROGRESS_EVENT: ShellEvent = "bw-progress";
 
 /**
  * The one place a rejection is read. The shell rejects with "<code>: <plain sentence>". A
@@ -37,7 +37,7 @@ async function call<T>(command: string, args?: Record<string, unknown>): Promise
  * Subscribe to a shell event. `listen` is asynchronous, but the returned unsubscribe works at
  * any time: called before the listener is registered, it drops the listener the moment it is.
  */
-function subscribe<T>(event: string, cb: (payload: T) => void): () => void {
+function subscribe<T>(event: ShellEvent, cb: (payload: T) => void): () => void {
   let stopped = false;
   let unlisten: (() => void) | null = null;
   listen<T>(event, (e) => { if (!stopped) cb(e.payload); })
@@ -46,7 +46,7 @@ function subscribe<T>(event: string, cb: (payload: T) => void): () => void {
     // and a development build keeps the reason for whoever is fixing it.
     .catch((err: unknown) => {
       if (import.meta.env.DEV) console.error(`Could not listen for ${event}:`, err);
-      reportListenFailure();
+      reportListenFailure(event);
     });
   return () => {
     stopped = true;

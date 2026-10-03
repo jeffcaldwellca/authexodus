@@ -10,6 +10,7 @@ import { Dialog } from "../components/Dialog";
 import { Callout, Screen, Waiting } from "../components/ui";
 import { BitwardenServer } from "../failures/BitwardenServer";
 import { Problem } from "../failures/Problem";
+import { onListenFailure } from "../listenFailure";
 import { en } from "../strings/en";
 import { deviceLabel, type ScreenProps } from "./types";
 
@@ -142,6 +143,9 @@ export function BitwardenFlow({ api, state, tokens, onDone, onLocked }: ScreenPr
   const [loginsError, setLoginsError] = useState<ApiError | null>(null);
   const [picking, setPicking] = useState<string | null>(null);
   const [progress, setProgress] = useState<string[]>([]);
+  /** The window could not listen for progress lines: the work goes on, unseen. */
+  const [noProgress, setNoProgress] = useState(false);
+  useEffect(() => onListenFailure("bw-progress", () => setNoProgress(true)), []);
   const [report, setReport] = useState<ApplyReport | null>(null);
   const [applyError, setApplyError] = useState<ApiError | null>(null);
   const applied = useRef(false);
@@ -351,6 +355,7 @@ export function BitwardenFlow({ api, state, tokens, onDone, onLocked }: ScreenPr
             <Waiting>{t.preparing}</Waiting>
             {/* The download reports how far it is many times over: only the latest line is shown. */}
             <p className="progress-log" role="status" aria-label={t.progressLabel}>{progress.at(-1) ?? ""}</p>
+            {noProgress && <p className="quiet-text">{t.progressUnavailable}</p>}
           </>
         )}
         {prepareCancelled && <Callout tone="info"><p role="status">{t.prepareCancelled}</p></Callout>}
@@ -558,6 +563,7 @@ export function BitwardenFlow({ api, state, tokens, onDone, onLocked }: ScreenPr
   if (stage === "applying") {
     return (
       <Screen focusKey={stage} title={t.applyingTitle} footer={<><span /><Waiting>{t.applying}</Waiting></>}>
+        {noProgress && <p className="quiet-text">{t.progressUnavailable}</p>}
         <ProgressLog lines={progress} />
       </Screen>
     );

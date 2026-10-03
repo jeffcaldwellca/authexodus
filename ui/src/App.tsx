@@ -101,9 +101,10 @@ export function App({ api, devTools }: { api: Api; devTools?: ReactNode }) {
     writeKept({ device: state.device, checks: state.checks, started: !NOT_A_RUN.includes(state.step) });
   }, [loaded, state.device, state.checks, state.step]);
 
-  // The window could not subscribe to the shell's events: nothing it reports would arrive.
+  // The window could not subscribe to the connection's events: nothing it reports would
+  // arrive. (Bitwarden's progress lines failing is the Bitwarden screen's to say.)
   const [deaf, setDeaf] = useState(false);
-  useEffect(() => onListenFailure(() => setDeaf(true)), []);
+  useEffect(() => onListenFailure("proxy-event", () => setDeaf(true)), []);
 
   useEffect(() => {
     const stop = load();

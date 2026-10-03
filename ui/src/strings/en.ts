@@ -475,6 +475,7 @@ export const en = {
     applyingTitle: "Updating Bitwarden",
     applying: "Adding codes to Bitwarden…",
     progressLabel: "Progress",
+    progressUnavailable: "This window cannot show how far it has got this time. The work still goes on: wait for it to finish.",
 
     reportTitle: "Bitwarden is updated",
     reportPartialTitle: "Bitwarden is partly updated",
