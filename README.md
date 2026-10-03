@@ -176,6 +176,15 @@ The workflow stops with a clear message if any of these repository secrets (Sett
 
 Before the first tag, run the real-device checklist.
 
+## Acknowledgements
+
+authexodus stands on work by others, and thanks them:
+
+- **[Authy-iOS-MiTM](https://github.com/AlexTech01/Authy-iOS-MiTM)** by AlexTech01, which showed that Authy on iOS still downloads its encrypted backup in a form you can capture and decrypt with your own backup password, and documented how. The capture, the decryption (PBKDF2-HMAC-SHA1 into AES-256-CBC) and the whole flow this app guides you through follow that guide. authexodus reimplements it in Rust rather than reusing its code.
+- **[mitmproxy](https://mitmproxy.org)**, the interactive HTTPS proxy. The method was first proven by hand with mitmproxy before this app existed, and the guided certificate install, the `mitm.it`-style download page and the per-run certificate authority all follow its lead. authexodus does not bundle or depend on mitmproxy; it runs its own small proxy that intercepts only Authy's servers.
+
+Neither project is affiliated with authexodus, and they are not responsible for it.
+
 ## Licence
 
 MIT. See [LICENSE](LICENSE).
