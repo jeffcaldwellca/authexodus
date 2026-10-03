@@ -26,6 +26,6 @@
     "jsdom": "^26",
     "typescript": "^5.6",
     "vite": "^6",
-    "vitest": "^3"
+    "vitest": "^4.1.11"
   }
 }
