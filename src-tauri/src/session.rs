@@ -23,7 +23,7 @@ use authexodus_core::backup;
 use authexodus_core::bitwarden::{
     self, BwClient, BwError, Cancel, CliBinary, CliClient, CodeMark, LoginOutcome, PrepareStage,
 };
-use authexodus_core::ca::Authority;
+use authexodus_core::ca::{Authority, CaError};
 use authexodus_core::export::{self, ExportFile};
 use authexodus_core::proxy::{self, ProxyConfig, ProxyEvent, ProxyHandle, TestUpstream};
 use authexodus_core::totp;
@@ -323,6 +323,9 @@ pub struct Session {
     /// the first start of the proxy, kept across restarts (the device trusts it), and dropped
     /// by cleanup and when the app closes.
     authority: Mutex<Option<Arc<Authority>>>,
+    /// For tests: make the next certificate authority fail to be created.
+    #[cfg(test)]
+    fail_ca: AtomicBool,
     proxy: tokio::sync::Mutex<Option<ProxyRun>>,
     /// The address the proxy last ran on: where a start-over goes when none is named.
     last_ip: Mutex<Option<Ipv4Addr>>,
@@ -617,6 +620,8 @@ impl Session {
             finished: AtomicBool::new(false),
             device: Mutex::new(None),
             authority: Mutex::new(None),
+            #[cfg(test)]
+            fail_ca: AtomicBool::new(false),
             proxy: tokio::sync::Mutex::new(None),
             last_ip: Mutex::new(None),
             tuning: Mutex::new(Tuning {
@@ -767,7 +772,7 @@ impl Session {
         let had_marker = marker_exists(&self.paths);
         self.cleaned.store(false, Ordering::SeqCst);
         write_marker(&self.paths)?;
-        let ca = match Authority::create(self.constrained) {
+        let ca = match self.create_authority() {
             Ok(ca) => Arc::new(ca),
             Err(e) => {
                 if !had_marker {
@@ -792,6 +797,15 @@ impl Session {
         }
         *lock(&self.authority) = Some(Arc::clone(&ca));
         Ok(ca)
+    }
+
+    /// A new certificate authority in this launch's mode. Tests can make it fail.
+    fn create_authority(&self) -> Result<Authority, CaError> {
+        #[cfg(test)]
+        if self.fail_ca.load(Ordering::SeqCst) {
+            return Err(CaError::Certificate("refused by the test".into()));
+        }
+        Authority::create(self.constrained)
     }
 
     /// Make sure the proxy is running, on `requested` if an address is given.

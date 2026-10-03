@@ -181,6 +181,50 @@ async fn a_marker_that_cannot_be_written_means_no_key_is_made() {
 }
 
 #[tokio::test]
+async fn a_root_that_cannot_be_made_is_refused_and_takes_back_only_its_own_marker() {
+    let dir = tempfile::tempdir().unwrap();
+    let marker = dir.path().join("session.json");
+    let s = session(dir.path());
+    s.fail_ca.store(true, Ordering::SeqCst);
+
+    let error = s.ensure_ca().await.err().expect("no certificate authority");
+    assert_eq!(error, CmdError(Reject::CaNotCreated));
+    assert_eq!(error.code(), ErrorCode::Internal);
+    assert!(error.to_string().starts_with("internal: "), "{error}");
+    assert!(
+        !error.to_string().contains("refused by the test"),
+        "what went wrong in detail is for the log: {error}"
+    );
+    assert!(lock(&s.authority).is_none());
+    assert!(
+        !marker.exists(),
+        "no marker claims a certificate that was never made"
+    );
+    assert!(!session(dir.path()).get_state(&loopback()).resume_cleanup);
+}
+
+#[tokio::test]
+async fn a_root_that_cannot_be_made_on_a_resumed_launch_keeps_the_earlier_marker() {
+    let dir = tempfile::tempdir().unwrap();
+    let marker = dir.path().join("session.json");
+    session(dir.path()).ensure_ca().await.unwrap(); // a launch that quit mid-run
+    assert!(marker.exists());
+
+    let resumed = session(dir.path());
+    assert!(resumed.get_state(&loopback()).resume_cleanup);
+    resumed.fail_ca.store(true, Ordering::SeqCst);
+    assert_eq!(
+        resumed.ensure_ca().await.err(),
+        Some(CmdError(Reject::CaNotCreated))
+    );
+    assert!(
+        marker.exists(),
+        "the earlier run's certificate may still be on a device: cleanup stays due"
+    );
+    assert!(session(dir.path()).get_state(&loopback()).resume_cleanup);
+}
+
+#[tokio::test]
 async fn finish_clears_the_marker_for_the_next_launch() {
     let dir = tempfile::tempdir().unwrap();
     let s = session(dir.path());
