@@ -52,6 +52,7 @@ describe("documents", () => {
       en.bitwarden.reportPartialTitle,
       en.cleanup.title,
       en.cleanup.resumed,
+      en.cleanup.keyGone(iphone),
       en.cleanup.noInternet(iphone),
       en.cleanup.clean(iphone),
       en.cleanup.failed,
@@ -107,7 +108,10 @@ describe("documents", () => {
     expect(readme).toMatch(/Using the app never needs a terminal/);
     expect(readme).toMatch(/The app writes no log file/);
     expect(readme).toMatch(/a home or office network you control/);
-    expect(readme).toMatch(/If you quit before cleanup, the key stays in the Keychain/);
+    // The certificate's key is never stored anywhere, and the README says so.
+    expect(readme).toMatch(/The certificate's secret key exists only in the app's memory/);
+    expect(readme).toMatch(/If you quit before cleanup, the key is gone with the app/);
+    expect(readme).not.toMatch(/the key stays/);
     expect(readme).toMatch(/only codes from an authenticator app work/);
     expect(readme).toMatch(/AUTHEXODUS_LOG=debug/);
     expect(readme).toMatch(/AUTHEXODUS_UNCONSTRAINED_CA=1[^\n]*\n?[^\n]*testing aid/);
@@ -151,6 +155,10 @@ describe("documents", () => {
     ]) expect(checklist, String(needle)).toMatch(needle);
     // The old advice that could not work is gone.
     expect(checklist).not.toMatch(/`bw-cli` is expected after the Bitwarden path/);
+    // The certificate key is no longer stored, so the checklist only confirms nothing was.
+    expect(checklist).not.toMatch(/a new item appears for authexodus/);
+    expect(checklist).not.toMatch(/the authexodus item is (still there|gone)/);
+    expect(checklist).toMatch(/shows no authexodus item/);
   });
 
   it("no string claims the certificate can only be used for Authy", () => {

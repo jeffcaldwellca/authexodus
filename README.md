@@ -47,7 +47,7 @@ The method was proven by hand on 2026-10-02 (40 accounts moved).
 - Your backup password and codes are never written to disk, unless you choose to save an import file. That file has no lock on it, and the app tells you to delete it after use. (Bitwarden's tool keeps its own session data in the app's folder while you use that path; the app wipes it at cleanup and when it quits. If the app crashes or is force-quit, it is wiped the next time the app opens.)
 - It reads only Authy's API address (`api.authy.com`). Every other connection from your iPhone or iPad is passed along and is not read or recorded.
 - The app writes no log file. Diagnostic lines go to the terminal, and only if you launched the app from one. They hold request paths and status codes, this Mac's and the device's network addresses, and the certificate's fingerprint; never passwords, query strings, codes or bodies. See [Diagnostic output](#diagnostic-output).
-- The certificate's secret key is created on your Mac for each run, kept in the macOS Keychain, and destroyed at cleanup. If you quit before cleanup, the key stays in the Keychain so the app can finish the job: the next launch opens on the Clean up screen. If you never open the app again, the key stays there, and the certificate itself stops being valid after 7 days. You can delete it by hand: open Keychain Access, search for authexodus, and delete the item. Remove the certificate profile from your iPhone or iPad either way.
+- The certificate's secret key exists only in the app's memory, for one run. It is created on your Mac when the connection first starts, kept while the app is open (restarting the connection keeps the same certificate), and dropped at cleanup. It is never written to disk or to the macOS Keychain. If you quit before cleanup, the key is gone with the app, so the certificate left on your iPhone or iPad is useless: nothing can ever sign with it again, and it stops being valid after 7 days anyway. The next launch still opens on the Clean up screen, so that you remove the certificate profile and switch the proxy off on your device.
 - The app uses the certificate only to read what Authy sends. By default the certificate is also limited to Authy's addresses, so that it would be of no use for anything else; whether iOS accepts and enforces that limit is one of the things the first real-device test settles.
 
 ## Bitwarden: signing in, and choosing where each code goes
@@ -89,7 +89,7 @@ Whichever you use, check two codes against Authy before you rely on it. The app'
 
 When you press Finish on the last step, nothing of the app's own is left:
 
-- The certificate's secret key is removed from the Keychain.
+- The certificate's secret key was only ever in memory, and is gone. Nothing of it is in the Keychain.
 - The app's folder, `~/Library/Application Support/dev.somecorp.authexodus`, is emptied: the record of the unfinished run, Bitwarden's session data and the downloaded Bitwarden tool are all deleted.
 - Your codes and passwords were only ever in memory.
 
@@ -131,7 +131,7 @@ pnpm -C ui build
 pnpm tauri build --bundles app
 ```
 
-The app is then at `target/release/bundle/macos/authexodus.app`, unsigned (macOS will ask you to right-click and choose Open). `pnpm tauri build --no-bundle` builds just the binary. `pnpm tauri dev` runs it in development; note that launching it writes a key to your Keychain and opens a proxy on your network, so use it deliberately.
+The app is then at `target/release/bundle/macos/authexodus.app`, unsigned (macOS will ask you to right-click and choose Open). `pnpm tauri build --no-bundle` builds just the binary. `pnpm tauri dev` runs it in development; note that starting the connection in it creates a certificate and opens a proxy on your network, so use it deliberately.
 
 Tests:
 

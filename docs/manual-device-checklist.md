@@ -1,6 +1,6 @@
 # Manual device checklist (before v0.1.0)
 
-This is the script for the first real run of authexodus with a real Mac, a real iPhone, a real iPad and a real Authy account. Nothing in it can be done by an automated test. Until it has been done, every claim the app makes about iOS, Authy, Keychain, the firewall and the window itself is untested.
+This is the script for the first real run of authexodus with a real Mac, a real iPhone, a real iPad and a real Authy account. Nothing in it can be done by an automated test. Until it has been done, every claim the app makes about iOS, Authy, the firewall and the window itself is untested.
 
 Tick a box only when you have seen the thing happen. When something differs from what is written here, do not tick it: write what you saw in the Notes lines, and carry on if you safely can.
 
@@ -59,7 +59,6 @@ You need:
 - [ ] The throwaway Bitwarden vault described above, with Experiment A and Experiment B both prepared. Its email: ______
 - [ ] Optional: a second Authy account whose backups are switched off, on a spare device, for the empty-backup check. Skip that check if you have none.
 - [ ] An Android phone or tablet, only for the Aegis test (Aegis is Android-only).
-- [ ] Keychain Access open on the Mac (Applications > Utilities > Keychain Access), search box set to `authexodus`.
 - [ ] Finder open at `~/Library/Application Support/dev.somecorp.authexodus` (Finder > Go > Go to Folder). It may not exist yet.
 - [ ] The Mac's firewall is ON for Run 1 (System Settings, search for Firewall), so the prompt appears.
 
@@ -113,10 +112,9 @@ This is the first time the app has ever run in a real window. Everything else de
 
 - [ ] **[Provoke P1: firewall.]** When the Connect screen opens, macOS asks whether authexodus may accept incoming network connections. Exact wording of the prompt and of its two buttons ("Deny" or "Don't Allow"?): ______ Choose the one that does **not** allow it.
 - [ ] **Local network permission (macOS 15 and later).** macOS may ask whether authexodus may find and connect to devices on your local network. Did it ask: yes / no. Exact wording of the prompt and its buttons: ______ Choose Allow. If you chose not to allow it, the device cannot reach the app and nothing on screen says why: record what you saw, then allow it in System Settings > Privacy & Security > Local Network.
-- [ ] Keychain: macOS may also ask for permission to use the Keychain. Exact wording: ______
+- [ ] macOS does **not** ask for permission to use the Keychain at any point in the run (the app keeps the certificate's key in memory only). If it does, write the exact wording: ______
 - [ ] **App says**, in a strip above the heading, "Keep this window open and this Mac awake and plugged in until you finish. Do not close the lid: a sleeping Mac cuts your iPhone off from the internet." It stays there on every step up to and including Check codes.
 - [ ] Under the heading there is a small control, "Using an iPad instead?". Press it: the heading, the steps and the drawings change to the iPad's. Press "Using an iPhone instead?" to go back.
-- [ ] In Keychain Access, a new item appears for authexodus (service `dev.somecorp.authexodus`, account `ca`). Kind and keychain: ______
 - [ ] In the Finder folder, `session.json` now exists. The folder is owner-only (`ls -ld` shows `drwx------`): ______
 - [ ] The screen says **Connect your iPhone to this computer** and shows Server and Port. Write them down, you need them later: Server ______ Port ______
 - [ ] The Server is the Mac's address on your home network (compare with System Settings > Wi-Fi > Details). It is not 127.0.0.1 or a VPN address.
@@ -157,7 +155,7 @@ This is the first time the app has ever run in a real window. Everything else de
 - [ ] **Reload recovery (only if a reload is possible).** Right-click an empty part of the window. If the menu offers Reload, choose it. If it does not, write "no reload offered" and skip this check: ______
   - [ ] The app comes back on **Reinstall Authy**, not on the Safety check, and says "The window was reloaded, and you are back where you were. Do not redo anything you have already done on your iPhone."
   - [ ] The Terminal shows no second start of the proxy, and the iPhone's proxy still works: Safari on the iPhone loads a page.
-  - [ ] Nothing in Keychain Access changed (the item's modification time is the same).
+  - [ ] The certificate did not change: on the iPhone, Settings > General > About > Certificate Trust Settings still lists **authexodus (remove after use)** with full trust, and Safari still loads pages through the proxy.
 - [ ] **The Mac's address changes.** On the Mac, turn Wi-Fi off and on (if the router hands back the same address, join a different network and come back, or unplug Ethernet, so the address really changes). Mac's address before ______ and after ______.
   - [ ] After about 10 seconds without the address (the app looks every 5 s and needs two looks in a row) **App says** "This Mac's network address changed. Your iPhone can no longer reach it." with a **Restart the connection** button. Time it took: ______ A short Wi-Fi drop of more than about 10 s will show the notice even if the same address comes back; it then clears itself within about 5 s of the address returning, with nothing restarted. If you saw that, note it here: ______
   - [ ] Press **Restart the connection**. The app goes to Connect, shows the NEW Server and Port inside a yellow outline, and says "This computer's address has changed. Update Server and Port on your iPhone to the ones shown here."
@@ -221,8 +219,9 @@ Do the "Clean up" section near the end of this document now, for the iPhone.
 
 ## Quit in the middle (do this on a third short run, or at the start of Run 2)
 
-- [ ] With the certificate installed and the app at Reinstall Authy, quit the app (Cmd-Q). In Keychain Access the authexodus item is still there (correct: the key stays until cleanup).
+- [ ] With the certificate installed and the app at Reinstall Authy, quit the app (Cmd-Q).
 - [ ] Open the app again. It opens on **Put everything back** with "The app was closed before clean-up finished last time. Finish these steps now."
+- [ ] **App says** "The certificate's secret key was kept only in the app's memory, so it ended when the app closed: the certificate still on your iPhone is useless. Remove its profile anyway, below." (Until you say which device you used, it says "iPhone or iPad".)
 - [ ] It asks which device you used, and lists four ticks: proxy off, profile removed, Authy signed in, and "I deleted any file I saved".
 - [ ] Finish the cleanup. Then start Run 2 from the Welcome screen.
 
@@ -359,17 +358,17 @@ Do this at the end of EVERY run, including runs that failed.
 
 - [ ] **App says**, at the top, "Your iPhone has no internet until you switch its proxy off. Do that first." Confirm it is true: Safari on the device loads nothing right now.
 - [ ] **App says** "This computer is clean: the connection is stopped and the certificate's secret key is destroyed, so the certificate on your iPhone is useless."
-  - [ ] If instead it says **This computer could not finish cleaning up.**, it also gives the reason and says to delete the authexodus item in Keychain Access. Reason shown: ______
+  - [ ] If instead it says **This computer could not finish cleaning up.**, it also gives the reason, a **Try again** button and a box to carry on. Reason shown: ______
 - [ ] On the device: Settings > Wi-Fi > (i) beside your network > Configure Proxy > Off > Save. Tick **I turned the proxy off**. Safari now loads a normal web page.
 - [ ] Settings > General > VPN & Device Management > **authexodus (remove after use)** > Remove Profile. Tick **I removed the certificate profile**. Settings > General > About > Certificate Trust Settings no longer lists it.
 - [ ] If you switched off a VPN or iCloud Private Relay, switch it back on.
 - [ ] Authy on the device is signed in and shows all your accounts and codes. Tick **Authy is signed in and shows my codes**.
 - [ ] If you saved a file: delete it and empty the Trash. Tick **I deleted the file I saved**.
-- [ ] In Keychain Access, the authexodus item is gone (Cmd-R refreshes the search).
 - [ ] If some accounts could not move, Clean up lists them by name under "still only in Authy".
 - [ ] Click **Finish**. The last screen says **All done** (or **Cleaned up. Nothing was moved** if nothing was moved). If some accounts could not move, it says how many still live only in Authy and lists them by name.
 - [ ] The last screen offers **Start again from the beginning** and says that the app has forgotten your codes, so moving them to another app means a whole new run. (Do not press it now unless you are starting the next run.)
 - [ ] Confirm nothing is left under `~/Library/Application Support/dev.somecorp.authexodus` after finishing: `ls -la` on that folder shows no `session.json`, no `bw-data` and no `bw-cli`. What it shows: ______
+- [ ] After finishing, open Keychain Access (Applications > Utilities > Keychain Access) and search for `authexodus`: Keychain Access shows no authexodus item. What it shows: ______
 - [ ] What macOS keeps on its own account (expected, and none of it holds codes): `~/Library/WebKit/dev.somecorp.authexodus` and `~/Library/Caches/dev.somecorp.authexodus`. Present: ______
 - [ ] In Terminal, `find ~ -name "*.authexodus-tmp" 2>/dev/null` prints nothing.
 - [ ] Quit the app and open it again. It opens on Welcome, not on Clean up.
