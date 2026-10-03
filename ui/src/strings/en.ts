@@ -7,7 +7,6 @@
 import type { ErrorCode } from "../api.errors";
 
 const CERT_NAME = "authexodus (remove after use)";
-const KEYCHAIN_BY_HAND = "open Keychain Access on this Mac, search for authexodus, and delete the item it finds";
 const plural = (n: number, one: string, many: string) => `${n} ${n === 1 ? one : many}`;
 
 /**
@@ -36,10 +35,6 @@ const PROBLEMS: Record<ErrorCode, { title: (d: string) => string; advice: (d: st
   listen_failed: {
     title: (d: string) => `This computer could not start listening for your ${d}.`,
     advice: () => "",
-  },
-  keychain_failed: {
-    title: () => "The Mac's Keychain would not store the certificate's secret key.",
-    advice: () => "If macOS asks for permission to use the Keychain, choose Allow.",
   },
   capture_would_be_lost: {
     title: () => "The address can't change without restarting the connection.",
@@ -71,7 +66,6 @@ const PROBLEMS: Record<ErrorCode, { title: (d: string) => string; advice: (d: st
     advice: (d: string) => `Capture it again: that restarts the connection, and you then close and open Authy on your ${d}.`,
   },
   export_failed: { title: () => "", advice: () => "" },
-  cleanup_keychain_failed: { title: () => "This computer could not finish cleaning up.", advice: () => "" },
   cleanup_failed: { title: () => "This computer could not finish cleaning up.", advice: () => "" },
   internal: { title: () => "", advice: () => "" },
 };
@@ -511,17 +505,15 @@ export const en = {
     noInternet: (d: string) => `Your ${d} has no internet until you switch its proxy off. Do that first.`,
     vpnBack: "If you switched off a VPN or iCloud Private Relay earlier, switch it back on now.",
     resumed: "The app was closed before clean-up finished last time. Finish these steps now.",
+    keyGone: (d: string) => `The certificate's secret key was kept only in the app's memory, so it ended when the app closed: the certificate still on your ${d} is useless. Remove its profile anyway, below.`,
     reloaded: "The window was reloaded during clean-up. Finish these steps now.",
     working: "Stopping the connection and destroying the certificate's secret key…",
     clean: (d: string) => `This computer is clean: the connection is stopped and the certificate's secret key is destroyed, so the certificate on your ${d} is useless.`,
     failed: "This computer could not finish cleaning up.",
     failedReason: (reason: string) => `The reason given: ${reason}`,
-    carryOn: "Carry on with the steps below either way.",
-    manualDone: "I deleted the authexodus item in Keychain Access",
     failedOther: "Try again. If it keeps failing, carry on with the steps below, then quit authexodus and open it again: it opens on this screen and tries once more.",
     otherDone: "I have tried again and want to carry on",
     finishFailed: "The app could not finish.",
-    finishFailedKeychain: "The certificate's secret key is still in the Keychain. Remove it by hand, then press Finish again.",
     finishFailedOther: "Nothing on this screen is lost. Press Finish again. If it keeps failing, quit authexodus and open it again: it opens on this screen.",
     noCertificate: (d: string) => `No certificate was installed on your ${d}, so there is no profile to remove.`,
     unconstrained: "This certificate was not limited to Authy, so removing it matters even more.",
@@ -695,8 +687,6 @@ export const en = {
     // For a refusal that came without one of the shell's sentences (Tauri's own, or a fault in
     // this window). Its raw text is developer text and is never shown.
     unexplained: "Something went wrong inside this app. Try again; if it keeps happening, quit the app (press Command-Q) and open it again.",
-    // Shown for the two Keychain codes whenever the shell's sentence does not itself say how.
-    keychainByHand: `To remove it by hand: ${KEYCHAIN_BY_HAND}.`,
     byCode: PROBLEMS,
   },
 

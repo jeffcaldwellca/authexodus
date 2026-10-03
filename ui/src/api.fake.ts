@@ -440,7 +440,7 @@ export function createFakeApi(initial: Partial<AppState> = {}, overrides: Partia
       if (script.cleanupError) {
         const message = script.cleanupError;
         script.cleanupError = null;
-        throw new ApiError("cleanup_keychain_failed", message);
+        throw new ApiError("cleanup_failed", message);
       }
       unlocked = false;
       signedIn = false;

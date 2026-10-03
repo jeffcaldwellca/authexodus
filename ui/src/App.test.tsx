@@ -514,6 +514,12 @@ describe("wizard", () => {
     const { api } = await mountApp({ resumeCleanup: true });
     expect(screen.getByRole("heading", { level: 1, name: en.cleanup.title })).toBeInTheDocument();
     expect(screen.getByText(en.cleanup.resumed)).toBeInTheDocument();
+    // The key went with the app, so the certificate left on the device is useless: said
+    // plainly, and the profile is still to be removed.
+    expect(screen.getByText(en.cleanup.keyGone(en.deviceName.either))).toBeInTheDocument();
+    expect(en.cleanup.keyGone(iphone)).toMatch(/only in the app's memory/);
+    expect(en.cleanup.keyGone(iphone)).toMatch(/certificate still on your iPhone is useless/);
+    expect(en.cleanup.keyGone(iphone)).toMatch(/remove its profile/i);
     await screen.findByText(en.cleanup.clean(en.deviceName.either));
     // The app no longer knows what happened before it was closed, so it asks about Authy
     // and about a saved file as well.
@@ -549,15 +555,14 @@ describe("wizard", () => {
     expect(screen.getByText(en.done.again(iphone))).toBeInTheDocument();
   });
 
-  it("a failed cleanup shows the shell's reason and a manual route, and can still be finished", async () => {
-    const { api, user } = await walkTo("cleanup", { cleanupError: "could not remove the certificate key: keychain is locked" });
+  it("a failed cleanup shows the shell's reason and a way to carry on, and can still be finished", async () => {
+    const { api, user } = await walkTo("cleanup", { cleanupError: "The Bitwarden data folder could not be removed." });
     const alert = await screen.findByRole("alert");
     expect(within(alert).getByText(en.cleanup.failed)).toBeInTheDocument();
-    expect(within(alert).getByText(en.cleanup.failedReason("could not remove the certificate key: keychain is locked"))).toBeInTheDocument();
-    // The shell's words here do not say how to remove the item, so the screen does.
-    expect(within(alert).getByText(en.problems.keychainByHand)).toBeInTheDocument();
-    expect(en.problems.keychainByHand).toMatch(/Keychain Access.*authexodus/);
-    expect(within(alert).getByText(en.cleanup.carryOn)).toBeInTheDocument();
+    expect(within(alert).getByText(en.cleanup.failedReason("The Bitwarden data folder could not be removed."))).toBeInTheDocument();
+    expect(within(alert).getByText(en.cleanup.failedOther)).toBeInTheDocument();
+    // A run that was not resumed says nothing about a key that went with an earlier launch.
+    expect(screen.queryByText(en.cleanup.keyGone(iphone))).not.toBeInTheDocument();
 
     // The phone-side ticks can be made regardless, but they alone do not finish.
     const finish = screen.getByRole("button", { name: en.cleanup.finish });
@@ -566,8 +571,8 @@ describe("wizard", () => {
     }
     expect(finish).toBeDisabled();
 
-    // Saying the key was removed by hand is the way out when Try again keeps failing.
-    await user.click(within(alert).getByRole("checkbox", { name: en.cleanup.manualDone }));
+    // Saying so is the way out when Try again keeps failing.
+    await user.click(within(alert).getByRole("checkbox", { name: en.cleanup.otherDone }));
     expect(finish).toBeEnabled();
     await user.click(finish);
     await screen.findByRole("heading", { level: 1 });
@@ -575,7 +580,7 @@ describe("wizard", () => {
   });
 
   it("Try again after a failed cleanup can succeed", async () => {
-    const { user } = await walkTo("cleanup", { cleanupError: "keychain busy" });
+    const { user } = await walkTo("cleanup", { cleanupError: "The Bitwarden tool could not be removed." });
     const alert = await screen.findByRole("alert");
     await user.click(within(alert).getByRole("button", { name: en.common.tryAgain }));
     await screen.findByText(en.cleanup.clean(iphone));

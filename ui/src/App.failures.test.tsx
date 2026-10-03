@@ -6,7 +6,6 @@ import { vi } from "vitest";
 import { ApiError } from "./api.errors";
 import { createFakeApi } from "./api.fake";
 import { ADDRESS_RECHECK_MS, App } from "./App";
-import { Problem } from "./failures/Problem";
 import { reportListenFailure, resetListenFailure } from "./listenFailure";
 import { en } from "./strings/en";
 import { mountApp, tickAllChecks, walkTo } from "./test-utils";
@@ -78,7 +77,6 @@ describe("failures, by the shell's code", () => {
   // The sentences are the shell's own, word for word (src-tauri/src/errors.rs).
   it.each([
     ["no_private_address", "This computer is not on a home or office Wi-Fi network. Connect it to the same Wi-Fi as the iPhone or iPad and try again."],
-    ["keychain_failed", "The certificate could not be created, because this computer's keychain did not take its key. Open Keychain Access, search for \"dev.somecorp.authexodus\", delete the item it finds, and try again."],
     ["listen_failed", "This computer could not open the connection for your iPhone or iPad. Check that Wi-Fi is switched on and that no other copy of this app is running, then try again."],
     ["address_not_private", "That address is reachable from the internet, so the connection cannot be opened on it. Use this computer's address on your home or office Wi-Fi."],
   ] as const)("a proxy that cannot start (%s) shows its own title, the shell's sentence and Try again", async (code, sentence) => {
@@ -99,30 +97,10 @@ describe("failures, by the shell's code", () => {
     expect(api.calls.filter((c) => c.method === "startProxy")).toHaveLength(2);
   });
 
-  it("the home-network and Keychain cases say what the person needs to hear", () => {
+  it("the home-network cases say what the person needs to hear", () => {
     expect(by.no_private_address.title(iphone)).toMatch(/not on a home or office network/);
     expect(by.no_private_address.advice(iphone)).toMatch(/home or office router.*nobody outside your network/);
     expect(by.address_not_private.advice(iphone)).toMatch(/home or office router.*nobody outside your network/);
-    expect(en.problems.keychainByHand).toMatch(/Keychain Access.*authexodus.*delete the item/);
-  });
-
-  it.each(["keychain_failed", "cleanup_keychain_failed"] as const)("%s always shows the Keychain route, once: the screen adds it only when the shell's sentence lacks it", (code) => {
-    const mount = (message: string) => render(<Problem error={new ApiError(code, message)} d={iphone} title={en.connect.startFailed(iphone)} />);
-    const said = () => screen.getByRole("alert").textContent!.match(/Keychain Access/g) ?? [];
-
-    const bare = mount("The key could not be stored.");
-    expect(screen.getByText(en.problems.keychainByHand)).toBeInTheDocument();
-    expect(said()).toHaveLength(1);
-    bare.unmount();
-
-    mount("The key could not be removed. To remove it by hand: open Keychain Access, search for \"dev.somecorp.authexodus\", and delete the item it finds.");
-    expect(screen.queryByText(en.problems.keychainByHand)).not.toBeInTheDocument();
-    expect(said()).toHaveLength(1);
-  });
-
-  it("no other code is given the Keychain route", () => {
-    render(<Problem error={new ApiError("cleanup_failed", "The Bitwarden data folder could not be removed.")} d={iphone} title={en.cleanup.failed} />);
-    expect(screen.getByRole("alert").textContent).not.toMatch(/Keychain/);
   });
 
   it("a start that fails with no code keeps the screen's own title and a plain sentence, never the raw text", async () => {
@@ -232,9 +210,9 @@ describe("failures, by the shell's code", () => {
     expect(api.calls.filter((c) => c.method === "restartProxy")).toHaveLength(1);
   });
 
-  it("a Finish the shell rejects is never silent: the Keychain route is shown and Finish can be pressed again", async () => {
+  it("a Finish the shell rejects is never silent: the reason is shown and Finish can be pressed again", async () => {
     const { api, user } = await walkTo("cleanup", {
-      failures: { finish: [new ApiError("cleanup_keychain_failed", "The certificate key is still in the Keychain.")] },
+      failures: { finish: [new ApiError("cleanup_failed", "The Bitwarden data folder could not be removed.")] },
     });
     await screen.findByText(en.cleanup.clean(iphone));
     for (const box of screen.getAllByRole("checkbox")) await user.click(box);
@@ -243,9 +221,8 @@ describe("failures, by the shell's code", () => {
 
     const alert = await screen.findByRole("alert");
     expect(within(alert).getByText(en.cleanup.finishFailed)).toBeInTheDocument();
-    expect(within(alert).getByText(en.cleanup.failedReason("The certificate key is still in the Keychain."))).toBeInTheDocument();
-    expect(within(alert).getByText(en.cleanup.finishFailedKeychain)).toBeInTheDocument();
-    expect(within(alert).getByText(en.problems.keychainByHand)).toBeInTheDocument();
+    expect(within(alert).getByText(en.cleanup.failedReason("The Bitwarden data folder could not be removed."))).toBeInTheDocument();
+    expect(within(alert).getByText(en.cleanup.finishFailedOther)).toBeInTheDocument();
     expect(screen.getByRole("heading", { level: 1, name: en.cleanup.title })).toBeInTheDocument();
     expect(finish).toBeEnabled();
 
@@ -254,22 +231,12 @@ describe("failures, by the shell's code", () => {
     expect(api.calls.filter((c) => c.method === "finish")).toHaveLength(2);
   });
 
-  it("a Finish that fails for another reason gives no Keychain advice", async () => {
-    const { user } = await walkTo("cleanup", { failures: { finish: [new ApiError("cleanup_failed", "The Bitwarden data folder could not be removed.")] } });
-    await screen.findByText(en.cleanup.clean(iphone));
-    for (const box of screen.getAllByRole("checkbox")) await user.click(box);
-    await user.click(screen.getByRole("button", { name: en.cleanup.finish }));
-    const alert = await screen.findByRole("alert");
-    expect(within(alert).getByText(en.cleanup.finishFailedOther)).toBeInTheDocument();
-    expect(alert.textContent).not.toMatch(/Keychain/);
-  });
-
-  it("a cleanup that fails over something other than the key gives no Keychain advice either", async () => {
+  it("a cleanup the shell rejects shows its reason, Try again and the box to carry on", async () => {
     await walkTo("cleanup", { failures: { cleanup: [new ApiError("cleanup_failed", "The Bitwarden data folder could not be removed.")] } });
     const alert = await screen.findByRole("alert");
     expect(within(alert).getByText(en.cleanup.failedReason("The Bitwarden data folder could not be removed."))).toBeInTheDocument();
     expect(within(alert).getByText(en.cleanup.failedOther)).toBeInTheDocument();
-    expect(alert.textContent).not.toMatch(/Keychain/);
+    expect(within(alert).getByRole("button", { name: en.common.tryAgain })).toBeInTheDocument();
     expect(within(alert).getByRole("checkbox", { name: en.cleanup.otherDone })).toBeInTheDocument();
   });
 

@@ -5,10 +5,10 @@
 
 /** Every code the shell can reject with. Anything else is `internal`. */
 export const ERROR_CODES = [
-  "address_changed", "address_not_private", "no_private_address", "listen_failed", "keychain_failed",
+  "address_changed", "address_not_private", "no_private_address", "listen_failed",
   "capture_would_be_lost", "bad_email", "bad_server_url", "bw_download_failed", "bw_checksum_mismatch",
   "bw_unreachable", "bw_session_expired", "bw_vault_read_failed", "bw_failed", "not_unlocked", "no_backup",
-  "export_failed", "cleanup_keychain_failed", "cleanup_failed", "internal",
+  "export_failed", "cleanup_failed", "internal",
 ] as const;
 
 export type ErrorCode = (typeof ERROR_CODES)[number];

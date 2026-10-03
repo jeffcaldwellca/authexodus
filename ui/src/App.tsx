@@ -71,8 +71,8 @@ export function App({ api, devTools }: { api: Api; devTools?: ReactNode }) {
     const kept = readKept();
     const ask = async (): Promise<AppState> => {
       const app = await api.getState();
-      // The shell leaves the proxy out of its answer while the proxy is busy (a first start
-      // waiting on a Keychain prompt, or a moment's work). When the answer, or what this
+      // The shell leaves the proxy out of its answer while the proxy is busy (a start or a
+      // stop, a moment's work). When the answer, or what this
       // window kept, says a run is under way, ask once more before deciding.
       const midRun = !NOT_A_RUN.includes(app.step) || (kept?.started === true && app.step === "welcome");
       if (app.session?.proxy || !midRun) return app;

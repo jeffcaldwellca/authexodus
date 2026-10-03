@@ -127,11 +127,11 @@ describe("reload recovery", () => {
     expect(count(api, "restartProxy")).toBe(0);
   });
 
-  it("a reload while the first start waits behind a Keychain prompt keeps the device and the ticks", async () => {
+  it("a reload while the first start has not answered yet keeps the device and the ticks", async () => {
     const h = await mountApp();
     await h.user.click(screen.getByRole("radio", { name: en.deviceName.ipad }));
     await tickAllChecks(h.user);
-    // The shell's start is waiting on macOS: it has not answered, and the snapshot has no proxy.
+    // The shell's start has not answered yet, and the snapshot has no proxy.
     let release = () => undefined as void;
     const start = h.api.startProxy.bind(h.api);
     h.api.startProxy = (ip?: string) => new Promise((resolve, reject) => { release = () => { start(ip).then(resolve, reject); }; });

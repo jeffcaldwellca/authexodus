@@ -4,8 +4,7 @@
 // window: a new launch of the app starts from nothing.
 //
 // The shell knows the device and the run, but a reload can come while it cannot say so: the
-// first start of the connection waits behind a Keychain prompt and holds the lock the snapshot
-// reads. Without this the person would be sent back to tick the checks again.
+// first start of the connection holds the lock the snapshot reads until it has answered. Without this the person would be sent back to tick the checks again.
 import type { Device } from "../api";
 import { CHECK_IDS, type CheckId } from "./machine";
 

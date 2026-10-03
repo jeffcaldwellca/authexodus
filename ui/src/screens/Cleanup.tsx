@@ -1,5 +1,5 @@
-// Screen 8: the app stops the proxy and destroys the certificate key, then the person undoes
-// the phone changes by hand. It is not finished until every item is ticked. A launch that
+// Screen 8: the app stops the proxy and drops the certificate key from memory, then the person
+// undoes the phone changes by hand. It is not finished until every item is ticked. A launch that
 // follows an unfinished run opens here. Nothing fails quietly: a cleanup or a Finish that the
 // shell rejects is shown with its reason and what to do about it.
 import { useEffect, useRef, useState } from "react";
@@ -7,7 +7,6 @@ import type { Device } from "../api";
 import { asApiError, type ApiError } from "../api.errors";
 import { Callout, Screen, Tick, Waiting } from "../components/ui";
 import { AuthyAccounts, DeviceManagement, ProxyForm, TrashFile } from "../device/scenes";
-import { aboutKeychain, keychainRoute } from "../failures/Problem";
 import { en } from "../strings/en";
 import { canFinish, cantMoveCount, cleanupItems, type CleanupId } from "../wizard/machine";
 import { deviceLabel, type ScreenProps } from "./types";
@@ -26,7 +25,7 @@ function ItemArt({ id, device }: { id: CleanupId; device: Device }) {
 export function Cleanup({ api, state, dispatch, certConstrained }: ScreenProps) {
   const [core, setCore] = useState<"working" | "clean" | "failed">("working");
   const [failure, setFailure] = useState<ApiError | null>(null);
-  const [removedByHand, setRemovedByHand] = useState(false);
+  const [carryOnAnyway, setCarryOnAnyway] = useState(false);
   const [shown, setShown] = useState<CleanupId>("proxyOff");
   const [finishing, setFinishing] = useState(false);
   const [finishError, setFinishError] = useState<ApiError | null>(null);
@@ -53,8 +52,8 @@ export function Cleanup({ api, state, dispatch, certConstrained }: ScreenProps) 
     runCleanup();
   }, []);
 
-  // When this computer's own cleanup fails, the person can finish it by hand and say so.
-  const computerDone = core === "clean" || (core === "failed" && removedByHand);
+  // When this computer's own cleanup keeps failing, the person can say so and carry on.
+  const computerDone = core === "clean" || (core === "failed" && carryOnAnyway);
   const text = (id: CleanupId) => (id === "fileDeleted" && !state.exportedFile ? t.items.fileDeletedMaybe : t.items[id]);
 
   const finish = async () => {
@@ -64,8 +63,8 @@ export function Cleanup({ api, state, dispatch, certConstrained }: ScreenProps) 
       await api.finish();
       dispatch({ type: "finish" });
     } catch (err) {
-      // Finish runs the cleanup again in the shell. If the key is still there it says so,
-      // and the person is told: a Finish button that does nothing is the worst outcome here.
+      // Finish runs the cleanup again in the shell. If that fails, the person is told: a
+      // Finish button that does nothing is the worst outcome here.
       setFinishError(asApiError(err));
       setFinishing(false);
     }
@@ -87,6 +86,7 @@ export function Cleanup({ api, state, dispatch, certConstrained }: ScreenProps) 
       }
     >
       {!state.cleanupTicks.proxyOff && <Callout tone="warn" title={t.noInternet(d)} />}
+      {state.resumed && <Callout tone="info"><p>{t.keyGone(d)}</p></Callout>}
       <div aria-live="polite">
         {core === "working" && <Waiting>{t.working}</Waiting>}
         {core === "clean" && <Callout tone="ok"><p>{t.clean(d)}</p></Callout>}
@@ -94,20 +94,18 @@ export function Cleanup({ api, state, dispatch, certConstrained }: ScreenProps) 
       {core === "failed" && failure && (
         <Callout tone="error" title={t.failed} alert>
           {reasonOf(failure)}
-          {keychainRoute(failure) !== null && <p>{keychainRoute(failure)}</p>}
-          <p>{aboutKeychain(failure) ? t.carryOn : t.failedOther}</p>
+          <p>{t.failedOther}</p>
           <button type="button" className="secondary" onClick={runCleanup}>{en.common.tryAgain}</button>
           <label className="scanned">
-            <input type="checkbox" checked={removedByHand} onChange={(e) => setRemovedByHand(e.target.checked)} />
-            <span>{aboutKeychain(failure) ? t.manualDone : t.otherDone}</span>
+            <input type="checkbox" checked={carryOnAnyway} onChange={(e) => setCarryOnAnyway(e.target.checked)} />
+            <span>{t.otherDone}</span>
           </label>
         </Callout>
       )}
       {finishError && (
         <Callout tone="error" title={t.finishFailed} alert>
           {reasonOf(finishError)}
-          <p>{aboutKeychain(finishError) ? t.finishFailedKeychain : t.finishFailedOther}</p>
-          {keychainRoute(finishError) !== null && <p>{keychainRoute(finishError)}</p>}
+          <p>{t.finishFailedOther}</p>
         </Callout>
       )}
 
