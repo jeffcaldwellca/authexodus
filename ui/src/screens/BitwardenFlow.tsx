@@ -48,6 +48,20 @@ function needsAnswer(p: Proposal): boolean {
   return p.confidence === "low" || proposedHasCode(p);
 }
 
+/**
+ * Which Bitwarden account a sign-in is to, as the shell tells them apart: the server and the
+ * email in lower case. The shell keeps its matches across a new sign-in only to the same one.
+ */
+function accountOf(region: BwRegion, email: string): string {
+  let server: string = region.kind;
+  if (region.kind === "selfHosted") {
+    const url = region.url.trim();
+    try { server = new URL(url).href; } catch { server = url; }
+    server = server.replace(/\/+$/, "");
+  }
+  return `${server}\n${email.toLowerCase()}`;
+}
+
 /** A self-hosted server must be a full https address before it is sent anywhere. */
 export function validServerUrl(url: string): boolean {
   return /^https:\/\/[^\s/]+\S*$/.test(url.trim());
@@ -80,6 +94,10 @@ export function BitwardenFlow({ api, state, tokens, onDone, onLocked }: ScreenPr
   /** Bitwarden ended the session. The choices already made are kept for after the new sign-in. */
   const [expired, setExpired] = useState(false);
   const [signedInAgain, setSignedInAgain] = useState(false);
+  /** Signed in again to a different account: the suggestions were made afresh for it. */
+  const [refreshed, setRefreshed] = useState(false);
+  /** The account of the last sign-in that Bitwarden accepted. */
+  const signedInAs = useRef<string | null>(null);
   const [busy, setBusy] = useState(false);
   const [showPassword, setShowPassword] = useState(false);
   const [showSecret, setShowSecret] = useState(false);
@@ -235,12 +253,18 @@ export function BitwardenFlow({ api, state, tokens, onDone, onLocked }: ScreenPr
         afterTwoStep();
         setKeyNeeded(false);
         setBusy(false);
-        if (expired && proposals) {
+        const account = accountOf(region, email);
+        const sameAccount = signedInAs.current === account;
+        signedInAs.current = account;
+        if (expired && proposals && sameAccount) {
           // The shell kept the matches across the new sign-in, and the choices are still here.
           setExpired(false);
           setSignedInAgain(true);
           setStage("review");
         } else {
+          // Another account's vault (another email or server): the shell dropped the old
+          // matches, and every choice made from them would be refused. Make them again.
+          setRefreshed(expired && proposals !== null);
           setExpired(false);
           await match();
         }
@@ -267,6 +291,7 @@ export function BitwardenFlow({ api, state, tokens, onDone, onLocked }: ScreenPr
     if (!proposals || decisions.length !== proposals.length) return;
     setApplyError(null);
     setSignedInAgain(false);
+    setRefreshed(false);
     setStage("applying");
     try {
       const result = await withProgress(() => api.bwApply(decisions));
@@ -465,6 +490,7 @@ export function BitwardenFlow({ api, state, tokens, onDone, onLocked }: ScreenPr
         }
       >
         {signedInAgain && <Callout tone="ok"><p role="status">{t.signedInAgain}</p></Callout>}
+        {refreshed && <Callout tone="warn"><p role="status">{t.refreshedForOtherAccount}</p></Callout>}
         <table className="matches">
           <thead><tr><th scope="col">{t.colAccount}</th><th scope="col">{t.colAction}</th></tr></thead>
           <tbody>

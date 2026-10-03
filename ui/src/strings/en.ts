@@ -439,6 +439,7 @@ export const en = {
     },
     signInAgain: "Sign in again",
     signedInAgain: "You are signed in again, and your choices are as you left them. Press Apply to Bitwarden when you are ready.",
+    refreshedForOtherAccount: "You signed in to a different Bitwarden account (another email or server) than before, so the suggestions were made again for that account's vault. Check every choice again.",
 
     reviewTitle: "Review the matches",
     reviewLede: "Nothing has changed yet. We suggested a login for each account. Change any that are wrong: pick another suggestion, or use Choose a different login to give the code to any login in your vault. Accounts the app could not match become new entries in the “Authy import” folder, which you can merge in Bitwarden afterwards. Skipped accounts stay only in Authy. A code that is already in Bitwarden is never replaced.",

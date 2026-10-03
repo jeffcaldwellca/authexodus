@@ -398,6 +398,35 @@ describe("a session that ends part-way", () => {
     expect(applies[1]!.args).toEqual(applies[0]!.args);
   });
 
+  // The shell keeps the matches only for the same account (server and email). Another one's
+  // vault is not the one they were made from, so every choice would be refused.
+  for (const [what, change] of [
+    ["another email", async (h: Harness) => {
+      await h.user.clear(screen.getByLabelText(t.email));
+      await h.user.type(screen.getByLabelText(t.email), "other@example.com");
+    }],
+    ["another region", async (h: Harness) => { await h.user.click(screen.getByRole("radio", { name: t.regions.eu })); }],
+  ] as const) {
+    it(`signed in again with ${what}: the suggestions are made again for that account, and the person is told`, async () => {
+      const h = await toReview({ failures: { bwApply: [new ApiError("bw_session_expired", "Bitwarden's session has ended.")] } });
+      const { api, user } = h;
+      await user.selectOptions(screen.getByRole("combobox", { name: t.actionFor("Google") }), t.attach("Google (work)", "sam@work.example"));
+      await user.click(screen.getByRole("button", { name: t.apply }));
+      await user.click(await screen.findByRole("button", { name: t.signInAgain }));
+      await screen.findByRole("heading", { level: 1, name: t.loginTitle });
+      await change(h);
+      await user.type(screen.getByLabelText(t.password), "master pw");
+      await user.click(screen.getByRole("button", { name: t.signIn }));
+
+      await screen.findByRole("heading", { level: 1, name: t.reviewTitle });
+      expect(screen.getByText(t.refreshedForOtherAccount)).toBeInTheDocument();
+      expect(screen.queryByText(t.signedInAgain)).not.toBeInTheDocument();
+      expect(api.calls.filter((c) => c.method === "bwPropose")).toHaveLength(2);
+      // The old choice is not carried over: the uncertain row asks again.
+      expect(screen.getByRole("combobox", { name: t.actionFor("Google") })).toHaveValue("");
+    });
+  }
+
   it("while choosing a login by hand: the same way back, and the picker closes", async () => {
     const h = await toReview({ failures: { bwLogins: [new ApiError("bw_session_expired", "Bitwarden's session has ended.")] } });
     const { user } = h;
