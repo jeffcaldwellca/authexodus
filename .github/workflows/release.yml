@@ -127,6 +127,9 @@ jobs:
         uses: tauri-apps/tauri-action@1deb371b0cd8bd54025b384f1cd735e725c4060f # v1 (v1.0.0)
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          # Tauri skips the disk image's Finder styling (background, icon positions) whenever
+          # CI is set, as it is on every GitHub runner. The runner has a Finder, so do it anyway.
+          TAURI_BUNDLER_DMG_IGNORE_CI: "true"
           APPLE_CERTIFICATE: ${{ secrets.MACOS_CERTIFICATE }}
           APPLE_CERTIFICATE_PASSWORD: ${{ secrets.MACOS_CERTIFICATE_PASSWORD }}
           APPLE_SIGNING_IDENTITY: ${{ env.SIGNING_IDENTITY }}

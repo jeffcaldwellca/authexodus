@@ -1,0 +1,36 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  Background of the authexodus disk image window (660 x 400 points). The app icon sits at
+  (180, 200) and the Applications link at (480, 200): tauri.conf.json > bundle > macOS > dmg.
+  Regenerate background.tiff (1x + 2x in one file, for Retina) from the repository root:
+
+    rsvg-convert -w 660 -h 400 src-tauri/dmg/background.svg -o /tmp/bg.png
+    rsvg-convert -w 1320 -h 800 src-tauri/dmg/background.svg -o /tmp/bg@2x.png
+    tiffutil -cathidpicheck /tmp/bg.png /tmp/bg@2x.png -out src-tauri/dmg/background.tiff
+-->
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 660 400" width="660" height="400">
+  <defs>
+    <linearGradient id="sky" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#f6fbf9"/>
+      <stop offset="1" stop-color="#e3f1ed"/>
+    </linearGradient>
+  </defs>
+  <rect width="660" height="400" fill="url(#sky)"/>
+  <rect x="70" y="116" width="520" height="182" rx="26" fill="#ffffff" fill-opacity="0.72" stroke="#15907a" stroke-opacity="0.16"/>
+
+  <text x="330" y="62" text-anchor="middle" font-family="Helvetica Neue, Helvetica, Arial, sans-serif"
+        font-size="26" font-weight="700" fill="#0a5548" letter-spacing="0.5">authexodus</text>
+  <text x="330" y="88" text-anchor="middle" font-family="Helvetica Neue, Helvetica, Arial, sans-serif"
+        font-size="13" fill="#3d6b62">Move your two-step login codes out of Authy</text>
+
+  <!-- The arrow from the app to Applications, in the icon's yellow. -->
+  <g fill="none" stroke="#f2b51d" stroke-width="7" stroke-linecap="round" stroke-linejoin="round">
+    <path d="M 262 200 C 312 168, 348 168, 398 200"/>
+    <path d="M 384 180 L 400 201 L 376 207"/>
+  </g>
+
+  <text x="330" y="338" text-anchor="middle" font-family="Helvetica Neue, Helvetica, Arial, sans-serif"
+        font-size="14" fill="#0a5548">Drag authexodus into Applications, then open it from there.</text>
+  <text x="330" y="362" text-anchor="middle" font-family="Helvetica Neue, Helvetica, Arial, sans-serif"
+        font-size="11" fill="#5f857d">You will need an iPhone or iPad with Authy, on the same Wi-Fi as this Mac.</text>
+</svg>
