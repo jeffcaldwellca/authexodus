@@ -4,6 +4,7 @@
 // (names, never keys), and it drops that when cleanup begins. The names of the accounts that
 // cannot be moved are kept to the end, so the person can still be told which ones they are.
 import type { AppState, Device, ProxyEvent, Step, UnlockSummary } from "../api";
+import type { Kept } from "./kept";
 
 /** The five safety checks on the welcome screen. All must be ticked. */
 export const CHECK_IDS = ["device", "backups", "password", "multiDevice", "sms"] as const;
@@ -69,7 +70,8 @@ export type WizardState = {
 };
 
 export type WizardEvent =
-  | { type: "loaded"; app: AppState }
+  /** `kept`: the device and ticks this window kept from before a reload of itself (see kept.ts). */
+  | { type: "loaded"; app: AppState; kept?: Pick<Kept, "device" | "checks"> | null }
   | { type: "chooseDevice"; device: Device | "android" }
   | { type: "setCheck"; id: CheckId; value: boolean }
   | { type: "start" }
@@ -217,23 +219,36 @@ function onProxy(s: WizardState, e: ProxyEvent): WizardState {
  * The state for a freshly opened window. Normally that is the welcome screen, or cleanup when
  * the last launch was not finished. But the window can also be reloaded while a run is under
  * way: then the shell still has the proxy, the device and the capture, and the wizard is put
- * back where it was. A running proxy always wins over the resume flag, so that a reload can
- * never start the cleanup (and throw the capture away) by itself.
+ * back where it was. In order:
+ *
+ * 1. A cleanup the shell has begun (or a launch that found the last run unfinished) wins over
+ *    everything: while cleanup waits for a sign-in to give up, the proxy is still reported.
+ * 2. A running proxy: the step it has reached. It wins over the resume flag, so that a reload
+ *    can never start the cleanup (and throw the capture away) by itself.
+ * 3. An unlocked summary with no proxy reported (the shell was busy for a moment): Move codes.
+ * 4. Otherwise the welcome screen, with the device and the ticks this window kept.
  */
-function onLoaded(s: WizardState, app: AppState): WizardState {
-  const base: WizardState = { ...s, device: app.device, version: app.version, releasesUrl: app.releasesUrl, resumed: false };
+function onLoaded(s: WizardState, app: AppState, kept: Pick<Kept, "device" | "checks"> | null): WizardState {
+  const base: WizardState = {
+    ...s, device: app.device ?? kept?.device ?? null, version: app.version, releasesUrl: app.releasesUrl, resumed: false,
+  };
   const snap = app.session;
+  if (app.step === "cleanup") {
+    return app.resumeCleanup && !snap?.proxy
+      ? { ...base, step: "cleanup", resumed: true, unsure: true }
+      // Reloaded after this computer's cleanup had begun: the phone's steps are still to do.
+      : { ...base, step: "cleanup", recovered: true, unsure: true };
+  }
+  const trusted = { reachedCertificate: true, reachedAuthy: true, trustProven: true, certificateInstalled: true };
+  const atDestination = (summary: UnlockSummary): WizardState => ({
+    ...base, ...trusted, recovered: true, step: "destination", summary, cantMove: namesThatCantMove(summary),
+    captured: snap.captured > 0 ? snap.captured : null,
+    // Whether a file was saved before the reload is not known, so cleanup asks.
+    unsure: true,
+  });
   if (snap?.proxy) {
     const live: WizardState = { ...base, recovered: true };
-    const trusted = { reachedCertificate: true, reachedAuthy: true, trustProven: true, certificateInstalled: true };
-    if (snap.summary) {
-      return {
-        ...live, ...trusted, step: "destination", summary: snap.summary, cantMove: namesThatCantMove(snap.summary),
-        captured: snap.captured > 0 ? snap.captured : null,
-        // Whether a file was saved before the reload is not known, so cleanup asks.
-        unsure: true,
-      };
-    }
+    if (snap.summary) return atDestination(snap.summary);
     // The count is of accounts that can be moved. A capture holding only Authy's own
     // accounts counts none, yet is still a backup to unlock: the shell's step says so.
     if (snap.captured > 0 || app.step === "unlock") return { ...live, ...trusted, step: "unlock", captured: snap.captured };
@@ -241,16 +256,15 @@ function onLoaded(s: WizardState, app: AppState): WizardState {
     if (snap.deviceConnected) return { ...live, step: "certificate", reachedCertificate: true };
     return { ...live, step: "connect" };
   }
+  if (snap?.summary) return atDestination(snap.summary);
   if (app.resumeCleanup) return { ...base, step: "cleanup", resumed: true, unsure: true };
-  // Reloaded after this computer's cleanup had begun: the phone's steps are still to do.
-  if (app.step === "cleanup") return { ...base, step: "cleanup", recovered: true, unsure: true };
-  return base;
+  return kept ? { ...base, checks: { ...kept.checks } } : base;
 }
 
 export function reduce(s: WizardState, ev: WizardEvent): WizardState {
   switch (ev.type) {
     case "loaded":
-      return onLoaded(s, ev.app);
+      return onLoaded(s, ev.app, ev.kept ?? null);
     case "chooseDevice":
       // Cleanup can open without a device (a resumed run), and its pictures need one. On the
       // first two steps a wrong choice can still be put right: nothing is deleted yet.

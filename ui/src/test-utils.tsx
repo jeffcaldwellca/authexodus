@@ -8,7 +8,9 @@ import { en } from "./strings/en";
 
 export type Harness = { api: FakeApi; user: UserEvent };
 
+/** Opens the app in a new window: nothing kept from an earlier one (see wizard/kept.ts). */
 export async function mountApp(initial: Partial<AppState> = {}, script: Partial<FakeScript> = {}): Promise<Harness> {
+  sessionStorage.clear();
   const api = createFakeApi(initial, script);
   const user = userEvent.setup();
   render(<App api={api} />);

@@ -1,7 +1,7 @@
 // The wizard: one reducer, eight screens, and the wiring between the core's events and the
 // reducer. The app holds no secrets here; screens that show one ask the core for it.
 import { useCallback, useEffect, useReducer, useRef, useState, type ReactNode } from "react";
-import type { Api, ProxyInfo, Step } from "./api";
+import type { Api, AppState, ProxyInfo, Step } from "./api";
 import { asApiError, type ApiError } from "./api.errors";
 import type { RestartState } from "./failures/ConnectionNotices";
 import { Problem } from "./failures/Problem";
@@ -16,6 +16,7 @@ import { Unlock } from "./screens/Unlock";
 import { Verify } from "./screens/Verify";
 import { Welcome } from "./screens/Welcome";
 import { en } from "./strings/en";
+import { readKept, writeKept } from "./wizard/kept";
 import { initialState, reduce } from "./wizard/machine";
 
 const RAIL: readonly Exclude<Step, "done">[] = [
@@ -23,6 +24,10 @@ const RAIL: readonly Exclude<Step, "done">[] = [
 ];
 /** While the connection is up, the person is reminded to keep the window and the Mac awake. */
 const CONNECTED: readonly Step[] = ["connect", "certificate", "authy", "unlock", "destination", "verify"];
+/** Steps that are not part of a run under way: nothing in the shell to wait for. */
+const NOT_A_RUN: readonly Step[] = ["welcome", "done", "cleanup"];
+/** How long to wait before asking the shell for its state a second time. */
+const ASK_AGAIN_MS = 500;
 /** After one of these, asking again with no address lets the shell pick a new one. */
 const ADDRESS_GONE = ["address_changed", "address_not_private", "internal"];
 
@@ -53,18 +58,36 @@ export function App({ api, devTools }: { api: Api; devTools?: ReactNode }) {
   const load = useCallback(() => {
     let live = true;
     setLoaded("loading");
-    api.getState()
+    const kept = readKept();
+    const ask = async (): Promise<AppState> => {
+      const app = await api.getState();
+      // The shell leaves the proxy out of its answer while the proxy is busy (a first start
+      // waiting on a Keychain prompt, or a moment's work). When the answer, or what this
+      // window kept, says a run is under way, ask once more before deciding.
+      const midRun = !NOT_A_RUN.includes(app.step) || (kept?.started === true && app.step === "welcome");
+      if (app.session?.proxy || !midRun) return app;
+      await new Promise((resolve) => setTimeout(resolve, ASK_AGAIN_MS));
+      return live ? api.getState() : app;
+    };
+    ask()
       .then((app) => {
         if (!live) return;
         // A reloaded window finds the run still going in the shell: pick it up, do not restart it.
         const running = app.session?.proxy ?? null;
         if (running) { proxyAsked.current = true; gotProxy(running); }
-        dispatch({ type: "loaded", app });
+        dispatch({ type: "loaded", app, kept });
         setLoaded("ready");
       })
       .catch((err: unknown) => { if (live) { setLoadError(asApiError(err)); setLoaded("failed"); } });
     return () => { live = false; };
   }, [api, gotProxy]);
+
+  // Kept for a reload of this window (see wizard/kept.ts). Not before the first state is
+  // loaded, or the blank starting state would overwrite what an earlier page kept.
+  useEffect(() => {
+    if (loaded !== "ready") return;
+    writeKept({ device: state.device, checks: state.checks, started: !NOT_A_RUN.includes(state.step) });
+  }, [loaded, state.device, state.checks, state.step]);
 
   useEffect(() => {
     const stop = load();

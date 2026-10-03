@@ -1,9 +1,10 @@
 // A reload of the window mid-run: the shell still holds the proxy, the device and the capture,
 // and the wizard must come back where it was, without starting anything over.
-import { act, screen, within } from "@testing-library/react";
+import { act, cleanup, render, screen, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
+import { App } from "./App";
 import { en } from "./strings/en";
-import { reload, walkTo } from "./test-utils";
+import { mountApp, reload, tickAllChecks, walkTo } from "./test-utils";
 
 const ipad = en.deviceName.ipad;
 const count = (api: { calls: { method: string }[] }, method: string) => api.calls.filter((c) => c.method === method).length;
@@ -95,6 +96,58 @@ describe("reload recovery", () => {
     await reload(api);
     expect(screen.getByRole("heading", { level: 1, name: en.unlock.title })).toBeInTheDocument();
     expect(count(api, "cleanup")).toBe(0);
+  });
+
+  it("a reload during a cleanup the shell is still doing stays on Clean up, even with the proxy still reported", async () => {
+    const { api } = await walkTo("unlock");
+    const real = api.getState.bind(api);
+    api.getState = async () => ({ ...(await real()), step: "cleanup" });
+    await reload(api);
+    expect(screen.getByRole("heading", { level: 1, name: en.cleanup.title })).toBeInTheDocument();
+    expect(screen.getByText(en.cleanup.reloaded)).toBeInTheDocument();
+  });
+
+  it("a snapshot that missed the proxy for a moment is asked for again before deciding", async () => {
+    const { api } = await walkTo("unlock");
+    const real = api.getState.bind(api);
+    let asked = 0;
+    // The first answer after the reload is what the shell says while its lock is held: no
+    // proxy, and nothing else that points at a run.
+    api.getState = async () => {
+      const state = await real();
+      asked += 1;
+      return asked === 1
+        ? { ...state, step: "welcome", session: { proxy: null, deviceConnected: false, trustWorking: false, captured: 0, summary: null } }
+        : state;
+    };
+    cleanup();
+    render(<App api={api} />);
+    await screen.findByRole("heading", { level: 1, name: en.unlock.title }, { timeout: 2000 });
+    expect(asked).toBe(2);
+    expect(count(api, "restartProxy")).toBe(0);
+  });
+
+  it("a reload while the first start waits behind a Keychain prompt keeps the device and the ticks", async () => {
+    const h = await mountApp();
+    await h.user.click(screen.getByRole("radio", { name: en.deviceName.ipad }));
+    await tickAllChecks(h.user);
+    // The shell's start is waiting on macOS: it has not answered, and the snapshot has no proxy.
+    let release = () => undefined as void;
+    const start = h.api.startProxy.bind(h.api);
+    h.api.startProxy = (ip?: string) => new Promise((resolve, reject) => { release = () => { start(ip).then(resolve, reject); }; });
+    await h.user.click(screen.getByRole("button", { name: en.welcome.start }));
+    await screen.findByRole("heading", { level: 1, name: en.connect.title(ipad) });
+
+    await reload(h.api);
+    await screen.findByRole("heading", { level: 1, name: en.welcome.title }, { timeout: 2000 });
+    expect(screen.getByRole("radio", { name: en.deviceName.ipad })).toBeChecked();
+    for (const box of screen.getAllByRole("checkbox")) expect(box).toBeChecked();
+    const startButton = screen.getByRole("button", { name: en.welcome.start });
+    expect(startButton).toBeEnabled();
+    // Start again joins the start that is still waiting.
+    await h.user.click(startButton);
+    act(() => release());
+    await screen.findByText(en.connect.waiting(ipad));
   });
 
   it("the fake reports a fresh run as the shell does: a first start does not mark it for resume", async () => {

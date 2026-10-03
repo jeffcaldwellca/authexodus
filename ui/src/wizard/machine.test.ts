@@ -327,6 +327,32 @@ describe("wizard machine", () => {
     const load = (session: Partial<SessionSnapshot>, over: Partial<AppState> = {}) =>
       reduce(initialState(), { type: "loaded", app: app(over, { proxy: PROXY, ...session }) });
 
+    it("a cleanup the shell has begun wins over everything, even a proxy it is still stopping", () => {
+      // Cleanup waits for a sign-in to give up before it stops the proxy: a reload then sees both.
+      const during = load({ captured: 4, trustWorking: true }, { step: "cleanup" });
+      expect(during).toMatchObject({ step: "cleanup", recovered: true, resumed: false, unsure: true });
+      // A launch that found the last run unfinished.
+      const resumed = reduce(initialState(), { type: "loaded", app: app({ step: "cleanup", resumeCleanup: true }) });
+      expect(resumed).toMatchObject({ step: "cleanup", resumed: true, unsure: true });
+    });
+
+    it("the vault summary alone, with the proxy not reported, is still Move codes", () => {
+      // The shell answers without the proxy when it is busy for a moment; the summary is kept apart.
+      const s = reduce(initialState(), { type: "loaded", app: app({ step: "destination" }, { summary: full }) });
+      expect(s).toMatchObject({ step: "destination", recovered: true, unsure: true });
+      expect(s.summary).toEqual(full);
+    });
+
+    it("on the welcome screen, the device and the ticks kept from before the reload come back", () => {
+      const checks = { device: true, backups: true, password: true, multiDevice: true, sms: true };
+      const s = reduce(initialState(), { type: "loaded", app: app({ device: null }), kept: { device: "iphone", checks } });
+      expect(s).toMatchObject({ step: "welcome", device: "iphone", checks });
+      expect(canStart(s)).toBe(true);
+      // What the shell says about the device wins over what the window kept.
+      const shell = reduce(initialState(), { type: "loaded", app: app({ device: "ipad" }), kept: { device: "iphone", checks } });
+      expect(shell.device).toBe("ipad");
+    });
+
     it("a running proxy and nothing else is the connect step, with the device kept", () => {
       expect(load({})).toMatchObject({ step: "connect", device: "ipad", recovered: true, resumed: false, reachedCertificate: false });
     });
