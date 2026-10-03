@@ -24,6 +24,7 @@ const SOURCES = Object.fromEntries(
 const ALLOWED: { file: string; text: string | RegExp; why: string }[] = [
   { file: "api.fake.ts", text: /.*/, why: "invented account names and stand-ins for the core's own messages; never shipped" },
   { file: "api.errors.ts", text: "A command was refused without one of the shell's codes:", why: "written to the console in development builds only, for a developer; never on screen" },
+  { file: "api.tauri.ts", text: /^Could not listen for/, why: "written to the console in development builds only, for a developer; never on screen" },
 ];
 
 function allowed(file: string, text: string): boolean {

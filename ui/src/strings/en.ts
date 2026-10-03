@@ -103,6 +103,7 @@ export const en = {
     restartFailed: "The connection could not be restarted.",
     authyFinish: "Finish signing in to Authy: enter your backup password there so it keeps working as your fallback. If you cannot find the password, your codes can only be reached from another device where Authy is still signed in.",
     loadFailed: "The app could not start.",
+    listenFailed: "The app cannot hear from its own background part. Quit and open it again.",
     loadFailedHelp: "Try again. If it still does not start, quit authexodus (press Command-Q) and open it again. If you were part-way through, it opens on the clean-up steps, so nothing is left half done.",
     keepOpen: (d: string) => `Keep this window open and this Mac awake and plugged in until you finish. Do not close the lid: a sleeping Mac cuts your ${d} off from the internet.`,
     switchDevice: (other: string) => `Using an ${other} instead?`,

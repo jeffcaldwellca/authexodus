@@ -4,7 +4,9 @@ import { useCallback, useEffect, useReducer, useRef, useState, type ReactNode } 
 import type { Api, AppState, ProxyInfo, Step } from "./api";
 import { asApiError, type ApiError } from "./api.errors";
 import type { RestartState } from "./failures/ConnectionNotices";
+import { Callout } from "./components/ui";
 import { Problem } from "./failures/Problem";
+import { onListenFailure } from "./listenFailure";
 import { Authy } from "./screens/Authy";
 import { Certificate } from "./screens/Certificate";
 import { Cleanup } from "./screens/Cleanup";
@@ -90,6 +92,10 @@ export function App({ api, devTools }: { api: Api; devTools?: ReactNode }) {
     if (loaded !== "ready") return;
     writeKept({ device: state.device, checks: state.checks, started: !NOT_A_RUN.includes(state.step) });
   }, [loaded, state.device, state.checks, state.step]);
+
+  // The window could not subscribe to the shell's events: nothing it reports would arrive.
+  const [deaf, setDeaf] = useState(false);
+  useEffect(() => onListenFailure(() => setDeaf(true)), []);
 
   useEffect(() => {
     const stop = load();
@@ -208,6 +214,7 @@ export function App({ api, devTools }: { api: Api; devTools?: ReactNode }) {
         {loaded === "ready" && CONNECTED.includes(state.step) && (
           <p className="keep-open" role="note">{en.common.keepOpen(deviceLabel(state.device))}</p>
         )}
+        {deaf && <Callout tone="error" title={en.common.listenFailed} alert />}
         {loaded === "loading" && <p className="loading" role="status">{en.common.loading}</p>}
         {loaded === "failed" && loadError && (
           <div className="screen-body">

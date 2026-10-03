@@ -6,6 +6,7 @@ import apiSource from "./api.ts?raw";
 import { createFakeApi } from "./api.fake";
 import { ApiError, ERROR_CODES } from "./api.errors";
 import { createTauriApi, toApiError } from "./api.tauri";
+import { onListenFailure, resetListenFailure } from "./listenFailure";
 
 const invoke = vi.hoisted(() => vi.fn());
 const listen = vi.hoisted(() => vi.fn());
@@ -27,6 +28,7 @@ function apiMethods(): string[] {
 const snake = (name: string) => name.replace(/[A-Z]/g, (c) => `_${c.toLowerCase()}`);
 
 beforeEach(() => {
+  resetListenFailure();
   invoke.mockReset();
   listen.mockReset();
   invoke.mockResolvedValue(undefined);
@@ -195,12 +197,16 @@ describe("api.tauri", () => {
     expect(seen).toEqual([]);
   });
 
-  it("a listen that fails to register is not an unhandled rejection", async () => {
+  it("a listen that fails to register is not an unhandled rejection, and is reported for the screen", async () => {
+    const consoleError = vi.spyOn(console, "error").mockImplementation(() => undefined);
+    const heard = vi.fn();
+    const stop = onListenFailure(heard);
     listen.mockRejectedValue(new Error("no event system"));
     const off = createTauriApi().onBwProgress(() => undefined);
-    await Promise.resolve();
-    await Promise.resolve();
+    await vi.waitFor(() => expect(heard).toHaveBeenCalledTimes(1));
     expect(() => off()).not.toThrow();
+    stop();
+    consoleError.mockRestore();
   });
 });
 

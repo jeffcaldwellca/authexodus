@@ -6,6 +6,7 @@ import { ApiError } from "./api.errors";
 import { createFakeApi } from "./api.fake";
 import { App } from "./App";
 import { Problem } from "./failures/Problem";
+import { reportListenFailure, resetListenFailure } from "./listenFailure";
 import { en } from "./strings/en";
 import { mountApp, tickAllChecks, walkTo } from "./test-utils";
 
@@ -19,6 +20,27 @@ async function startFailing(error: ApiError | string) {
   await h.user.click(screen.getByRole("button", { name: en.welcome.start }));
   return { ...h, alert: await screen.findByRole("alert") };
 }
+
+describe("the window not hearing from the shell", () => {
+  it("a failed event subscription is a plain problem panel, not a silent wait", async () => {
+    resetListenFailure();
+    await walkTo("connect");
+    expect(screen.queryByText(en.common.listenFailed)).not.toBeInTheDocument();
+    act(() => reportListenFailure());
+    const alert = await screen.findByRole("alert");
+    expect(within(alert).getByText(en.common.listenFailed)).toBeInTheDocument();
+    expect(en.common.listenFailed).toBe("The app cannot hear from its own background part. Quit and open it again.");
+    resetListenFailure();
+  });
+
+  it("a failure that came before the window was drawn is shown too", async () => {
+    resetListenFailure();
+    reportListenFailure();
+    await mountApp();
+    expect(within(screen.getByRole("alert")).getByText(en.common.listenFailed)).toBeInTheDocument();
+    resetListenFailure();
+  });
+});
 
 describe("failures, by the shell's code", () => {
   it("the app failing to start says why, and offers Try again and how to quit", async () => {

@@ -7,6 +7,7 @@ import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 import type { Api, ProxyEvent } from "./api";
 import { ApiError, isErrorCode, unexplained } from "./api.errors";
+import { reportListenFailure } from "./listenFailure";
 
 export const PROXY_EVENT = "proxy-event";
 export const BW_PROGRESS_EVENT = "bw-progress";
@@ -41,8 +42,12 @@ function subscribe<T>(event: string, cb: (payload: T) => void): () => void {
   let unlisten: (() => void) | null = null;
   listen<T>(event, (e) => { if (!stopped) cb(e.payload); })
     .then((off) => { if (stopped) off(); else unlisten = off; })
-    // Nothing can be delivered if registration fails; the wizard's waiting steps offer help.
-    .catch(() => undefined);
+    // Nothing can be delivered if registration fails: the window says so (listenFailure.ts),
+    // and a development build keeps the reason for whoever is fixing it.
+    .catch((err: unknown) => {
+      if (import.meta.env.DEV) console.error(`Could not listen for ${event}:`, err);
+      reportListenFailure();
+    });
   return () => {
     stopped = true;
     unlisten?.();
