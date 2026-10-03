@@ -48,15 +48,16 @@ describe("api.fake", () => {
     expect(second.kept.every((line) => /\.$/.test(line))).toBe(true);
   });
 
-  it("counts as skipped only what the person skipped", async () => {
+  it("counts as skipped what the person skipped and a login that holds another code, as the shell does", async () => {
     const api = createFakeApi();
     await signIn(api);
     const report = await api.bwApply([
       { tokenId: "t1", decision: { kind: "skip" } },
       { tokenId: "t4", decision: { kind: "attach", itemId: "v5" } },
     ]);
-    expect(report).toMatchObject({ attached: 0, created: 0, skipped: 1 });
-    expect(report.kept).toEqual(["Dropbox already has a code, so Dropbox was not added to it."]);
+    expect(report).toMatchObject({ attached: 0, created: 0, skipped: 2 });
+    // Nothing of this account is in Bitwarden, so it is not among the codes already there.
+    expect(report.kept).toEqual([]);
   });
 
   it("like the shell, reports resumeCleanup as it was at launch: starting the proxy does not change it", async () => {

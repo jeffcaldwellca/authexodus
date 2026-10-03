@@ -295,7 +295,8 @@ export function BitwardenFlow({ api, state, tokens, onDone, onLocked }: ScreenPr
     setStage("applying");
     try {
       const result = await withProgress(() => api.bwApply(decisions));
-      applied.current = true;
+      // Moved means a code is now in Bitwarden: added, created, or found there already.
+      if (result.attached + result.created + result.kept.length > 0) applied.current = true;
       setReport(result);
     } catch (err) {
       setReport(null);
@@ -576,7 +577,7 @@ export function BitwardenFlow({ api, state, tokens, onDone, onLocked }: ScreenPr
           {sessionEnded ? <button type="button" className="primary" onClick={signInAgain}>{t.signInAgain}</button>
             : locked ? <button type="button" className="primary" onClick={onLocked}>{en.common.unlockAgain}</button>
             : applyError || partial !== null ? <button type="button" className="primary" onClick={() => void apply()}>{t.runAgain}</button>
-            : <button type="button" className="primary" onClick={() => onDone(true)}>{en.common.done}</button>}
+            : <button type="button" className="primary" onClick={() => onDone(applied.current)}>{en.common.done}</button>}
         </>
       }
     >

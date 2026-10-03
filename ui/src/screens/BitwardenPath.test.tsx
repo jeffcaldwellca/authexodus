@@ -623,6 +623,26 @@ describe("apply and its report", () => {
     expect(screen.queryByText(/Skipped 5/)).not.toBeInTheDocument();
   });
 
+  it("a login that gained a code of its own since it was read is a skip, not \"already in Bitwarden\"", async () => {
+    // The vault as it is when Apply runs: GitHub's login has been given a code meanwhile.
+    const changed = vault.map((v) => (v.itemId === "v-gh" ? { ...v, hasCode: true } : v));
+    const { user } = await toReview({ vault: changed });
+    await user.selectOptions(screen.getByRole("combobox", { name: t.actionFor("Google") }), t.skip);
+    await user.selectOptions(screen.getByRole("combobox", { name: t.actionFor("Fastmail") }), t.skip);
+    await user.click(screen.getByRole("button", { name: t.apply }));
+    await screen.findByRole("heading", { level: 1, name: t.reportTitle });
+    expect(screen.getByText(t.skipped(3))).toBeInTheDocument();
+    expect(screen.queryByText(t.keptTitle)).not.toBeInTheDocument();
+    const lines = within(screen.getByRole("log", { name: t.progressLabel })).getAllByRole("listitem").map((li) => li.textContent);
+    expect(lines.join(" ")).toMatch(/Skipped GitHub: the login you chose already has a different code/);
+
+    // Nothing reached Bitwarden, so nothing counts as moved.
+    await user.click(screen.getByRole("button", { name: en.common.done }));
+    await screen.findByRole("heading", { level: 1, name: en.destination.title });
+    expect(screen.queryByText(en.destination.usedTag)).not.toBeInTheDocument();
+    expect(screen.getByRole("button", { name: en.destination.continue })).toBeDisabled();
+  });
+
   it("with nothing already there, no such list is shown", async () => {
     const { user } = await toReview();
     await user.selectOptions(screen.getByRole("combobox", { name: t.actionFor("Google") }), t.skip);

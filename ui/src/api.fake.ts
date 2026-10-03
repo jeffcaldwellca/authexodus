@@ -255,8 +255,9 @@ export function createFakeApi(initial: Partial<AppState> = {}, overrides: Partia
     return [...seen.values()];
   }
 
-  // As the shell counts: `skipped` is only what the person skipped; a code that is already in
-  // Bitwarden comes back in `kept`, one sentence each.
+  // As the shell counts: `skipped` is what the person skipped and any login that turned out to
+  // hold a different code (nothing is written there); a code that is already in Bitwarden
+  // comes back in `kept`, one sentence each.
   function workOutReport(decisions: { tokenId: string; decision: Decision }[]): ApplyReport {
     const report: ApplyReport = { attached: 0, created: 0, skipped: 0, kept: [], failed: null };
     const logins = vault();
@@ -273,8 +274,8 @@ export function createFakeApi(initial: Partial<AppState> = {}, overrides: Partia
       } else {
         const target = logins.find((c) => c.itemId === decision.itemId);
         if (target?.hasCode) {
-          report.kept.push(`${target.name} already has a code, so ${title} was not added to it.`);
-          emitBw(`Kept ${target.name}`);
+          report.skipped++;
+          emitBw(`Skipped ${title}: the login you chose already has a different code, which was left as it is`);
           continue;
         }
         report.attached++;
