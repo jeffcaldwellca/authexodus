@@ -2,9 +2,10 @@
 // sentence as the detail, and something to do. No catch-all messages.
 import { act, render, screen, waitFor, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
+import { vi } from "vitest";
 import { ApiError } from "./api.errors";
 import { createFakeApi } from "./api.fake";
-import { App } from "./App";
+import { ADDRESS_RECHECK_MS, App } from "./App";
 import { Problem } from "./failures/Problem";
 import { reportListenFailure, resetListenFailure } from "./listenFailure";
 import { en } from "./strings/en";
@@ -255,6 +256,39 @@ describe("failures, by the shell's code", () => {
     expect(within(alert).getByText(en.cleanup.failedOther)).toBeInTheDocument();
     expect(alert.textContent).not.toMatch(/Keychain/);
     expect(within(alert).getByRole("checkbox", { name: en.cleanup.otherDone })).toBeInTheDocument();
+  });
+
+  it("when the address comes back, the notice goes by itself and nothing is restarted", async () => {
+    const { api } = await walkTo("certificate");
+    const before = api.calls.filter((c) => c.method === "startProxy").length;
+    const home = api.script.addresses;
+    vi.useFakeTimers();
+    try {
+      // A Wi-Fi drop: the address is gone for a while.
+      api.script.addresses = [{ ip: "192.168.7.20", label: "Wi-Fi" }];
+      act(() => api.emitProxyEvent({ kind: "addressChanged" }));
+      expect(screen.getByText(en.failures.addressChanged.title(iphone))).toBeInTheDocument();
+      // While the notice is up the app asks the shell, with no address, every few seconds.
+      expect(ADDRESS_RECHECK_MS).toBe(5000);
+      await act(async () => { await vi.advanceTimersByTimeAsync(ADDRESS_RECHECK_MS); });
+      const asked = () => api.calls.filter((c) => c.method === "startProxy").slice(before);
+      expect(asked().map((c) => c.args[0])).toEqual([undefined]);
+      // Still gone: the shell refuses, and the notice stays.
+      expect(screen.getByText(en.failures.addressChanged.title(iphone))).toBeInTheDocument();
+
+      // The same address is back.
+      api.script.addresses = home;
+      await act(async () => { await vi.advanceTimersByTimeAsync(ADDRESS_RECHECK_MS); });
+      expect(screen.queryByText(en.failures.addressChanged.title(iphone))).not.toBeInTheDocument();
+      expect(asked()).toHaveLength(2);
+      // No more asking once it has gone, and no restart: the device keeps its settings.
+      await act(async () => { await vi.advanceTimersByTimeAsync(ADDRESS_RECHECK_MS * 3); });
+      expect(asked()).toHaveLength(2);
+      expect(api.calls.filter((c) => c.method === "restartProxy")).toHaveLength(0);
+      expect(screen.getByRole("heading", { level: 1, name: en.certificate.title })).toBeInTheDocument();
+    } finally {
+      vi.useRealTimers();
+    }
   });
 
   it("this computer's address changing is announced, and the restart shows the new Server and Port", async () => {

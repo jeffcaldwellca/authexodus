@@ -98,6 +98,13 @@ describe("wizard machine", () => {
     expect(s.step).toBe("certificate");
   });
 
+  it("the address coming back clears the notice, on the waiting steps only", () => {
+    const changed = reduce(at("certificate"), { type: "proxy", event: { kind: "addressChanged" } });
+    expect(changed.addressChanged).toBe(true);
+    const back = reduce(changed, { type: "addressReturned" });
+    expect(back).toMatchObject({ step: "certificate", addressChanged: false });
+  });
+
   it("keeps the largest capture, and a capture of only Authy's own accounts still goes on to Unlock", () => {
     // The shell sends a capture only when the backup grew. A count of 0 means it holds only
     // Authy's own accounts: there is still a backup to unlock, which lists them by name.

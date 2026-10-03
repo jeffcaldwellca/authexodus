@@ -30,6 +30,12 @@ const CONNECTED: readonly Step[] = ["connect", "certificate", "authy", "unlock",
 const NOT_A_RUN: readonly Step[] = ["welcome", "done", "cleanup"];
 /** How long to wait before asking the shell for its state a second time. */
 const ASK_AGAIN_MS = 500;
+/**
+ * While the address notice is up, how often the shell is asked for the proxy again (with no
+ * address). It answers as before once the address is this computer's again, and refuses with
+ * `address_changed` while it is not: the notice goes by itself when the address returns.
+ */
+export const ADDRESS_RECHECK_MS = 5000;
 /** After one of these, asking again with no address lets the shell pick a new one. */
 const ADDRESS_GONE = ["address_changed", "address_not_private", "internal"];
 
@@ -149,6 +155,22 @@ export function App({ api, devTools }: { api: Api; devTools?: ReactNode }) {
       })
       .catch((err: unknown) => { setRestartError(asApiError(err)); setRestart("failed"); });
   }, [api, gotProxy]);
+
+  // The address notice clears itself when the same address comes back (see ADDRESS_RECHECK_MS).
+  useEffect(() => {
+    if (!state.addressChanged) return;
+    let asking = false;
+    const timer = setInterval(() => {
+      const before = proxyNow.current;
+      if (asking || before === null) return;
+      asking = true;
+      api.startProxy()
+        .then((info) => { if (info.ip === before.ip && info.port === before.port) dispatch({ type: "addressReturned" }); })
+        .catch(() => undefined)
+        .finally(() => { asking = false; });
+    }, ADDRESS_RECHECK_MS);
+    return () => clearInterval(timer);
+  }, [api, state.addressChanged]);
 
   // The proxy starts when the person reaches the connect step, and only once per run.
   useEffect(() => {

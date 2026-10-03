@@ -302,6 +302,10 @@ export function createFakeApi(initial: Partial<AppState> = {}, overrides: Partia
     async startProxy(ip?: string) {
       await record("startProxy", ip);
       failIfScripted("startProxy");
+      // As the shell does: asked for the running proxy whose address this computer has lost.
+      if (ip === undefined && session.proxy && !script.addresses.some((a) => a.ip === session.proxy?.ip)) {
+        throw new ApiError("address_changed", "This computer's network address has changed. Restart the connection to carry on.");
+      }
       if (session.captured > 0 && ip !== undefined && ip !== proxyInfo().ip) {
         throw new ApiError("capture_would_be_lost", "A backup is already captured. Restart the connection to change the address.");
       }

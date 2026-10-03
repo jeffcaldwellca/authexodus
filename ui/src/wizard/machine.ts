@@ -78,6 +78,8 @@ export type WizardEvent =
   | { type: "proxy"; event: ProxyEvent }
   | { type: "unlocked"; summary: UnlockSummary }
   | { type: "restarting" }
+  /** The address the proxy is on is this computer's again (a Wi-Fi drop that ended). */
+  | { type: "addressReturned" }
   | { type: "backToUnlock" }
   | { type: "locked" }
   | { type: "startOver" }
@@ -291,6 +293,8 @@ export function reduce(s: WizardState, ev: WizardEvent): WizardState {
         deviceRefused: false, authyError: null, captured: null, emptyBackup: false, addressChanged: false,
         restarts: s.restarts + 1,
       } : s;
+    case "addressReturned":
+      return LISTENING.includes(s.step) ? { ...s, addressChanged: false } : s;
     case "backToUnlock":
       // Only while nothing has been moved: after that, the way on is forward.
       return s.step === "destination" && !s.moved ? { ...s, step: "unlock", summary: null, cantMove: { native: [], invalid: [] } } : s;
