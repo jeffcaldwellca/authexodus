@@ -175,12 +175,12 @@ The workflow stops with a clear message if any of these repository secrets (Sett
 
 | Secret | What it is |
 |---|---|
-| `APPLE_CERTIFICATE` | Developer ID Application certificate, exported as `.p12`, base64-encoded |
-| `APPLE_CERTIFICATE_PASSWORD` | the password set when exporting the `.p12` |
-| `APPLE_SIGNING_IDENTITY` | for example `Developer ID Application: Your Name (TEAMID)` |
-| `APPLE_ID` | the Apple ID email used for notarization |
-| `APPLE_PASSWORD` | an app-specific password for that Apple ID |
-| `APPLE_TEAM_ID` | the 10-character team ID |
+| `MACOS_CERTIFICATE` | Developer ID Application certificate, exported as `.p12`, base64-encoded |
+| `MACOS_CERTIFICATE_PASSWORD` | the password set when exporting the `.p12` |
+| `NOTARIZATION_APPLE_ID` | the Apple ID email used for notarization |
+| `NOTARIZATION_PASSWORD` | an app-specific password for that Apple ID |
+
+The signing identity and team ID are not secret; they are set at the top of `.github/workflows/release.yml`. A fork that signs with its own certificate changes them there.
 
 Before the first tag, run the real-device checklist.
 

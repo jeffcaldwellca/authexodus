@@ -1,19 +1,21 @@
 # Release: builds a universal, signed and notarized .dmg when a version tag is pushed, and
 # attaches it to a DRAFT GitHub release. Nothing is published until a person presses Publish.
 #
-# Repository secrets this workflow needs (Settings > Secrets and variables > Actions).
-# The names are the ones the Tauri CLI and tauri-action read for macOS signing and notarization
-# (https://v2.tauri.app/distribute/sign/macos/). All six are required; the first job step stops
-# the run with a plain message if any is missing, so an unsigned build is never produced.
+# Repository secrets this workflow needs (Settings > Secrets and variables > Actions). They use
+# the same names as the maintainer's other signed macOS apps, so the same values go in. All four
+# are required; the first job step stops the run with a plain message if any is missing, so an
+# unsigned build is never produced.
 #
-#   APPLE_CERTIFICATE           the "Developer ID Application" certificate exported as .p12,
+#   MACOS_CERTIFICATE           the "Developer ID Application" certificate exported as .p12,
 #                               then base64-encoded:  base64 -i certificate.p12 | pbcopy
-#   APPLE_CERTIFICATE_PASSWORD  the password chosen when exporting that .p12
-#   APPLE_SIGNING_IDENTITY      the certificate's name, for example
-#                               "Developer ID Application: Your Name (TEAMID)"
-#   APPLE_ID                    the Apple ID email used for notarization
-#   APPLE_PASSWORD              an app-specific password for that Apple ID (not the real password)
-#   APPLE_TEAM_ID               the 10-character team ID from the Apple Developer membership page
+#   MACOS_CERTIFICATE_PASSWORD  the password chosen when exporting that .p12
+#   NOTARIZATION_APPLE_ID       the Apple ID email used for notarization
+#   NOTARIZATION_PASSWORD       an app-specific password for that Apple ID (not the real password)
+#
+# The signing identity and team ID are not secret (they are printed in every signed app), so
+# they are written below as SIGNING_IDENTITY and TEAM_ID. The Tauri CLI and tauri-action read
+# the APPLE_* variable names (https://v2.tauri.app/distribute/sign/macos/); the steps below map
+# these secrets onto them.
 #
 # GITHUB_TOKEN is supplied by GitHub itself and needs no setup.
 #
@@ -32,7 +34,7 @@
 # attaches the checksum file; permissions cannot be set per step, so the job has it. The
 # checkout does not leave the token on disk, so the steps in between cannot use it.
 #
-# Alternative to APPLE_ID / APPLE_PASSWORD / APPLE_TEAM_ID: an App Store Connect API key
+# Alternative to an Apple ID and app-specific password for notarization: an App Store Connect API key
 # (APPLE_API_ISSUER, APPLE_API_KEY, and APPLE_API_KEY_PATH pointing at the downloaded .p8 file).
 # This workflow does not use it: the .p8 has to exist as a file on the runner, which needs an
 # extra step to write it from a secret. Switch only if the Apple ID route is not wanted.
@@ -46,6 +48,10 @@ on:
 permissions:
   contents: write
 
+env:
+  SIGNING_IDENTITY: "Developer ID Application: Jeffrey Caldwell (88ZPCYS252)"
+  TEAM_ID: "88ZPCYS252"
+
 concurrency:
   group: release-${{ github.ref }}
   cancel-in-progress: false
@@ -57,17 +63,18 @@ jobs:
     steps:
       - name: Stop now if a signing secret is missing
         env:
-          APPLE_CERTIFICATE: ${{ secrets.APPLE_CERTIFICATE }}
-          APPLE_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
-          APPLE_SIGNING_IDENTITY: ${{ secrets.APPLE_SIGNING_IDENTITY }}
-          APPLE_ID: ${{ secrets.APPLE_ID }}
-          APPLE_PASSWORD: ${{ secrets.APPLE_PASSWORD }}
-          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+          APPLE_CERTIFICATE: ${{ secrets.MACOS_CERTIFICATE }}
+          APPLE_CERTIFICATE_PASSWORD: ${{ secrets.MACOS_CERTIFICATE_PASSWORD }}
+          APPLE_SIGNING_IDENTITY: ${{ env.SIGNING_IDENTITY }}
+          APPLE_ID: ${{ secrets.NOTARIZATION_APPLE_ID }}
+          APPLE_PASSWORD: ${{ secrets.NOTARIZATION_PASSWORD }}
+          APPLE_TEAM_ID: ${{ env.TEAM_ID }}
         run: |
           missing=""
-          for name in APPLE_CERTIFICATE APPLE_CERTIFICATE_PASSWORD APPLE_SIGNING_IDENTITY APPLE_ID APPLE_PASSWORD APPLE_TEAM_ID; do
-            if [ -z "${!name}" ]; then missing="$missing $name"; fi
-          done
+          [ -n "$APPLE_CERTIFICATE" ] || missing="$missing MACOS_CERTIFICATE"
+          [ -n "$APPLE_CERTIFICATE_PASSWORD" ] || missing="$missing MACOS_CERTIFICATE_PASSWORD"
+          [ -n "$APPLE_ID" ] || missing="$missing NOTARIZATION_APPLE_ID"
+          [ -n "$APPLE_PASSWORD" ] || missing="$missing NOTARIZATION_PASSWORD"
           if [ -n "$missing" ]; then
             echo "::error title=Signing secrets missing::This release would be unsigned. Add these repository secrets and push the tag again:$missing"
             exit 1
@@ -120,12 +127,12 @@ jobs:
         uses: tauri-apps/tauri-action@1deb371b0cd8bd54025b384f1cd735e725c4060f # v1 (v1.0.0)
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          APPLE_CERTIFICATE: ${{ secrets.APPLE_CERTIFICATE }}
-          APPLE_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
-          APPLE_SIGNING_IDENTITY: ${{ secrets.APPLE_SIGNING_IDENTITY }}
-          APPLE_ID: ${{ secrets.APPLE_ID }}
-          APPLE_PASSWORD: ${{ secrets.APPLE_PASSWORD }}
-          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+          APPLE_CERTIFICATE: ${{ secrets.MACOS_CERTIFICATE }}
+          APPLE_CERTIFICATE_PASSWORD: ${{ secrets.MACOS_CERTIFICATE_PASSWORD }}
+          APPLE_SIGNING_IDENTITY: ${{ env.SIGNING_IDENTITY }}
+          APPLE_ID: ${{ secrets.NOTARIZATION_APPLE_ID }}
+          APPLE_PASSWORD: ${{ secrets.NOTARIZATION_PASSWORD }}
+          APPLE_TEAM_ID: ${{ env.TEAM_ID }}
         with:
           tagName: ${{ github.ref_name }}
           releaseName: authexodus ${{ github.ref_name }}
