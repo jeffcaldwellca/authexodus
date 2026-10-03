@@ -159,7 +159,7 @@ This is the first time the app has ever run in a real window. Everything else de
   - [ ] The Terminal shows no second start of the proxy, and the iPhone's proxy still works: Safari on the iPhone loads a page.
   - [ ] Nothing in Keychain Access changed (the item's modification time is the same).
 - [ ] **The Mac's address changes.** On the Mac, turn Wi-Fi off and on (if the router hands back the same address, join a different network and come back, or unplug Ethernet, so the address really changes). Mac's address before ______ and after ______.
-  - [ ] Within a few seconds **App says** "This Mac's network address changed. Your iPhone can no longer reach it." with a **Restart the connection** button. Time it took: ______ If the address did not change, the app should say nothing.
+  - [ ] After about 10 seconds without the address (the app looks every 5 s and needs two looks in a row) **App says** "This Mac's network address changed. Your iPhone can no longer reach it." with a **Restart the connection** button. Time it took: ______ A short Wi-Fi drop of more than about 10 s will show the notice even if the same address comes back; it then clears itself within about 5 s of the address returning, with nothing restarted. If you saw that, note it here: ______
   - [ ] Press **Restart the connection**. The app goes to Connect, shows the NEW Server and Port inside a yellow outline, and says "This computer's address has changed. Update Server and Port on your iPhone to the ones shown here."
   - [ ] Type the new Server and Port on the iPhone, open the Test page. The app moves forward by itself.
 
@@ -351,7 +351,7 @@ Use the THROWAWAY vault. Choose "Bitwarden, matched to your logins".
   - [ ] On a fresh visit to the sign-in screen, the link "Sign in with an API key instead" opens the same form without a failed try first.
 - [ ] **Signed out part-way (optional).** With the match table open, go to the web vault and choose Settings → Security → Deauthorize sessions. Back in the app press Apply. **App says** "Bitwarden signed you out. Sign in again and your choices will still be here." with **Sign in again**. Sign in: you are back on the match table with every choice as you left it. Tested: yes / no / could not provoke it.
 - [ ] The login that already had a code still has its old code.
-- [ ] After the Bitwarden step, in the app data folder, `bw-data` is gone once you leave the Bitwarden screens for Clean up. (`bw-cli`, the downloaded tool, stays until Clean up finishes.)
+- [ ] After the Bitwarden step, in the app data folder, `bw-data` (Bitwarden's session data) and `bw-cli` (the downloaded tool) are both still there while you are on Move codes and Check the codes: leaving the Bitwarden screens does not sign out. Both are deleted together when the Clean up step begins (this Mac's part of the cleanup), and also if the app is quit and at its next launch. Seen on reaching Clean up: ______
 
 ## Clean up
 

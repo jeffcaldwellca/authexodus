@@ -16,6 +16,8 @@ Status: **pre-release (v0.1, not yet tagged)**. It has not yet been checked on a
 
 Keep the app's window open until the last screen. Only one copy of the app can be open at a time: opening it a second time does not start a second copy.
 
+If the Mac loses its network address while you work, the app says "This Mac's network address changed" and offers to restart the connection. A short Wi-Fi drop of more than about 10 s will show the notice; it clears itself when the address returns, and then you do not need to restart anything.
+
 ## Before you start: five checks
 
 You will delete Authy and install it again. Without these five, you can be locked out for 24 hours or lose codes. The app makes you confirm each one before it starts.
@@ -58,7 +60,7 @@ The Bitwarden path signs in through Bitwarden's own command-line tool, which the
 
 After signing in you review every match before anything changes. The app suggests a login for each account. Change any suggestion that is wrong, or use **Choose a different login…** on a row to give that code to any login in your vault, found by searching. A login can take one code only, so a login that already has a code, or that you have given to another account, is listed but cannot be chosen.
 
-Accounts the app cannot match become new entries in an "Authy import" folder, which you can merge in Bitwarden afterwards. A code that is already in Bitwarden is never replaced, and the report lists those separately. If Bitwarden signs you out part-way, the app asks you to sign in again and brings you back to your choices as you left them.
+Accounts the app cannot match become new entries in an "Authy import" folder, which you can merge in Bitwarden afterwards. A code that is already in Bitwarden is never replaced, and the report lists those separately. A login that turns out to hold a different code when the codes are added (someone gave it one after the app read your vault) is left as it is, and that account is counted as skipped. If Bitwarden signs you out part-way, the app asks you to sign in again and brings you back to your choices as you left them. If you then sign in to a different account (another email or server), the suggestions are made again for that account's vault, and the app says so.
 
 ## What cannot be moved
 
@@ -96,6 +98,7 @@ What stays is not the app's doing:
 - Any import file **you** chose to save, wherever you saved it. Delete it once it is imported, and empty the Trash.
 - The folders macOS makes for any app with a web view (`~/Library/WebKit/dev.somecorp.authexodus` and `~/Library/Caches/dev.somecorp.authexodus`). They hold the window's cache, not your codes. You can delete them.
 - The app itself, in Applications, until you delete it.
+- While the app is open, a small file at `/tmp/dev_somecorp_authexodus_si.sock`, which stops a second copy from opening. The app removes it when it quits normally; after a crash or a forced quit it stays until the next launch replaces it, or until the Mac restarts. It holds nothing of yours.
 
 On your iPhone or iPad, the proxy setting and the certificate profile stay until **you** remove them. The Clean up step walks you through both.
 
