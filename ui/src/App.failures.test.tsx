@@ -138,6 +138,21 @@ describe("failures, by the shell's code", () => {
     expect(api.calls.filter((c) => c.method === "restartProxy")).toHaveLength(1);
   });
 
+  it("the address picker is held while the shell moves to the chosen address", async () => {
+    const { api, user } = await walkTo("connect");
+    const start = api.startProxy.bind(api);
+    let release = () => undefined as void;
+    api.startProxy = (ip?: string) => new Promise((resolve, reject) => { release = () => { start(ip).then(resolve, reject); }; });
+    const picker = screen.getByLabelText(new RegExp(en.connect.addressLabel));
+    await user.selectOptions(picker, "10.0.0.12");
+    expect(picker).toBeDisabled();
+    expect(picker).toHaveAttribute("aria-busy", "true");
+    act(() => release());
+    await waitFor(() => expect(screen.getByLabelText(new RegExp(en.connect.addressLabel))).toBeEnabled());
+    expect(screen.getByLabelText(new RegExp(en.connect.addressLabel))).toHaveValue("10.0.0.12");
+    expect(screen.getByLabelText(new RegExp(en.connect.addressLabel))).not.toHaveAttribute("aria-busy", "true");
+  });
+
   it("a restart that fails shows the shell's reason by code", async () => {
     const { api, user } = await walkTo("certificate");
     api.script.failures.restartProxy = [new ApiError("listen_failed", "Port 8080 is in use by another program.")];

@@ -42,6 +42,8 @@ export function App({ api, devTools }: { api: Api; devTools?: ReactNode }) {
   const [restart, setRestart] = useState<RestartState>("idle");
   const [restartError, setRestartError] = useState<ApiError | null>(null);
   const [addressChanged, setAddressChanged] = useState(false);
+  /** The person chose another address and the shell has not answered yet. */
+  const [addressBusy, setAddressBusy] = useState(false);
   /** Whether this run's certificate is limited to Authy. Outlives the proxy, for cleanup. */
   const [certConstrained, setCertConstrained] = useState<boolean | null>(null);
   const proxyAsked = useRef(false);
@@ -101,15 +103,17 @@ export function App({ api, devTools }: { api: Api; devTools?: ReactNode }) {
   }, [api, gotProxy]);
 
   // The shell refuses a new address once a backup is captured; the way through is a restart.
+  // The picker is held until the shell has answered, so a second choice cannot queue behind it.
   const pickAddress = useCallback((ip: string) => {
     setAddressRejected(null);
     setAddressError(null);
     setAddressChanged(false);
+    setAddressBusy(true);
     api.startProxy(ip).then(gotProxy).catch((err: unknown) => {
       const error = asApiError(err);
       if (error.code === "capture_would_be_lost") setAddressRejected(ip);
       else setAddressError({ ip, error });
-    });
+    }).finally(() => setAddressBusy(false));
   }, [api, gotProxy]);
 
   const restartProxy = useCallback((ip?: string) => {
@@ -221,6 +225,7 @@ export function App({ api, devTools }: { api: Api; devTools?: ReactNode }) {
             addressRejected={addressRejected}
             addressError={addressError}
             addressChanged={addressChanged}
+            addressBusy={addressBusy}
             onPickAddress={pickAddress}
             onRetry={startProxy}
           />

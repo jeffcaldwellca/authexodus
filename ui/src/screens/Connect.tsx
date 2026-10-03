@@ -25,11 +25,13 @@ export type ConnectProps = ScreenProps & {
   addressError: { ip: string; error: ApiError } | null;
   /** A restart landed on a different address or port than the device was set to. */
   addressChanged: boolean;
+  /** A chosen address is being moved to: the picker is held until the shell answers. */
+  addressBusy: boolean;
   onPickAddress: (ip: string) => void;
   onRetry: () => void;
 };
 
-export function Connect({ api, state, dispatch, proxy, proxyError, addressRejected, addressError, addressChanged, onPickAddress, onRetry, onRestart, restart, restartError }: ConnectProps) {
+export function Connect({ api, state, dispatch, proxy, proxyError, addressRejected, addressError, addressChanged, addressBusy, onPickAddress, onRetry, onRestart, restart, restartError }: ConnectProps) {
   const device: Device = state.device ?? "iphone";
   const d = deviceLabel(state.device);
   const help = { d, ip: proxy?.ip, port: proxy?.port };
@@ -99,7 +101,7 @@ export function Connect({ api, state, dispatch, proxy, proxyError, addressReject
             {proxy.addresses.length > 1 && (
               <label className="address">
                 <span>{t.addressLabel}</span>
-                <select value={proxy.ip} disabled={restart === "busy"} onChange={(e) => onPickAddress(e.target.value)}>
+                <select value={proxy.ip} disabled={restart === "busy" || addressBusy} aria-busy={addressBusy} onChange={(e) => onPickAddress(e.target.value)}>
                   {proxy.addresses.map((a) => <option key={a.ip} value={a.ip}>{t.addressOption(a.ip, a.label)}</option>)}
                 </select>
                 <span className="quiet-text">{t.addressHint(d)}</span>
